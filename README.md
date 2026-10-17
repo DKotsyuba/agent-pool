@@ -38,6 +38,7 @@ All mutations require a stable `request_key`; existing-pool mutations also requi
 `expected_revision`. Read current state before new intent. A lost reply is recovered
 using the identical key and intent. `pool_get` sections are `overview`, `members`,
 `history`, `proposal`, `votes`, and `deliveries`; use the exact returned cursor.
+The owner can use `binding` with an exact `member_id` to retrieve a removed mapping.
 Removed agents cannot read or act. Removal does not stop their execution process.
 
 ## Development
@@ -58,6 +59,13 @@ snapshot. The strict embedded MiniJinja layouts are in `src/templates`. No new
 framework, runtime language or external database service is required.
 
 Packaging requires committed source and never grants native qualification.
+Choose the approved artifact directory explicitly and verify the resulting bundle:
+
+```sh
+cargo xtask package --out /absolute/package-directory
+cargo xtask package verify /absolute/package-directory
+```
+
 `self-install` and `releases use` preserve immutable version directories, check the
 state schema and do not register/restart services or edit host configuration.
 Release remains disabled until native qualification and explicit delivery approval.

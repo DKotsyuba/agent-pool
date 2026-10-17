@@ -63,9 +63,9 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "pool_get",
-            "Read one bounded authenticated section: overview/members up to five assignments (two with owner mappings), history up to three events within 10 KiB, votes up to three ballots. after resumes within that section. proposal_id reads a retained decision. Removed members cannot read.",
+            "Read one bounded authenticated section: overview/members up to five assignments (two with owner mappings), history up to three events within 10 KiB, votes up to three ballots. after resumes within that section. proposal_id reads a retained decision. Owner-only binding requires member_id and after=0 and includes removed mappings. Removed members cannot read.",
             object(
-                json!({"pool_id":string(128),"after":{"type":"integer","minimum":0},"section":{"type":"string","enum":["overview","members","history","proposal","votes","deliveries"]},"proposal_id":string(128)}),
+                json!({"pool_id":string(128),"after":{"type":"integer","minimum":0},"section":{"type":"string","enum":["overview","members","history","proposal","votes","deliveries","binding"]},"proposal_id":string(128),"member_id":string(128)}),
                 &["pool_id"],
             ),
             true,
@@ -138,7 +138,7 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "pool_propose",
-            "Owner or confirmed member opens one proposal with result, criteria and a frozen confirmed roster. A still-open proposal prevents another. Leader never votes.",
+            "Owner or confirmed member opens the current proposal with result, criteria and a frozen confirmed roster. Revising an open proposal at the current revision archives it as stale and clears current readiness. Accepted decisions remain immutable. Leader never votes.",
             mutation(
                 json!({"result":string(2048),"criteria":string(2048)}),
                 &["result", "criteria"],

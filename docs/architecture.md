@@ -39,6 +39,8 @@ A removed incarnation loses all access and is never reused.
 
 Participant output contains local member IDs, names, assignments, states and safe
 operation IDs. Owner-only roster pages additionally expose native/Run mappings.
+The owner can also retrieve one removed incarnation with `pool_get section=binding`
+and its exact `member_id`, for separate Run process control or audit.
 These mappings never appear in participant events, errors, receipts or notifications.
 Shared history includes direct and owner messages, while delivery audiences differ:
 posts go to members, direct messages to one member, explicit owner messages to the
@@ -75,6 +77,8 @@ owner; ordinary conversation and consensus do not subscribe the owner to deliver
 ## Consensus and bounded reads
 
 One open proposal freezes result, criteria and confirmed membership/assignments.
+An explicit replacement at the current revision archives the prior open proposal
+and its votes as stale, then requires fresh votes on the new result and criteria.
 Only those members vote. Ready requires evidence; block and revoke remain in the
 journal. Unanimity accepts a decision. Membership/assignment changes stale an open
 proposal; accepted decisions are independently archived and immutable. No vote,

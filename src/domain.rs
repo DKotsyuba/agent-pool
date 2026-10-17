@@ -104,6 +104,9 @@ pub struct Get {
     /// Optional retained proposal ID for proposal/votes sections; omitted selects the latest.
     #[serde(default)]
     pub proposal_id: Option<String>,
+    /// Exact membership ID for the owner-only binding section, including removed incarnations.
+    #[serde(default)]
+    pub member_id: Option<String>,
 }
 /// Independently paged sections keep complete assignments and evidence retrievable.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -122,6 +125,8 @@ pub enum Section {
     Votes,
     /// Twenty safe delivery/admission states per page, with no native bindings.
     Deliveries,
+    /// Owner-only exact native/Run mapping selected by member_id, including historical membership.
+    Binding,
 }
 /// Owner list pagination uses an exclusive opaque pool ID cursor.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -354,7 +359,13 @@ impl Command {
                 {
                     return Err(Fault::Invalid);
                 }
-                x.proposal_id.as_deref().map_or(Ok(()), identifier)
+                x.proposal_id.as_deref().map_or(Ok(()), identifier)?;
+                if x.member_id.is_some() != matches!(x.section, Section::Binding)
+                    || (matches!(x.section, Section::Binding) && x.after != 0)
+                {
+                    return Err(Fault::Invalid);
+                }
+                x.member_id.as_deref().map_or(Ok(()), identifier)
             }
             Self::List(x) => x.after.as_deref().map_or(Ok(()), identifier),
             Self::Add(x) => {
@@ -456,7 +467,7 @@ pub fn id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-/// Current membership state; removed incarnations remain only in private durable history.
+/// Membership state; removed incarnations appear only in the owner's historical binding view.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MemberState {
@@ -464,6 +475,8 @@ pub enum MemberState {
     Pending,
     /// Confirmed member eligible to act and vote.
     Active,
+    /// Archived incarnation with no pool access, regardless of its last observed process state.
+    Removed,
 }
 /// Transport-free member projection used in every participant response and event.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -80,13 +80,18 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Read one bounded authenticated section: overview/members up to five assignments (two with owner mappings), history up to three events within 10 KiB, votes up to three ballots. after resumes within that section. proposal_id reads a retained decision. Removed members cannot read.",
+    "description": "Read one bounded authenticated section: overview/members up to five assignments (two with owner mappings), history up to three events within 10 KiB, votes up to three ballots. after resumes within that section. proposal_id reads a retained decision. Owner-only binding requires member_id and after=0 and includes removed mappings. Removed members cannot read.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
         "after": {
           "minimum": 0,
           "type": "integer"
+        },
+        "member_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
         },
         "pool_id": {
           "maxLength": 128,
@@ -105,7 +110,8 @@
             "history",
             "proposal",
             "votes",
-            "deliveries"
+            "deliveries",
+            "binding"
           ],
           "type": "string"
         }
@@ -587,7 +593,7 @@
       "openWorldHint": true,
       "readOnlyHint": false
     },
-    "description": "Owner or confirmed member opens one proposal with result, criteria and a frozen confirmed roster. A still-open proposal prevents another. Leader never votes.",
+    "description": "Owner or confirmed member opens the current proposal with result, criteria and a frozen confirmed roster. Revising an open proposal at the current revision archives it as stale and clears current readiness. Accepted decisions remain immutable. Leader never votes.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {

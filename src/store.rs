@@ -671,12 +671,6 @@ fn execute(db: &Connection, actor: &Actor, command: &Command) -> Result<Reply, F
             ("owner_message", x.body.clone(), false)
         }
         Command::Propose(x) => {
-            if p.proposal
-                .as_ref()
-                .is_some_and(|x| x.state == ProposalState::Open)
-            {
-                return Err(Fault::Conflict);
-            }
             let voters: Vec<_> = roster
                 .iter()
                 .filter(|b| b.member.state == MemberState::Active)
@@ -684,6 +678,19 @@ fn execute(db: &Connection, actor: &Actor, command: &Command) -> Result<Reply, F
                 .collect();
             if voters.is_empty() {
                 return Err(Fault::Conflict);
+            }
+            let superseded = if let Some(previous) = p
+                .proposal
+                .as_mut()
+                .filter(|p| p.state == ProposalState::Open)
+            {
+                previous.state = ProposalState::Stale;
+                Some(previous.proposal_id.clone())
+            } else {
+                None
+            };
+            if superseded.is_some() {
+                save_pool(db, &p)?;
             }
             let frozen: Vec<_> = roster
                 .iter()
@@ -705,7 +712,16 @@ fn execute(db: &Connection, actor: &Actor, command: &Command) -> Result<Reply, F
             p.proposal = Some(proposal);
             (
                 "proposal_opened",
-                format!("Result:\n{}\nCriteria:\n{}", x.result, x.criteria),
+                format!(
+                    "{}Result:\n{}\nCriteria:\n{}",
+                    superseded
+                        .map(|id| format!(
+                            "Supersedes proposal {id}; its previous votes remain archived.\n"
+                        ))
+                        .unwrap_or_default(),
+                    x.result,
+                    x.criteria
+                ),
                 true,
             )
         }
@@ -987,6 +1003,27 @@ fn view(
     let mut more = false;
     let mut private = Vec::new();
     match g.section {
+        Section::Binding => {
+            if !owner {
+                return Err(Fault::Forbidden);
+            }
+            p.proposal = None;
+            let mid = g.member_id.as_deref().ok_or(Fault::Invalid)?;
+            let row: Option<(String, bool)> = db
+                .query_row(
+                    "SELECT data,current FROM members WHERE id=?1 AND pool=?2",
+                    params![mid, p.pool_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let (data, current) = row.ok_or(Fault::Forbidden)?;
+            let mut binding: Binding = decode(&data)?;
+            if !current {
+                binding.member.state = MemberState::Removed;
+            }
+            members.push(binding.member.clone());
+            private.push(binding);
+        }
         Section::Overview | Section::Members => {
             p.proposal = None;
             let offset = usize::try_from(g.after).map_err(|_| Fault::Invalid)?;
@@ -1574,6 +1611,7 @@ mod tests {
                 after: 0,
                 section: Section::Overview,
                 proposal_id: None,
+                member_id: None,
             }),
         )
     }
@@ -2064,6 +2102,7 @@ mod tests {
                                 after: cursor,
                                 section: section.clone(),
                                 proposal_id: None,
+                                member_id: None,
                             }),
                         )
                         .unwrap();
@@ -2164,6 +2203,7 @@ mod tests {
                     after: 0,
                     section: Section::Proposal,
                     proposal_id: Some(pr.proposal_id),
+                    member_id: None,
                 }),
             )
             .unwrap();
@@ -2255,6 +2295,119 @@ mod tests {
         while let Some(e) = s.next_effect().unwrap() {
             assert!(!matches!(e.work, Work::Deliver { .. }));
         }
+    }
+    /// Revising an open proposal archives its evidence as stale and requires fresh unanimous votes.
+    #[test]
+    fn proposal_revision_preserves_previous_votes_and_resets_readiness() {
+        let (_d, mut s) = fixture();
+        let lead = actor("lead");
+        let a = actor("a");
+        let b = actor("b");
+        let p = make(&mut s, &lead, "one");
+        add(&mut s, &lead, &p, &a);
+        join(&mut s, &a, &p);
+        add(&mut s, &lead, &p, &b);
+        join(&mut s, &b, &p);
+        let c = change(&s, &p);
+        s.execute(
+            &a,
+            &Command::Propose(Propose {
+                change: c,
+                result: "First".into(),
+                criteria: "Original".into(),
+            }),
+        )
+        .unwrap();
+        let old = pool(&s.db, &p).unwrap().0.proposal.unwrap();
+        let c = change(&s, &p);
+        s.execute(
+            &a,
+            &Command::Vote(Vote {
+                change: c,
+                proposal_id: old.proposal_id.clone(),
+                roster_key: old.roster_key.clone(),
+                choice: Choice::Ready,
+                evidence: "original proof".into(),
+            }),
+        )
+        .unwrap();
+        let c = change(&s, &p);
+        s.execute(
+            &b,
+            &Command::Propose(Propose {
+                change: c,
+                result: "Revised".into(),
+                criteria: "Corrected".into(),
+            }),
+        )
+        .unwrap();
+        let latest = pool(&s.db, &p).unwrap().0.proposal.unwrap();
+        assert_ne!(latest.proposal_id, old.proposal_id);
+        assert_eq!(latest.state, ProposalState::Open);
+        assert!(latest.votes.is_empty());
+        let old_json: String =
+            s.db.query_row(
+                "SELECT data FROM proposals WHERE id=?1",
+                [&old.proposal_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let archived: Proposal = decode(&old_json).unwrap();
+        assert_eq!(archived.state, ProposalState::Stale);
+        assert_eq!(
+            archived.votes.values().next().unwrap().evidence,
+            "original proof"
+        );
+        let c = change(&s, &p);
+        assert!(matches!(
+            s.execute(
+                &a,
+                &Command::Vote(Vote {
+                    change: c,
+                    proposal_id: old.proposal_id,
+                    roster_key: old.roster_key,
+                    choice: Choice::Ready,
+                    evidence: "old".into()
+                })
+            ),
+            Err(Fault::Stale)
+        ));
+    }
+    /// The owner retains exact removed mappings for independent process control; peers never receive them.
+    #[test]
+    fn historical_binding_is_owner_only_after_removal() {
+        let (_d, mut s) = fixture();
+        let lead = actor("lead");
+        let a = actor("private-native-address");
+        let b = actor("peer");
+        let p = make(&mut s, &lead, "one");
+        let mid = add(&mut s, &lead, &p, &a);
+        join(&mut s, &a, &p);
+        add(&mut s, &lead, &p, &b);
+        join(&mut s, &b, &p);
+        let c = change(&s, &p);
+        s.execute(
+            &lead,
+            &Command::Remove(Remove {
+                change: c,
+                member_id: mid.clone(),
+            }),
+        )
+        .unwrap();
+        let query = Command::Get(Get {
+            pool_id: p,
+            after: 0,
+            section: Section::Binding,
+            proposal_id: None,
+            member_id: Some(mid),
+        });
+        assert!(matches!(s.execute(&b, &query), Err(Fault::Forbidden)));
+        assert!(matches!(s.execute(&a, &query), Err(Fault::Forbidden)));
+        let Reply::OwnerView { bindings, .. } = s.execute(&lead, &query).unwrap() else {
+            panic!("owner view")
+        };
+        assert_eq!(bindings[0].address.as_deref(), Some(a.address.as_str()));
+        assert_eq!(bindings[0].member.state, MemberState::Removed);
     }
     /// Refusing a future database must leave its bytes and journal mode unchanged.
     #[test]

@@ -52,6 +52,9 @@ enum Task {
     Test { suite: String },
     /// Build a new immutable single-binary directory, or verify an existing one.
     Package {
+        /// Explicit new artifact directory; omitted uses the product's dist directory.
+        #[arg(long)]
+        out: Option<PathBuf>,
         #[command(subcommand)]
         command: Option<PackageCommand>,
     },
@@ -519,7 +522,10 @@ impl Project {
         );
         Ok(())
     }
-    pub(crate) fn package(&self) -> Result<PathBuf> {
+    /// Builds and verifies an immutable bundle from committed source, returning its directory.
+    /// `out` selects an explicit new artifact path; omission retains the standard dist layout.
+    /// Existing bundle directories are refused; packaging never activates or restarts a service.
+    pub(crate) fn package(&self, out: Option<PathBuf>) -> Result<PathBuf> {
         self.standard()?;
         if !text(&self.root, "git", &["status", "--porcelain"])?.is_empty() {
             return Err("commit product changes before packaging".into());
@@ -538,10 +544,11 @@ impl Project {
             }
         };
         self.build(true)?;
-        let output = self
-            .root
-            .join("dist")
-            .join(format!("{}-{}-{}", self.name, self.version, target));
+        let output = out.unwrap_or_else(|| {
+            self.root
+                .join("dist")
+                .join(format!("{}-{}-{}", self.name, self.version, target))
+        });
         fs::create_dir_all(output.parent().ok_or("package parent absent")?)?;
         let manifest = Manifest {
             schema_version: 1,
@@ -639,9 +646,10 @@ fn main_result() -> Result<()> {
             ),
             _ => Err("unknown test suite".into()),
         },
-        Task::Package { command: None } => project.package().map(|_| ()),
+        Task::Package { command: None, out } => project.package(out).map(|_| ()),
         Task::Package {
             command: Some(PackageCommand::Verify { directory }),
+            out: None,
         } => {
             println!(
                 "{}",
@@ -649,6 +657,10 @@ fn main_result() -> Result<()> {
             );
             Ok(())
         }
+        Task::Package {
+            command: Some(_),
+            out: Some(_),
+        } => Err("--out is only accepted when creating a package".into()),
         Task::Release { command } => release::execute(&project, command),
         Task::Template { command } => upgrade::execute(&project, command),
     }
