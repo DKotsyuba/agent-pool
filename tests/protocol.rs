@@ -200,3 +200,43 @@ fn eof_releases_stdio_process() {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+
+/// The real rmcp dispatch moves wire _meta into RequestContext; the frontend must
+/// preserve those exact fields for SDK registration. The fake adapter only captures
+/// bytes and refuses authority: this is metadata transport proof, not native qualification.
+#[tokio::test]
+async fn original_call_metadata_reaches_registration_after_rmcp_dispatch() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let root =
+        tempfile::tempdir_in(std::env::var_os("TMPDIR").expect("task TMPDIR required")).unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let adapter_path = root.path().join("adapter.sock");
+    let core_path = root.path().join("core.sock");
+    let adapter = tokio::net::UnixListener::bind(&adapter_path).unwrap();
+    let _core = tokio::net::UnixListener::bind(&core_path).unwrap();
+    for path in [&adapter_path, &core_path] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let token = root.path().join("token");
+    std::fs::write(&token, "fixture-not-a-live-credential").unwrap();
+    std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let config = root.path().join("config.toml");
+    std::fs::write(&config,format!("socket_path={:?}\ndatabase_path={:?}\nexpected_uid={}\nbridge_registration_socket={:?}\nbridge_core_socket={:?}\nbridge_credential_file={:?}\nbridge_producer_id=\"pool-fixture\"\nbridge_audience=\"pool-backend-fixture\"\n",root.path().join("pool.sock"),root.path().join("pool.db"),std::fs::metadata(root.path()).unwrap().uid(),adapter_path,core_path,token)).unwrap();
+    let capture = tokio::spawn(async move {
+        let (stream, _) = adapter.accept().await.unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        serde_json::from_str::<serde_json::Value>(&line).unwrap()
+    });
+    tokio::time::timeout(Duration::from_secs(20),async {
+        let mut command=tokio::process::Command::new(binary());command.arg("mcp").arg("--config").arg(config).env_clear().env("HOME",root.path()).current_dir(root.path()).kill_on_drop(true).stderr(Stdio::null());
+        let client=().serve(TokioChildProcess::new(command).unwrap()).await.unwrap();
+        let original=serde_json::json!({"threadId":"fixture-thread","callId":"fixture-call","x-codex-turn-metadata":{"fixture":"protected-original"}});
+        let mut call=CallToolRequestParams::new("pool_list");call.meta=Some(serde_json::from_value(original.clone()).unwrap());
+        let result=client.call_tool(call).await.unwrap();assert_eq!(result.is_error,Some(true));
+        let received=capture.await.unwrap();let metadata=received.pointer("/params/evidence/metadata").expect("native registration metadata");
+        for key in ["threadId","callId","x-codex-turn-metadata"]{assert_eq!(metadata.get(key),original.get(key));}
+        client.cancel().await.unwrap();
+    }).await.expect("metadata fixture deadline");
+}

@@ -9,9 +9,9 @@ baseline = "rust-macos-2026-09-candidate1"
 qualification = "not_verified"
 
 [profiles]
-process = "in-process"
-state = "none"
-transports = ["stdio"]
+process = "resident"
+state = "local"
+transports = ["stdio", "unix"]
 host_adapter = false
 
 [compatibility]

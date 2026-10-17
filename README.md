@@ -1,93 +1,65 @@
 # agent-pool
 
-<!-- Replace this paragraph with your product's purpose: what it does for its
-caller and what it deliberately never does. -->
-A stdio MCP server. Repository: .
-Read AGENTS.md and docs/MCP_RESPONSE_STANDARD.md before adding tools.
+Persistent groups of native agents managed by an external leader. One leader can
+own several pools and never joins their rosters. Members collaborate through a
+shared journal, targeted messages and unanimous proposals. Run owns individual
+execution; Bridge owns identity and delivery. Pool owns group state.
+
+This candidate is not installed or live-qualified. Read
+[the architecture](docs/architecture.md) for trust boundaries and recovery behavior.
+
+## Running
+
+Provision explicit private paths and the required Bridge producer/audience grants
+using [config.example.toml](config.example.toml). Start the resident separately:
+
+```sh
+agent-pool serve --config /absolute/private/agent-pool/config.toml
+agent-pool mcp --config /absolute/private/agent-pool/config.toml
+```
+
+The second command belongs in the actual native host's MCP configuration so it
+receives protected original call metadata. Arbitrary shell invocations cannot
+invent a caller identity. The resident survives MCP frontend EOF. `get_status`,
+`doctor --json` and `contract export` work without live credentials.
 
 ## Tools
 
-| Tool | Effect | Purpose |
-|---|---|---|
-| `get_status` | read | product identity and release qualification status |
+| Tools | Purpose |
+|---|---|
+| `pool_create`, `pool_list`, `pool_get` | Create and inspect authorized persistent groups |
+| `pool_update`, `pool_close` | Owner changes metadata or explicitly closes a group |
+| `pool_add`, `pool_start_agent`, `pool_join` | Invite/start, onboard and confirm native membership |
+| `pool_member_update`, `pool_remove` | Change assignments or revoke an exact incarnation |
+| `pool_post`, `pool_send_member`, `pool_notify_owner` | Member broadcast, peer delivery and explicit owner contact |
+| `pool_propose`, `pool_vote` | Freeze criteria/roster and record unanimous acceptance |
 
-Replace this table with the product's real tools as their contracts are implemented.
+All mutations require a stable `request_key`; existing-pool mutations also require
+`expected_revision`. Read current state before new intent. A lost reply is recovered
+using the identical key and intent. `pool_get` sections are `overview`, `members`,
+`history`, `proposal`, `votes`, and `deliveries`; use the exact returned cursor.
+Removed agents cannot read or act. Removal does not stop their execution process.
 
 ## Development
 
-```bash
-cargo fetch --locked
+Use the pinned Rust toolchain and prepared offline dependencies. Set `TMPDIR`,
+`TMP`, `TEMP`, `CARGO_TARGET_DIR` and `CARGO_BUILD_BUILD_DIR` to the approved
+project-specific temporary/build directories before checks.
+
+```sh
+cargo check -p agent-pool --all-targets --offline --locked
+cargo test -p agent-pool --offline --locked
+cargo xtask contract update
 cargo xtask check
-cargo xtask add-tool NAME --effect read --response page
-cargo xtask test protocol
-cargo xtask test presentation
-cargo xtask test delivery
-cargo run --locked -- doctor --json
-cargo run --locked -- mcp
 ```
 
-Product source is in src/, the authoritative tool registry in src/tools/mod.rs,
-tool text templates in assets/mcp/tools/, and the exported discovery snapshot
-in schemas/tools.json. `cargo xtask contract update` is an explicit reviewed
-snapshot change. Generated tool stubs do not perform effects or return fake
-success; finish their contract and tests.
+Rust is the authoritative tool catalog; `schemas/tools.json` is a reviewed exported
+snapshot. The strict embedded MiniJinja layouts are in `src/templates`. No new
+framework, runtime language or external database service is required.
 
-Cargo.lock must be reviewed and committed.
-
-For a short edit loop, fetch the locked dependencies once, run formatting
-directly, then check the changed crate or run its relevant test target:
-
-```bash
-cargo fmt --all --check
-cargo check --frozen -p agent-pool --all-targets --all-features
-cargo test --frozen -p agent-pool --all-features --test protocol
-```
-
-Select the changed workspace crate and test filter as appropriate. These focused
-commands give early feedback; finish a coherent change with `cargo xtask check`
-and its applicable protocol/presentation/delivery checks before a PR. Changes to
-embedded templates or other compile-time assets require the same checks as code.
-Optimized packaging belongs to delivery, not every edit iteration.
-
-## Local delivery
-
-Commit your source first. No remote repository is required to build a local package.
-
-```bash
-cargo xtask package
-cargo xtask package verify dist/agent-pool-0.1.0-aarch64-apple-darwin
-```
-
-The bundle executable accepts `self-install --bundle PATH --home ABS_PATH --bin-dir ABS_PATH`.
-Create the bin directory explicitly. Installation preserves immutable versions, never restarts
-services and does not edit MCP host configuration. `releases use VERSION` verifies and selects
-a retained compatible version. This profile has no local data migration; external effects are
-not undone by a binary rollback. No automatic pruning or removal of user data.
-
-CI restores Cargo dependency builds and a versioned cargo-deny tool cache. Successful
-main check jobs warm the check cache; an independent main-only package job warms
-optimized package dependencies without uploading or publishing a release. This
-adds an optimized build to main CI, which runs alongside checks and costs extra
-compute on cold inputs. PRs use the check cache without the package producer.
-Release jobs restore both workloads without writing competing cache snapshots.
-Cache misses run the normal commands. The gate still
-runs on cache hits: workspaces without features need one all-features Clippy/test
-pass; workspaces with features retain default and all-features passes. Platform,
-compiler, dependency and build-setting changes invalidate the relevant cache.
-Release packages and their integrity/acceptance evidence remain separate artifacts.
-
-The release source check and exact payload build run in parallel. Publication
-waits for both to succeed, then preserves environment approval and tests the
-downloaded payload's exact bytes. Packaging does not enable release publication
-or establish native host qualification.
-
-The release workflow is guarded by release.enabled=false and qualification settings in family.toml.
-Version preparation is `cargo xtask release prepare VERSION --apply`; inspect/commit the changes,
-then create and push an annotated tag yourself. Publishing tests the exact shipped executable.
-
-## Template updates
-
-`cargo xtask template diff --from /trusted/template/checkout` compares original managed bytes,
-local changes and the next template. `template upgrade --dry-run` writes nothing.
-Apply the reviewed plan through Git; conflicting local changes and Cargo dependencies need review.
-The build has no live dependency on the private template repository.
+Packaging requires committed source and never grants native qualification.
+`self-install` and `releases use` preserve immutable version directories, check the
+state schema and do not register/restart services or edit host configuration.
+Release remains disabled until native qualification and explicit delivery approval.
+Legacy Run pools remain operational during additive qualification; archive and
+retirement are a separate guarded cutover, never an implicit database deletion.

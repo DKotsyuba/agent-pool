@@ -1,0 +1,5 @@
+COMMITTED pool {{ pool_id }} revision={{ revision }} event={{ event.event_id }}
+{{ event.kind }}{% if created_id %}; created_id={{ created_id }}{% endif %}
+Body: {{ event.body|quote }}
+Status: {{ status }}. External receipt is not proof that an agent read the message.
+Next: pool_get pool_id={{ pool_id }} for the current revision; repeat only the same request_key and intent after a lost reply.

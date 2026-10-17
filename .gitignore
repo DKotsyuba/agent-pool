@@ -1,4 +1,5 @@
 /target/
+/.codegraph/
 /dist/
 /.initializing
 *.rs.bk

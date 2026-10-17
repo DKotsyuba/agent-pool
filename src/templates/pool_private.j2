@@ -1,0 +1,3 @@
+OWNER-ONLY native mappings for this roster page:
+{% for binding in bindings %}{{ binding.member.member_id }} | address={% if binding.address %}{{ binding.address|quote }}{% else %}not resolved{% endif %}{% if binding.run_id %} | run={{ binding.run_id|quote }} sequence={{ binding.run_sequence }}{% endif %}
+{% endfor %}

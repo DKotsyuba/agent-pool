@@ -1,0 +1,5 @@
+OK accessible pools; more={{ has_more }}
+{% for pool in pools %}{{ pool.pool_id }} | revision={{ pool.revision }} | closed={{ pool.closed }} | {{ pool.name|quote }}
+Purpose: {{ pool.purpose|quote }}
+{% endfor %}{% if next_after %}Cursor: {{ next_after }}
+{% endif %}The leader can own several pools and remains outside every roster.

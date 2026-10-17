@@ -1,0 +1,25 @@
+OK pool {{ pool.pool_id }} revision={{ pool.revision }} closed={{ pool.closed }}
+Name: {{ pool.name|quote }}
+Purpose: {{ pool.purpose|quote }}
+Confirmed={{ active }} pending={{ pending }}; leader excluded. Section={{ section }}.
+{% for member in members %}{{ member.member_id }} | {{ member.state }} | execution={{ member.runtime }}
+Name: {{ member.name|quote }}; role: {{ member.role|quote }}
+Task: {{ member.task|quote }}
+{% endfor %}
+{% for delivery in deliveries %}Operation {{ delivery.operation_id }} {{ delivery.operation }} state={{ delivery.state }}{% if delivery.member_id %} member={{ delivery.member_id }}{% endif %}
+{% endfor %}
+{% for event in events %}Event {{ event.event_id }} revision={{ event.revision }} {{ event.kind }} author={{ event.author.kind }}{% if event.author.kind == 'member' %}:{{ event.author.member_id }}{% endif %}{% if event.recipient %} recipient={{ event.recipient }}{% endif %}
+Body: {{ event.body|quote }}
+{% endfor %}
+{% if pool.proposal %}Proposal {{ pool.proposal.proposal_id }} state={{ pool.proposal.state }} roster_key={{ pool.proposal.roster_key }}
+{% if section == 'proposal' %}Result: {{ pool.proposal.result|quote }}
+Criteria: {{ pool.proposal.criteria|quote }}
+Voters:{% for voter in pool.proposal.voters %} {{ voter }}{% endfor %}
+{% endif %}{% for voter in pool.proposal.votes %}Vote {{ voter }}: {{ pool.proposal.votes[voter].choice }}
+Evidence: {{ pool.proposal.votes[voter].evidence|quote }}
+{% endfor %}{% elif section == 'proposal' or section == 'votes' %}Proposal: none.
+{% endif %}
+More={{ has_more }}; next_after={{ next_after }}. Continue pool_get with the same pool_id and section.
+Roster/vote pages are live; restart that section from after=0 if its pool revision changed.
+Sections: overview, members, history, proposal, votes, deliveries. proposal_id selects a retained decision.
+Delivery accepted means native handoff, never comprehension; custody and unknown remain monitored.

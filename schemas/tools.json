@@ -1,13 +1,690 @@
 [
   {
-    "name": "get_status",
-    "description": "Report the product identity and scaffold qualification status. Read-only; does not access files or external services.",
-    "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
     "annotations": {
-      "readOnlyHint": true,
       "destructiveHint": false,
       "idempotentHint": true,
-      "openWorldHint": false
-    }
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Report product identity and qualification. No service or credentials needed.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "name": "get_status"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Create a persistent pool and permanently become a global external leader. Current or pending members cannot create pools. Retry only the same request_key and intent.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "maxLength": 80,
+          "minLength": 1,
+          "type": "string"
+        },
+        "purpose": {
+          "maxLength": 512,
+          "minLength": 1,
+          "type": "string"
+        },
+        "request_key": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "request_key",
+        "name",
+        "purpose"
+      ],
+      "type": "object"
+    },
+    "name": "pool_create"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Read ten accessible pools per page; after is the last exact pool ID. Leader is excluded from all rosters.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "after": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "name": "pool_list"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Read one bounded authenticated section: overview/members up to five assignments (two with owner mappings), history up to three events within 10 KiB, votes up to three ballots. after resumes within that section. proposal_id reads a retained decision. Removed members cannot read.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "after": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pool_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "proposal_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "section": {
+          "enum": [
+            "overview",
+            "members",
+            "history",
+            "proposal",
+            "votes",
+            "deliveries"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "pool_id"
+      ],
+      "type": "object"
+    },
+    "name": "pool_get"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Owner updates pool name and purpose at the current revision; current members are notified.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "expected_revision": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "name": {
+          "maxLength": 80,
+          "minLength": 1,
+          "type": "string"
+        },
+        "pool_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "purpose": {
+          "maxLength": 512,
+          "minLength": 1,
+          "type": "string"
+        },
+        "request_key": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "pool_id",
+        "expected_revision",
+        "request_key",
+        "name",
+        "purpose"
+      ],
+      "type": "object"
+    },
+    "name": "pool_update"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Owner explicitly closes the pool and revokes memberships. Cancels only provably unhanded delivery; never stops processes or clears global leader status.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "expected_revision": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "pool_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "request_key": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "pool_id",
+        "expected_revision",
+        "request_key"
+      ],
+      "type": "object"
+    },
+    "name": "pool_close"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Owner invites one canonical Bridge address and delivers onboarding. Leaders and reserved agents refuse. Maximum 20 current/pending members; actual identity binds through pool_join.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "address": {
+          "maxLength": 1024,
+          "minLength": 1,
+          "type": "string"
+        },
+        "expected_revision": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "name": {
+          "maxLength": 80,
+          "minLength": 1,
+          "type": "string"
+        },
+        "pool_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "request_key": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "role": {
+          "maxLength": 160,
+          "minLength": 1,
+          "type": "string"
+        },
+        "task": {
+          "maxLength": 512,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "pool_id",
+        "expected_revision",
+        "request_key",
+        "address",
+        "name",
+        "role",
+        "task"
+      ],
+      "type": "object"
+    },
+    "name": "pool_add"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Owner reserves a pending member and durably requests one Run agent with onboarding and required MCP assertions. Lost responses never authorize a replacement agent.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "expected_revision": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "name": {
+          "maxLength": 80,
+          "minLength": 1,
+          "type": "string"
+        },
+        "pool_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "request_key": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "role": {
+          "maxLength": 160,
+          "minLength": 1,
+          "type": "string"
+        },
+        "spec": {
+          "description": "Original Run start specification, at most 64 KiB. Required tools are asserted, never injected.",
+          "type": "object"
+        },
+        "task": {
+          "maxLength": 512,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "pool_id",
+        "expected_revision",
+        "request_key",
+        "name",
+        "role",
+        "task",
+        "spec"
+      ],
+      "type": "object"
+    },
+    "name": "pool_start_agent"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Owner changes an exact current member assignment, notifies members and stales unfinished proposals. Accepted decisions stay immutable.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "expected_revision": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "member_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "name": {
+          "maxLength": 80,
+          "minLength": 1,
+          "type": "string"
+        },
+        "pool_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "request_key": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "role": {
+          "maxLength": 160,
+          "minLength": 1,
+          "type": "string"
+        },
+        "task": {
+          "maxLength": 512,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "pool_id",
+        "expected_revision",
+        "request_key",
+        "member_id",
+        "name",
+        "role",
+        "task"
+      ],
+      "type": "object"
+    },
+    "name": "pool_member_update"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Owner removes a member; members may remove only themselves. Revokes access, retires unhanded deliveries and sends one final notice. Does not stop execution.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "expected_revision": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "member_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "pool_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "request_key": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "pool_id",
+        "expected_revision",
+        "request_key",
+        "member_id"
+      ],
+      "type": "object"
+    },
+    "name": "pool_remove"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Pending agent acknowledges the current onboarding revision under fresh native identity. Leaders cannot join any pool. Delivery is not acknowledgment.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "expected_revision": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "pool_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "request_key": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "pool_id",
+        "expected_revision",
+        "request_key"
+      ],
+      "type": "object"
+    },
+    "name": "pool_join"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Post to current members, excluding the sender's duplicate wakeup. Leader is not automatically notified. Recorded in shared history.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "body": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "type": "string"
+        },
+        "expected_revision": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "pool_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "request_key": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "pool_id",
+        "expected_revision",
+        "request_key",
+        "body"
+      ],
+      "type": "object"
+    },
+    "name": "pool_post"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Deliver to one exact current membership ID and record shared history. No external or cross-pool destination. Removed IDs are never redirected.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "body": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "type": "string"
+        },
+        "expected_revision": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "member_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "pool_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "request_key": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "pool_id",
+        "expected_revision",
+        "request_key",
+        "member_id",
+        "body"
+      ],
+      "type": "object"
+    },
+    "name": "pool_send_member"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Confirmed member explicitly notifies the hidden external owner, without an address argument. Recorded in shared history.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "body": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "type": "string"
+        },
+        "expected_revision": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "pool_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "request_key": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "pool_id",
+        "expected_revision",
+        "request_key",
+        "body"
+      ],
+      "type": "object"
+    },
+    "name": "pool_notify_owner"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Owner or confirmed member opens one proposal with result, criteria and a frozen confirmed roster. A still-open proposal prevents another. Leader never votes.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "criteria": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "type": "string"
+        },
+        "expected_revision": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "pool_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "request_key": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "result": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "pool_id",
+        "expected_revision",
+        "request_key",
+        "result",
+        "criteria"
+      ],
+      "type": "object"
+    },
+    "name": "pool_propose"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Confirmed members vote against exact proposal_id and roster_key. Ready requires evidence; block/revoke persist. Unanimity accepts an immutable decision without closing the pool or stopping agents.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "choice": {
+          "enum": [
+            "ready",
+            "block",
+            "revoke"
+          ],
+          "type": "string"
+        },
+        "evidence": {
+          "maxLength": 2048,
+          "type": "string"
+        },
+        "expected_revision": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "pool_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "proposal_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "request_key": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "roster_key": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "pool_id",
+        "expected_revision",
+        "request_key",
+        "proposal_id",
+        "roster_key",
+        "choice"
+      ],
+      "type": "object"
+    },
+    "name": "pool_vote"
   }
 ]

@@ -1,5 +1,10 @@
 //! Rust MCP application; protocol, presentation and deployment have separate boundaries.
+mod config;
+mod domain;
+mod integrations;
 mod response;
+mod runtime;
+mod store;
 mod tools;
 use clap::{Parser, Subcommand};
 use mcp_presentation::Renderer;
@@ -11,64 +16,100 @@ use std::{path::PathBuf, process::ExitCode, sync::Arc};
 /// Private catalog cache lifetime in milliseconds for modern MCP requests.
 const TOOLS_LIST_TTL_MS: u64 = 60_000;
 
+/// Command-line entry point; endpoint configuration is explicit and never inferred from identity variables.
 #[derive(Parser)]
 #[command(version, about = concat!(env!("CARGO_PKG_NAME"), " MCP server"))]
 struct Cli {
+    /// Selected operator or MCP command.
     #[command(subcommand)]
     command: Commands,
 }
+/// Explicit service, MCP and family delivery commands.
 #[derive(Subcommand)]
 enum Commands {
-    /// Run the protocol-only stdio endpoint.
-    Mcp,
+    /// Run the stdio frontend; missing configuration still permits catalog and product identity.
+    Mcp {
+        /// Explicit private resident/Bridge configuration file; absent disables pool calls.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Own the persistent local pool store, socket and background delivery worker.
+    Serve {
+        /// Explicit validated endpoint and credential configuration.
+        #[arg(long)]
+        config: PathBuf,
+    },
     /// Check local resources, without credentials, network or mutation.
     Doctor {
+        /// Request JSON diagnostics (the current output is always JSON).
         #[arg(long)]
         json: bool,
     },
     /// Export the actual registry or inspect unimplemented tool stubs.
     Contract {
+        /// Selected nested command.
         #[command(subcommand)]
         command: ContractCommand,
     },
     /// Install a verified single-binary bundle. Does not restart services.
     SelfInstall {
+        /// Verified family bundle directory.
         #[arg(long)]
         bundle: PathBuf,
+        /// Existing managed installation home.
         #[arg(long)]
         home: PathBuf,
+        /// Directory containing the managed executable link.
         #[arg(long)]
         bin_dir: PathBuf,
     },
     /// Select a retained compatible installation.
     Releases {
+        /// Selected nested command.
         #[command(subcommand)]
         command: ReleaseCommand,
     },
 }
+/// Read-only embedded tool contract commands.
 #[derive(Subcommand)]
 enum ContractCommand {
+    /// Print the authoritative embedded tool registry.
     Export,
+    /// Print currently incomplete tool names.
     Readiness,
 }
+/// Existing family installation selection commands.
 #[derive(Subcommand)]
 enum ReleaseCommand {
+    /// Activate an already retained compatible version.
     Use {
+        /// Exact retained semantic version.
         version: String,
+        /// Existing managed installation home.
         #[arg(long)]
         home: PathBuf,
+        /// Directory containing the managed executable link.
         #[arg(long)]
         bin_dir: PathBuf,
     },
 }
+/// Stateless MCP frontend backed by the separately owned persistent resident.
 #[derive(Clone)]
 struct Handler {
+    /// Embedded product identity renderer.
     identity: Arc<Renderer>,
+    /// Safe response templates shared across concurrent MCP calls.
     templates: Arc<response::Templates>,
+    /// Static tool catalog, available without service configuration.
     catalog: Vec<Tool>,
+    /// Operator-supplied configuration path, never a caller identity source.
+    config: Option<PathBuf>,
+    /// Admission bound for concurrent native assertion exchanges in this frontend.
+    calls: Arc<tokio::sync::Semaphore>,
 }
 impl Handler {
-    fn new() -> Result<Self, &'static str> {
+    /// Validates embedded presentation/catalog resources; performs no service or credential I/O.
+    fn new(config: Option<PathBuf>) -> Result<Self, &'static str> {
         let identity = Renderer::new().map_err(|_| "presentation_setup_failed")?;
         let templates = response::Templates::new(&tools::templates())?;
         let catalog = serde_json::from_value(serde_json::Value::Array(tools::definitions()))
@@ -77,14 +118,17 @@ impl Handler {
             identity: Arc::new(identity),
             templates: Arc::new(templates),
             catalog,
+            config,
+            calls: Arc::new(tokio::sync::Semaphore::new(32)),
         })
     }
 }
 impl ServerHandler for Handler {
+    /// Reports protocol capabilities and instructions without claiming service or live qualification.
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
-            .with_instructions("Use get_status for identity. Tool descriptions define effects. A not_implemented result never means work was performed.")
+            .with_instructions("Use get_status for product identity. Pool calls require a current authenticated native invocation and configured resident. Durable admission is separate from external delivery and agent completion.")
     }
     /// Return the static catalog; modern requests cache it privately for 60 seconds.
     /// Pagination is unused; legacy sessions retain their original wire fields.
@@ -104,18 +148,46 @@ impl ServerHandler for Handler {
         }
         Ok(result)
     }
+    /// Routes one actual call, preserving protected metadata and requiring fresh authentication for Pool.
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
+        // rmcp 3.4 moves the ORIGINAL wire params._meta into RequestContext before
+        // dispatch (service.rs); request.meta is empty here. This is not a fallback
+        // identity. The native adapter must still authenticate its protected claims.
+        let original_meta = serde_json::to_value(&context.meta)
+            .map_err(|_| McpError::new(ErrorCode::INVALID_PARAMS, "Invalid tool metadata", None))?;
         let args = serde_json::Value::Object(request.arguments.unwrap_or_default());
-        let reply = tools::call(&request.name, args, &self.identity, &self.templates)
-            .await
-            .ok_or_else(|| McpError::new(ErrorCode::METHOD_NOT_FOUND, "Unknown tool", None))?;
-        Ok(reply.into())
+        if request.name == "get_status" {
+            return tools::call(&request.name, args, &self.identity, &self.templates)
+                .await
+                .map(Into::into)
+                .ok_or_else(|| McpError::new(ErrorCode::METHOD_NOT_FOUND, "Unknown tool", None));
+        }
+        if !self.catalog.iter().any(|tool| tool.name == request.name) {
+            return Err(McpError::new(
+                ErrorCode::METHOD_NOT_FOUND,
+                "Unknown tool",
+                None,
+            ));
+        }
+        let Ok(_permit) = self.calls.try_acquire() else {
+            return Ok(tools::present(Err(domain::Fault::Unavailable), &self.templates).into());
+        };
+        let command = serde_json::from_value::<domain::Command>(
+            serde_json::json!({"name":request.name,"arguments":args}),
+        );
+        let result = match (command, self.config.as_deref()) {
+            (Ok(command), Some(path)) => runtime::frontend(&command, original_meta, path).await,
+            (Err(_), _) => Err(domain::Fault::Invalid),
+            (_, None) => Err(domain::Fault::Unavailable),
+        };
+        Ok(tools::present(result, &self.templates).into())
     }
 }
+/// Prints one operator-facing JSON result; never used for MCP protocol output.
 #[allow(clippy::print_stdout, reason = "Explicit CLI branch, never MCP output")]
 fn print_json(value: impl serde::Serialize) -> ExitCode {
     match serde_json::to_string_pretty(&value) {
@@ -147,6 +219,7 @@ fn qualification() -> &'static str {
     })
 }
 
+/// Dispatches explicit CLI work; stdio shutdown affects only its frontend, never the resident.
 #[tokio::main]
 async fn main() -> ExitCode {
     match Cli::parse().command {
@@ -176,7 +249,7 @@ async fn main() -> ExitCode {
             }
         },
         Commands::Doctor { json: _ } => {
-            let ready = Handler::new().is_ok();
+            let ready = Handler::new(None).is_ok();
             let output = print_json(
                 serde_json::json!({"product":env!("CARGO_PKG_NAME"),"version":env!("CARGO_PKG_VERSION"),
                 "local_ready":ready,"release_qualification":qualification(),"incomplete_tools":tools::incomplete()}),
@@ -185,7 +258,7 @@ async fn main() -> ExitCode {
         }
         Commands::Contract {
             command: ContractCommand::Export,
-        } => match Handler::new() {
+        } => match Handler::new(None) {
             Ok(h) => print_json(h.catalog),
             Err(e) => {
                 eprintln!("contract: {e}");
@@ -195,8 +268,15 @@ async fn main() -> ExitCode {
         Commands::Contract {
             command: ContractCommand::Readiness,
         } => print_json(tools::incomplete()),
-        Commands::Mcp => {
-            let h = match Handler::new() {
+        Commands::Serve { config } => match runtime::serve(&config).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("resident: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Commands::Mcp { config } => {
+            let h = match Handler::new(config) {
                 Ok(h) => h,
                 Err(e) => {
                     eprintln!("startup: {e}");

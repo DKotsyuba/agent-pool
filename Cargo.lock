@@ -106,7 +106,7 @@ dependencies = [
 [[package]]
 name = "bridge-protocol"
 version = "0.3.1"
-source = "git+https://github.com/DKotsyuba/agent-bridge.git?rev=3ceccc72d25b375f4677353e483b4d0b6dbe1af6#3ceccc72d25b375f4677353e483b4d0b6dbe1af6"
+source = "git+https://github.com/DKotsyuba/agent-bridge.git?rev=ae32d1c3c012cc1e40c6d60c9adcad7005298688#ae32d1c3c012cc1e40c6d60c9adcad7005298688"
 dependencies = [
  "serde",
  "serde_json",
@@ -116,12 +116,13 @@ dependencies = [
 [[package]]
 name = "bridge-sdk"
 version = "0.3.1"
-source = "git+https://github.com/DKotsyuba/agent-bridge.git?rev=3ceccc72d25b375f4677353e483b4d0b6dbe1af6#3ceccc72d25b375f4677353e483b4d0b6dbe1af6"
+source = "git+https://github.com/DKotsyuba/agent-bridge.git?rev=ae32d1c3c012cc1e40c6d60c9adcad7005298688#ae32d1c3c012cc1e40c6d60c9adcad7005298688"
 dependencies = [
  "bridge-protocol",
  "serde",
  "serde_json",
  "socket2",
+ "tokio",
 ]
 
 [[package]]
