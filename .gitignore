@@ -1,0 +1,7 @@
+/target/
+/dist/
+/.initializing
+*.rs.bk
+.DS_Store
+.env
+.env.*

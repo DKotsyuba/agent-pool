@@ -1,0 +1,97 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  check:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: test "$(uname -m)" = arm64
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: product-check-v2-macos-26-${{ runner.arch }}
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - run: cargo fetch --locked
+      - run: cargo xtask check
+      # Main warms native publisher tooling; PRs never compile this unused tool.
+      - name: Restore native cargo-deny
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        id: cargo-deny-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.cargo/bin/cargo-deny
+          key: cargo-deny-${{ runner.os }}-${{ runner.arch }}-macos-26-0.20.2-${{ hashFiles('rust-toolchain.toml') }}
+      - name: Prepare verified native cargo-deny
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        run: |
+          if [ "$(cargo deny --version 2>/dev/null)" != 'cargo-deny 0.20.2' ]; then
+            cargo install cargo-deny --version 0.20.2 --locked --force
+          fi
+          test "$(cargo deny --version)" = 'cargo-deny 0.20.2'
+      - name: Save native cargo-deny
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cargo-deny-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.cargo/bin/cargo-deny
+          key: ${{ steps.cargo-deny-cache.outputs.cache-primary-key }}
+  # One trusted main producer warms optimized dependencies without publishing.
+  package:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: test "$(uname -m)" = arm64
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: product-package-v1-macos-26-${{ runner.arch }}
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - run: cargo fetch --locked
+      - name: Warm and verify the native package workload
+        shell: bash
+        run: |
+          bundle=$(cargo xtask package | tail -n 1)
+          cargo xtask package verify "$bundle"
+  dependencies:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Restore cargo-deny
+        id: cargo-deny-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.cargo/bin/cargo-deny
+          key: cargo-deny-${{ runner.os }}-${{ runner.arch }}-ubuntu-24.04-0.20.2-${{ hashFiles('rust-toolchain.toml') }}
+      - name: Prepare verified cargo-deny
+        shell: bash
+        run: |
+          if [ "$(cargo deny --version 2>/dev/null)" != 'cargo-deny 0.20.2' ]; then
+            cargo install cargo-deny --version 0.20.2 --locked --force
+          fi
+          test "$(cargo deny --version)" = 'cargo-deny 0.20.2'
+      - run: cargo deny --locked check
+      - name: Save cargo-deny
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cargo-deny-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.cargo/bin/cargo-deny
+          key: ${{ steps.cargo-deny-cache.outputs.cache-primary-key }}

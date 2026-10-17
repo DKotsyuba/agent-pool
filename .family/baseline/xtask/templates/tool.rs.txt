@@ -1,0 +1,41 @@
+//! @@TOOL@@: generated contract and typed skeleton. No external effect is implemented.
+use crate::response::Templates;
+use rmcp::model::{CallToolResult, ContentBlock};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+pub const IMPLEMENTED: bool = false;
+pub const TEMPLATE: &str = include_str!("../../assets/mcp/tools/@@TOOL@@.txt.j2");
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Arguments {}
+#[derive(Serialize)]
+struct View { code: &'static str, message: &'static str }
+
+pub fn definition() -> Value {
+    json!({"name":"@@TOOL@@", "description":"Unimplemented @@EFFECT@@ tool skeleton; calls are refused without effects.",
+        "inputSchema":{"type":"object","properties":{},"additionalProperties":false},
+        "annotations":{"readOnlyHint":@@READ_ONLY@@,"destructiveHint":@@DESTRUCTIVE@@,"idempotentHint":@@IDEMPOTENT@@,"openWorldHint":@@OPEN_WORLD@@}})
+}
+pub async fn call(args: Value, templates: &Templates) -> CallToolResult {
+    let view = if serde_json::from_value::<Arguments>(args).is_ok() {
+        View { code: "not_implemented", message: "@@TOOL@@ has no implementation. No effect was performed." }
+    } else {
+        View { code: "invalid_arguments", message: "This skeleton accepts an empty argument object." }
+    };
+    let text = templates.render("@@TOOL@@", &view).unwrap_or_else(|_| "ERROR not_implemented: tool unavailable; no effect was performed.\nPresentation: degraded.\n".to_owned());
+    let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+    result.is_error = Some(true);
+    result
+}
+#[cfg(test)]
+#[allow(clippy::unwrap_used, reason = "Test fixtures")]
+mod tests {
+    use super::*;
+    #[test] fn template_contract() {
+        let r = Templates::new(&[("@@TOOL@@", TEMPLATE)]).unwrap();
+        let text = r.render("@@TOOL@@", &View { code: "not_implemented", message: "@@TOOL@@ has no implementation. No effect was performed." }).unwrap();
+        assert_eq!(text, include_str!("../../tests/fixtures/@@TOOL@@.txt"));
+    }
+}

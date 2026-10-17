@@ -1,0 +1,13 @@
+[
+  {
+    "name": "get_status",
+    "description": "Report the product identity and scaffold qualification status. Read-only; does not access files or external services.",
+    "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  }
+]

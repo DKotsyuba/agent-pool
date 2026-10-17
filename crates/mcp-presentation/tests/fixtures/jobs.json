@@ -1,0 +1,9 @@
+{
+  "jobs": [
+    {"id":"ag-17","status":"running","title":"Fix token refresh","provider":{"account":"private","access_token":"SECRET_CANARY"},"debug":{"attempt":3}},
+    {"id":"ag-18","status":"failed","title":"Run integration tests","internal_latency_ms":183}
+  ],
+  "has_more": true,
+  "next_cursor": "page-2",
+  "request_headers": {"Authorization":"Bearer SECRET_CANARY"}
+}

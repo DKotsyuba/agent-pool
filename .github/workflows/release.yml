@@ -1,0 +1,108 @@
+name: release
+on:
+  push:
+    tags: ['v*.*.*']
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  check:
+    runs-on: macos-26
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: test "$(uname -m)" = arm64
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: product-check-v2-macos-26-${{ runner.arch }}
+          cache-bin: false
+          save-if: false
+      - run: cargo fetch --locked
+      - run: cargo xtask check
+  # Build independently of the source gate; publication requires both to pass.
+  build:
+    runs-on: macos-26
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: test "$(uname -m)" = arm64
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: product-package-v1-macos-26-${{ runner.arch }}
+          cache-bin: false
+          save-if: false
+      - run: cargo fetch --locked
+      - name: Build the exact payload once
+        shell: bash
+        run: |
+          bundle=$(cargo xtask package | tail -n 1)
+          cargo xtask package verify "$bundle"
+          mkdir "$RUNNER_TEMP/upload"
+          cp "$bundle/"* "$RUNNER_TEMP/upload/"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: payload
+          path: ${{ runner.temp }}/upload/
+          if-no-files-found: error
+          retention-days: 7
+  publish:
+    needs: [check, build]
+    runs-on: macos-26
+    timeout-minutes: 40
+    permissions:
+      contents: write
+    environment: release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: test "$(uname -m)" = arm64
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: product-check-v2-macos-26-${{ runner.arch }}
+          cache-bin: false
+          save-if: false
+      - name: Restore native cargo-deny
+        id: cargo-deny-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.cargo/bin/cargo-deny
+          key: cargo-deny-${{ runner.os }}-${{ runner.arch }}-macos-26-0.20.2-${{ hashFiles('rust-toolchain.toml') }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: payload
+          path: ${{ runner.temp }}/payload
+      - name: Build only tooling, without release credentials in its environment
+        run: |
+          cargo fetch --locked
+          cargo build --frozen -p xtask
+          if [ "$(cargo deny --version 2>/dev/null)" != 'cargo-deny 0.20.2' ]; then
+            cargo install cargo-deny --version 0.20.2 --locked --force
+          fi
+          test "$(cargo deny --version)" = 'cargo-deny 0.20.2'
+      - name: Save native cargo-deny
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && steps.cargo-deny-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.cargo/bin/cargo-deny
+          key: ${{ steps.cargo-deny-cache.outputs.cache-primary-key }}
+      - name: Verify hashes before giving the payload executable permissions
+        shell: bash
+        run: |
+          target/debug/xtask package verify "$RUNNER_TEMP/payload"
+          find "$RUNNER_TEMP/payload" -type f ! -name release-manifest.json -exec chmod 755 {} \;
+      - name: Test the shipped payload, publish a complete draft, then make it visible
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: target/debug/xtask release publish "$RUNNER_TEMP/payload"
+      # Publishing additionally refuses release.enabled=false, unqualified targets/hosts and stubs.
+      # Configure required reviewers on the release environment; creating this file alone does not do it.

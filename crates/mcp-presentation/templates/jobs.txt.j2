@@ -1,0 +1,10 @@
+OK jobs: {{ returned }} returned; more={{ has_more }}
+{% for row in rows %}
+{{ row.id }} | {{ row.state }} | {{ row.title }}
+{% endfor %}
+{% if unknown_statuses > 0 %}
+Warning: {{ unknown_statuses }} unrecognized source status values.
+{% endif %}
+{% if cursor %}
+Cursor: {{ cursor }}
+{% endif %}
