@@ -717,6 +717,7 @@ mod tests {
             bridge_audience: "pool-test-backend".into(),
             bridge_observer_socket: None,
             bridge_observer_credential_file: None,
+            owner_observer_credential_file: None,
             run_socket: Some(path.join("run.sock")),
         }
     }

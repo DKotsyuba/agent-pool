@@ -2,6 +2,7 @@
 mod config;
 mod domain;
 mod integrations;
+mod observer;
 mod response;
 mod runtime;
 mod store;
@@ -27,6 +28,12 @@ struct Cli {
 /// Explicit service, MCP and family delivery commands.
 #[derive(Subcommand)]
 enum Commands {
+    /// Read owner projections from an existing resident using one structured stdin request.
+    Observe {
+        /// Explicit absolute config containing the separately provisioned observer credential.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
     /// Run the stdio frontend; missing configuration still permits catalog and product identity.
     Mcp {
         /// Explicit private resident/Bridge configuration file; absent disables pool calls.
@@ -223,6 +230,7 @@ fn qualification() -> &'static str {
 #[tokio::main]
 async fn main() -> ExitCode {
     match Cli::parse().command {
+        Commands::Observe { config } => observer::cli(config.as_deref()).await,
         Commands::SelfInstall {
             bundle,
             home,

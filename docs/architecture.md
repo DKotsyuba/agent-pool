@@ -108,3 +108,53 @@ Message delivery with KeepAll, kind `agent_pool`, and delivery scopes. Observati
 uses a separate opt-in credential. Missing Run leaves external-agent pools usable.
 No host registration, credentials, resident service, legacy migration or release is
 silently installed by the binary or source checks.
+
+## Owner Hub observation v1
+
+An optional `owner_observer_credential_file` enables a separate ingress on the
+existing resident socket. The operator provisions this private same-user 0600
+file in a 0700 directory. Provisioning the grant and activating a configured
+resident are separate owner actions; neither is performed by `observe`.
+The Bridge observation credential above retains its existing, independent role.
+Native participant calls still consume Current assertions, including reads and
+replay. Owner ingress cannot represent any participant command and never creates
+a native actor, leader, membership or assertion consumption.
+
+`agent-pool observe --config /absolute/config.toml` accepts exactly one bounded
+UTF-8 JSON line on stdin followed by EOF, and emits one JSON line. Input is
+`{"schema_version":1,"operation":"identity|list|get","params":{...}}`.
+`identity` requires `{}`; `list` accepts `after` (last pool ID). `get` requires
+`pool_id`, accepts numeric `after` (default 0), `section` (default `overview`),
+`proposal_id`, `member_id`, `include_bindings` (default false), and optional
+`expected_revision`. Continuing overview/members/votes with `after > 0` requires
+the preceding `view.pool.revision` as `expected_revision`; changed revisions
+return `stale` rather than silently skipping rows. Restart that section at zero.
+Sections are `overview`, `members`, `history`, `proposal`, `votes`, `deliveries`,
+`binding`, `decisions`. Binding requires an exact current/removed `member_id`;
+roster mappings appear only with `include_bindings:true`. Archive enumeration
+includes open, stale and accepted proposals without votes; use exact proposal ID
+with proposal/votes sections for independent evidence pages.
+
+Success is `{schema_version:1,kind:"identity|pool_page|pool_detail",data:...}`.
+Failure has the same family (or `error` for undecodable input), `error` instead
+of `data`, and fixed `code`, `outcome` (`blocked|unavailable`), `detail` fields.
+Inventory data has `pools:[{pool,leader_id}]`; detail has `section`, `view`
+(the existing typed section), `leader_id`, optional `bindings`, and `decisions`.
+Both page families include `cursor` (string; parse as numeric for get),
+`has_more`, `returned`, `observed_at_unix_ms`, `source_timestamp`, `coverage`.
+Identity contains product, compiled package version, embedded qualification,
+capabilities and observed time, without claiming an installed/source revision.
+
+All reads use the resident's already-owned Store connection without write
+transactions, claims, reconciliation, outbox flush or provider calls. The leader
+is independent of the roster; Run completion, voting, decision acceptance and
+delivery are separate facts. Inventory orders by pool ID; archive orders by
+retained proposal insertion sequence; other sections preserve existing cursor
+semantics. Pages observe current state independently; mutable offset sections
+require the revision fence on continuation.
+Store schema v1 has no historical timestamps: `source_timestamp:null` and
+coverage text disclose that absence. Complete encoded envelopes including the
+newline are capped at 1 MiB; oversized results fail explicitly without partial
+publication or silently advancing a cursor. Resident exchanges use the existing
+finite transport timeout; stdin waits for EOF without an execution deadline.
+No observer configuration, grant, release qualification or service is installed.

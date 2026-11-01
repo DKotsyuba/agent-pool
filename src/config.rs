@@ -35,6 +35,8 @@ pub struct Config {
     pub bridge_observer_socket: Option<PathBuf>,
     /// Optional owner-only credential carrying the separate observation grant.
     pub bridge_observer_credential_file: Option<PathBuf>,
+    /// Optional separate owner read-only Pool grant; absence disables owner observation.
+    pub owner_observer_credential_file: Option<PathBuf>,
     /// Optional resident Run public API; absence leaves external-agent pools usable.
     pub run_socket: Option<PathBuf>,
 }
@@ -55,6 +57,7 @@ impl Config {
         .into_iter()
         .chain(config.bridge_observer_socket.iter())
         .chain(config.bridge_observer_credential_file.iter())
+        .chain(config.owner_observer_credential_file.iter())
         .chain(config.run_socket.iter())
         {
             if !path.is_absolute()

@@ -13,3 +13,6 @@ bridge_audience = "agent-pool-backend"
 # bridge_observer_credential_file = "/absolute/private/agent-pool/observer.token"
 # Optional; external native-agent pools work without Run.
 # run_socket = "/absolute/private/agent-run/service.sock"
+# Optional independent owner-only Pool observation grant; absent disables `observe`.
+# Provision a separate protected token explicitly; this is not a Bridge assertion or grant.
+# owner_observer_credential_file = "/absolute/private/agent-pool/owner-observer.token"

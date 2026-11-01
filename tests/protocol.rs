@@ -240,3 +240,92 @@ async fn original_call_metadata_reaches_registration_after_rmcp_dispatch() {
         client.cancel().await.unwrap();
     }).await.expect("metadata fixture deadline");
 }
+
+/// Runs the fixed observer CLI with finite input and collects exactly one structured line.
+/// kill_on_drop and an external deadline bound child cleanup without any live service.
+async fn observer_cli(input: &[u8], config: Option<&std::path::Path>) -> std::process::Output {
+    let mut command = tokio::process::Command::new(binary());
+    command
+        .arg("observe")
+        .env_clear()
+        .kill_on_drop(true)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(config) = config {
+        command.arg("--config").arg(config);
+    }
+    let mut child = command.spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(input).await.unwrap();
+    drop(stdin);
+    tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+        .await
+        .expect("observer CLI fixture deadline")
+        .unwrap()
+}
+
+/// Malformed, multiple-line, missing-source and unknown-operation inputs preserve typed errors, without prose.
+#[tokio::test]
+async fn observer_cli_errors_are_one_structured_line() {
+    for input in [
+        b"{}\n".as_slice(),
+        b"{\"schema_version\":1,\"operation\":\"identity\",\"params\":{}}\n\n",
+        b"{\"schema_version\":1,\"operation\":\"pool_create\",\"params\":{}}\n",
+        b"\xff\n",
+        b"{\"schema_version\":1,\"operation\":\"identity\",\"params\":{}}\n",
+    ] {
+        let output = observer_cli(input, None).await;
+        assert!(!output.status.success());
+        assert!(output.stderr.is_empty());
+        assert_eq!(
+            output.stdout.iter().filter(|byte| **byte == b'\n').count(),
+            1
+        );
+        let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(envelope["schema_version"], 1);
+        assert!(envelope.get("data").is_none());
+        assert!(envelope["error"]["code"].is_string());
+        assert!(envelope["error"]["outcome"].is_string());
+    }
+}
+
+/// The CLI loads only its protected observer token and forwards to the existing socket, without opening a DB.
+#[tokio::test]
+async fn observer_cli_uses_separate_credential_and_resident() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let directory =
+        tempfile::tempdir_in(std::env::var_os("TMPDIR").expect("task TMPDIR required")).unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = directory.path();
+    let socket = path.join("pool.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let token = path.join("observer.token");
+    std::fs::write(&token, "fixture-only-observer").unwrap();
+    std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let config = path.join("config.toml");
+    std::fs::write(&config, format!("socket_path={socket:?}\ndatabase_path={:?}\nexpected_uid={}\nbridge_registration_socket={:?}\nbridge_core_socket={:?}\nbridge_credential_file={:?}\nbridge_producer_id=\"fixture\"\nbridge_audience=\"fixture\"\nowner_observer_credential_file={token:?}\n",path.join("must-not-open.db"),std::fs::metadata(path).unwrap().uid(),path.join("absent-register.sock"),path.join("absent-core.sock"),path.join("absent-bridge.token"))).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let resident = async {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["observer_credential"], "fixture-only-observer");
+            assert_eq!(request["observe"]["operation"], "identity");
+            assert!(request.get("assertion").is_none());
+            stream.write_all(b"{\"schema_version\":1,\"kind\":\"identity\",\"data\":{\"product\":\"agent-pool\",\"version\":\"0.1.0\",\"qualification\":\"not_verified\",\"capabilities\":[\"identity\",\"list\",\"get\"],\"observed_at_unix_ms\":1}}\n").await.unwrap();
+        };
+        let (_, output) = tokio::join!(resident, observer_cli(b"{\"schema_version\":1,\"operation\":\"identity\",\"params\":{}}\n",Some(&config)));
+        assert!(output.status.success(), "{}",String::from_utf8_lossy(&output.stdout));
+        assert!(output.stderr.is_empty());
+        assert_eq!(output.stdout.iter().filter(|byte| **byte == b'\n').count(), 1);
+        let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(envelope["data"]["product"], "agent-pool");
+        assert!(envelope.get("error").is_none());
+        assert!(!output.stdout.windows(b"fixture-only-observer".len()).any(|bytes| bytes == b"fixture-only-observer"));
+    }).await.expect("observer resident fixture deadline");
+    assert!(!path.join("must-not-open.db").exists());
+}

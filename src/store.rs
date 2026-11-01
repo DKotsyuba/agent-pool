@@ -22,6 +22,120 @@ pub struct Store {
     unknown_cursor: i64,
 }
 impl Store {
+    /// Queries the resident connection only, after the transport verified the separate owner grant.
+    /// This path has no write transaction, receipt replay, claims, provider I/O or outbox changes.
+    /// Pagination is section-local and uses the existing reviewed typed projections.
+    pub fn observe(
+        &self,
+        request: &crate::observer::Request,
+    ) -> Result<crate::observer::Data, Fault> {
+        use crate::observer::{Data, Detail, Envelope, Operation, Page, PoolPage, PoolRow};
+        request.validate()?;
+        match &request.operation {
+            Operation::Identity(_) => Envelope::identity(),
+            Operation::List(args) => {
+                let mut stmt = self
+                    .db
+                    .prepare("SELECT data,owner FROM pools WHERE id>?1 ORDER BY id LIMIT 11")?;
+                let mut pools = stmt
+                    .query_map([args.after.as_deref().unwrap_or("")], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .map(|row| {
+                        let (data, leader_id) = row?;
+                        let mut pool: Pool = decode(&data)?;
+                        pool.proposal = None;
+                        Ok(PoolRow { pool, leader_id })
+                    })
+                    .collect::<Result<Vec<_>, Fault>>()?;
+                let more = pools.len() > 10;
+                pools.truncate(10);
+                let page = Page::new(
+                    pools
+                        .last()
+                        .map(|row| row.pool.pool_id.clone())
+                        .or_else(|| args.after.clone()),
+                    more,
+                    pools.len(),
+                )?;
+                Ok(Data::Pools(PoolPage { pools, page }))
+            }
+            Operation::Get(args) => {
+                let (pool, leader_id) = pool(&self.db, &args.pool_id)?;
+                if args
+                    .expected_revision
+                    .is_some_and(|revision| revision != pool.revision)
+                {
+                    return Err(Fault::Stale);
+                }
+                if args.section == "decisions" {
+                    let mut stmt = self.db.prepare(
+                        "SELECT rowid,data FROM proposals WHERE pool=?1 AND rowid>?2 ORDER BY rowid LIMIT 3",
+                    )?;
+                    let mut rows = stmt
+                        .query_map(
+                            params![
+                                args.pool_id,
+                                i64::try_from(args.after).map_err(|_| Fault::Invalid)?
+                            ],
+                            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                        )?
+                        .map(|row| {
+                            let (cursor, data) = row?;
+                            let cursor = u64::try_from(cursor).map_err(|_| Fault::Internal)?;
+                            let mut proposal: Proposal = decode(&data)?;
+                            proposal.votes.clear();
+                            Ok((cursor, proposal))
+                        })
+                        .collect::<Result<Vec<_>, Fault>>()?;
+                    let more = rows.len() > 2;
+                    rows.truncate(2);
+                    let next = rows.last().map_or(args.after, |(cursor, _)| *cursor);
+                    let decisions: Vec<_> =
+                        rows.into_iter().map(|(_, proposal)| proposal).collect();
+                    let page = Page::new(Some(next.to_string()), more, decisions.len())?;
+                    return Ok(Data::Detail(Box::new(Detail {
+                        section: args.section.clone(),
+                        view: None,
+                        leader_id,
+                        bindings: None,
+                        decisions,
+                        page,
+                    })));
+                }
+                let get = args.projection()?;
+                let mappings = args.include_bindings || get.section == Section::Binding;
+                let reply = view(
+                    &self.db,
+                    pool,
+                    bindings(&self.db, &args.pool_id)?,
+                    &get,
+                    mappings,
+                )?;
+                let (view, private) = match reply {
+                    Reply::View(view) => (view, None),
+                    Reply::OwnerView { view, bindings } => (view, Some(bindings)),
+                    _ => return Err(Fault::Internal),
+                };
+                let returned = match get.section {
+                    Section::Overview | Section::Members | Section::Binding => view.members.len(),
+                    Section::History => view.events.len(),
+                    Section::Deliveries => view.deliveries.len(),
+                    Section::Votes => view.pool.proposal.as_ref().map_or(0, |p| p.votes.len()),
+                    Section::Proposal => usize::from(view.pool.proposal.is_some()),
+                };
+                let page = Page::new(Some(view.next_after.to_string()), view.has_more, returned)?;
+                Ok(Data::Detail(Box::new(Detail {
+                    section: args.section.clone(),
+                    view: Some(view),
+                    leader_id,
+                    bindings: private,
+                    decisions: Vec::new(),
+                    page,
+                })))
+            }
+        }
+    }
     /// Opens one private database, takes a nonblocking exclusive writer lease and migrates schema v1.
     /// The existing parent must be a real 0700 directory; future schemas and second writers refuse.
     pub fn open(path: &Path) -> Result<Self, Fault> {
@@ -1619,6 +1733,218 @@ mod tests {
     fn count(s: &Store, table: &str) -> i64 {
         s.db.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
             .unwrap()
+    }
+    /// Exercises owner inventory and every section over multiple pages without any read-side writes.
+    /// Synthetic actors and private SQLite files never contact Bridge, Run or a model.
+    #[test]
+    fn observer_pages_are_complete_redacted_and_read_only() {
+        use crate::observer::{Data, Envelope, Request};
+        let (_directory, mut store) = fixture();
+        let owner = actor("observer-owner");
+        let pid = make(&mut store, &owner, "primary");
+        for n in 0..11 {
+            make(
+                &mut store,
+                &actor(&format!("other-owner-{n}")),
+                &format!("pool-{n}"),
+            );
+        }
+        let members: Vec<_> = (0..7)
+            .map(|n| actor(&format!("observer-member-{n}")))
+            .collect();
+        let mut ids = Vec::new();
+        for member in &members {
+            ids.push(add(&mut store, &owner, &pid, member));
+            join(&mut store, member, &pid);
+        }
+        for n in 0..4 {
+            let c = change(&store, &pid);
+            store
+                .execute(
+                    &owner,
+                    &Command::Propose(Propose {
+                        change: c,
+                        result: format!("result-{n}"),
+                        criteria: "evidence".into(),
+                    }),
+                )
+                .unwrap();
+            for member in &members {
+                let proposal = pool(&store.db, &pid).unwrap().0.proposal.unwrap();
+                let c = change(&store, &pid);
+                store
+                    .execute(
+                        member,
+                        &Command::Vote(Vote {
+                            change: c,
+                            proposal_id: proposal.proposal_id,
+                            roster_key: proposal.roster_key,
+                            choice: Choice::Ready,
+                            evidence: "🦀".repeat(512),
+                        }),
+                    )
+                    .unwrap();
+            }
+        }
+        let removed = ids[0].clone();
+        let c = change(&store, &pid);
+        store
+            .execute(
+                &owner,
+                &Command::Remove(Remove {
+                    change: c,
+                    member_id: removed.clone(),
+                }),
+            )
+            .unwrap();
+        let before: i64 = store
+            .db
+            .query_row("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap();
+        let counts: Vec<_> = [
+            "pools",
+            "leaders",
+            "members",
+            "requests",
+            "events",
+            "effects",
+            "publications",
+            "alerts",
+        ]
+        .iter()
+        .map(|table| count(&store, table))
+        .collect();
+        let mut after = None;
+        let mut pools = Vec::new();
+        loop {
+            let request: Request = serde_json::from_value(
+                serde_json::json!({"schema_version":1,"operation":"list","params":{"after":after}}),
+            )
+            .unwrap();
+            let Data::Pools(page) = store.observe(&request).unwrap() else {
+                panic!("inventory");
+            };
+            assert!(page.page.source_timestamp.is_none());
+            assert_eq!(page.page.returned, page.pools.len());
+            assert!(page.pools.iter().all(|row| !row.leader_id.is_empty()));
+            after = page.page.cursor;
+            pools.extend(page.pools.into_iter().map(|row| row.pool.pool_id));
+            if !page.page.has_more {
+                break;
+            }
+        }
+        assert_eq!(pools.len(), 12);
+        assert!(pools.windows(2).all(|rows| rows[0] < rows[1]));
+        for section in ["members", "history", "votes", "deliveries", "decisions"] {
+            let mut cursor = 0;
+            let mut pages = 0;
+            let mut total = 0;
+            loop {
+                let request: Request = serde_json::from_value(serde_json::json!({"schema_version":1,"operation":"get","params":{"pool_id":pid,"section":section,"after":cursor,"expected_revision":pool(&store.db,&pid).unwrap().0.revision}})).unwrap();
+                let data = store.observe(&request).unwrap();
+                let encoded =
+                    crate::observer::encode(&Envelope::success("pool_detail", data)).unwrap();
+                assert!(encoded.len() <= crate::integrations::MAX_FRAME);
+                let envelope: Envelope = serde_json::from_slice(&encoded).unwrap();
+                let Some(Data::Detail(detail)) = envelope.data else {
+                    panic!("detail");
+                };
+                assert!(detail.bindings.is_none());
+                total += detail.page.returned;
+                pages += 1;
+                let next: u64 = detail.page.cursor.unwrap().parse().unwrap();
+                if !detail.page.has_more {
+                    break;
+                }
+                assert!(next > cursor, "continuation must make progress: {section}");
+                cursor = next;
+            }
+            assert!(pages > 1, "fixture must page {section}");
+            let expected = match section {
+                "members" => 6,
+                "votes" => 7,
+                "decisions" => 4,
+                _ => {
+                    let table = if section == "history" {
+                        "events"
+                    } else {
+                        "effects"
+                    };
+                    store
+                        .db
+                        .query_row(
+                            &format!("SELECT count(*) FROM {table} WHERE pool=?1"),
+                            [&pid],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .map(|count| usize::try_from(count).unwrap())
+                        .unwrap()
+                }
+            };
+            assert_eq!(
+                total, expected,
+                "every source row must be returned exactly once for {section}"
+            );
+        }
+        for params in [
+            serde_json::json!({"pool_id":pid,"section":"members","include_bindings":true}),
+            serde_json::json!({"pool_id":pid,"section":"binding","member_id":removed}),
+        ] {
+            let request: Request = serde_json::from_value(
+                serde_json::json!({"schema_version":1,"operation":"get","params":params}),
+            )
+            .unwrap();
+            let Data::Detail(detail) = store.observe(&request).unwrap() else {
+                panic!("detail");
+            };
+            assert!(!detail.bindings.unwrap().is_empty());
+        }
+        for section in ["members", "votes"] {
+            let request: Request = serde_json::from_value(serde_json::json!({"schema_version":1,"operation":"get","params":{"pool_id":pid,"section":section,"after":1,"expected_revision":1}})).unwrap();
+            assert!(matches!(store.observe(&request), Err(Fault::Stale)));
+            let request: Request = serde_json::from_value(serde_json::json!({"schema_version":1,"operation":"get","params":{"pool_id":pid,"section":section,"after":1}})).unwrap();
+            assert!(matches!(store.observe(&request), Err(Fault::Invalid)));
+        }
+        let request: Request = serde_json::from_value(serde_json::json!({"schema_version":1,"operation":"get","params":{"pool_id":"missing"}})).unwrap();
+        assert!(matches!(store.observe(&request), Err(Fault::Forbidden)));
+        let after: i64 = store
+            .db
+            .query_row("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(before, after);
+        assert_eq!(
+            counts,
+            [
+                "pools",
+                "leaders",
+                "members",
+                "requests",
+                "events",
+                "effects",
+                "publications",
+                "alerts"
+            ]
+            .iter()
+            .map(|table| count(&store, table))
+            .collect::<Vec<_>>()
+        );
+        assert_eq!(store.unknown_cursor, 0);
+        let participant = get(&mut store, &members[1], &pid).unwrap();
+        let json = encode(&participant).unwrap();
+        assert!(
+            !json.contains("address") && !json.contains("run_id") && !json.contains(&owner.key)
+        );
+    }
+    /// Missing/corrupt source tables yield typed unavailable source errors instead of empty success.
+    #[test]
+    fn observer_missing_source_fails_closed() {
+        let (_directory, store) = fixture();
+        store.db.execute_batch("DROP TABLE pools").unwrap();
+        let request = crate::observer::Request {
+            schema_version: 1,
+            operation: crate::observer::Operation::List(List { after: None }),
+        };
+        assert!(matches!(store.observe(&request), Err(Fault::Internal)));
     }
     /// One global leader owns multiple pools and can never join any, including another owner's pool.
     #[test]

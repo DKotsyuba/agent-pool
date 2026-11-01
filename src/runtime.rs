@@ -113,7 +113,7 @@ pub async fn frontend(
 }
 
 /// Authenticates and executes exactly one private frame, then closes its connection.
-/// Every replay consumes current native evidence before the store can return a receipt.
+/// Every native replay consumes current evidence; the separate owner ingress can only project reads.
 async fn connection(
     mut stream: UnixStream,
     config: Config,
@@ -126,6 +126,11 @@ async fn connection(
         let bytes = tokio::time::timeout(EXCHANGE_TIMEOUT, integrations::read_frame(&mut stream))
             .await
             .map_err(|_| Fault::Unavailable)??;
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|_| Fault::Invalid)?;
+        if value.get("observer_credential").is_some() || value.get("observe").is_some() {
+            return Ok::<_, Fault>(Err(owner_observation(&bytes, &config, &store).await));
+        }
         let request: Request = serde_json::from_slice(&bytes).map_err(|_| Fault::Invalid)?;
         request.command.validate()?;
         let actor = integrations::consume(config.clone(), request.assertion).await?;
@@ -148,9 +153,23 @@ async fn connection(
             store.execute(&actor, &request.command)
         })
         .await
+        .map(Ok)
     }
     .await;
-    let mut bytes = serde_json::to_vec(&result).map_err(|_| Fault::Internal)?;
+    let native = match result {
+        Ok(Err(envelope)) => {
+            let bytes = crate::observer::encode(&envelope).or_else(|error| {
+                crate::observer::encode(&crate::observer::Envelope::failure(&envelope.kind, error))
+            })?;
+            return tokio::time::timeout(EXCHANGE_TIMEOUT, stream.write_all(&bytes))
+                .await
+                .map_err(|_| Fault::Unavailable)?
+                .map_err(|_| Fault::Unavailable);
+        }
+        Ok(Ok(reply)) => Ok(reply),
+        Err(error) => Err(error),
+    };
+    let mut bytes = serde_json::to_vec(&native).map_err(|_| Fault::Internal)?;
     if bytes.len() > MAX_FRAME {
         return Err(Fault::Internal);
     }
@@ -159,6 +178,44 @@ async fn connection(
         .await
         .map_err(|_| Fault::Unavailable)?
         .map_err(|_| Fault::Unavailable)
+}
+
+/// Authenticates the separate protected owner grant before a closed read-only Store dispatch.
+/// Never consumes assertions, creates actors/membership, executes commands or starts provider work.
+async fn owner_observation(
+    bytes: &[u8],
+    config: &Config,
+    store: &SharedStore,
+) -> crate::observer::Envelope {
+    use crate::observer::{Envelope, Ingress};
+    let request = serde_json::from_slice::<Ingress>(bytes);
+    let kind = request
+        .as_ref()
+        .map_or("error", |request| request.observe.kind());
+    let result = async {
+        let request = request.map_err(|_| Fault::Invalid)?;
+        let config = config.clone();
+        let credential = tokio::task::spawn_blocking(move || {
+            let path = config
+                .owner_observer_credential_file
+                .as_deref()
+                .ok_or(Fault::Unauthorized)?;
+            private_parent(path, config.expected_uid)?;
+            config.credential(path)
+        })
+        .await
+        .map_err(|_| Fault::Internal)??;
+        if request.observer_credential != credential {
+            return Err(Fault::Unauthorized);
+        }
+        request.observe.validate()?;
+        stored(store, move |store| store.observe(&request.observe)).await
+    }
+    .await;
+    match result {
+        Ok(data) => Envelope::success(kind, data),
+        Err(error) => Envelope::failure(kind, error),
+    }
 }
 
 /// Rechecks a managed enrollment's exact live Run sequence at join time.
@@ -466,6 +523,141 @@ async fn work(
 mod tests {
     use super::*;
 
+    /// Exchanges one request through the production connection dispatcher on an isolated Unix pair.
+    /// Both futures are joined under a deadline; no resident worker or provider is started.
+    async fn observer_exchange(
+        config: &Config,
+        store: &SharedStore,
+        value: serde_json::Value,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let (server, mut client) = UnixStream::pair()?;
+        let exchange = async {
+            let mut bytes = serde_json::to_vec(&value)?;
+            bytes.push(b'\n');
+            client.write_all(&bytes).await?;
+            let response = integrations::read_frame(&mut client).await?;
+            Ok::<_, Box<dyn std::error::Error>>(serde_json::from_slice(&response)?)
+        };
+        let (server, response) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(
+                connection(server, config.clone(), Arc::clone(store)),
+                exchange
+            )
+        })
+        .await?;
+        server?;
+        response
+    }
+
+    /// The effective transport accepts only authenticated owner projections and refuses all native/admin paths.
+    /// Native requests still require assertions; fixture endpoints do not exist, and DB/WAL remain unchanged.
+    #[tokio::test]
+    async fn observer_socket_authority_is_separate_and_read_only()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory =
+            tempfile::tempdir_in(std::env::var_os("TMPDIR").ok_or("task TMPDIR required")?)?;
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))?;
+        let path = directory.path();
+        let token = path.join("observer.token");
+        fs::write(&token, "fixture-owner-observer")?;
+        fs::set_permissions(&token, fs::Permissions::from_mode(0o600))?;
+        let mut config = Config {
+            socket_path: path.join("pool.sock"),
+            database_path: path.join("pool.db"),
+            expected_uid: fs::metadata(path)?.uid(),
+            bridge_registration_socket: path.join("absent-registration.sock"),
+            bridge_core_socket: path.join("absent-core.sock"),
+            bridge_credential_file: path.join("absent-producer.token"),
+            bridge_producer_id: "fixture".into(),
+            bridge_audience: "fixture".into(),
+            bridge_observer_socket: None,
+            bridge_observer_credential_file: None,
+            owner_observer_credential_file: Some(token),
+            run_socket: None,
+        };
+        let mut initial = Store::open(&config.database_path)?;
+        let actor = Actor::verified("codex:test:observer:owner".into(), "owner", "root")?;
+        let reply = initial.execute(
+            &actor,
+            &Command::Create(crate::domain::Create {
+                request_key: "fixture-create".into(),
+                name: "Fixture".into(),
+                purpose: "Read-only observation".into(),
+            }),
+        )?;
+        let Reply::Receipt(receipt) = reply else {
+            return Err("fixture receipt".into());
+        };
+        let store = Arc::new(Mutex::new(initial));
+        let db_before = fs::read(&config.database_path)?;
+        let wal = config.database_path.with_file_name("pool.db-wal");
+        let wal_before = fs::read(&wal)?;
+        let identity = serde_json::json!({"schema_version":1,"operation":"identity","params":{}});
+        for observe in [
+            identity.clone(),
+            serde_json::json!({"schema_version":1,"operation":"list","params":{}}),
+            serde_json::json!({"schema_version":1,"operation":"get","params":{"pool_id":receipt.pool_id}}),
+        ] {
+            let response = observer_exchange(&config, &store, serde_json::json!({"observer_credential":"fixture-owner-observer","observe":observe})).await?;
+            assert!(
+                response.get("error").is_none(),
+                "authorized read must succeed: {response}"
+            );
+            assert!(response.get("data").is_some());
+            assert!(!response.to_string().contains("fixture-owner-observer"));
+        }
+        for credential in ["", "wrong", "native-assertion-secret"] {
+            let response = observer_exchange(
+                &config,
+                &store,
+                serde_json::json!({"observer_credential":credential,"observe":identity}),
+            )
+            .await?;
+            assert_eq!(response["error"]["code"], "unauthorized");
+        }
+        let response =
+            observer_exchange(&config, &store, serde_json::json!({"observe":identity})).await?;
+        assert_eq!(response["error"]["code"], "invalid");
+        let saved = config.owner_observer_credential_file.take();
+        let response = observer_exchange(
+            &config,
+            &store,
+            serde_json::json!({"observer_credential":"fixture-owner-observer","observe":identity}),
+        )
+        .await?;
+        assert_eq!(response["error"]["code"], "unauthorized");
+        config.owner_observer_credential_file = saved;
+        for name in crate::tools::definitions()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .chain(["replay", "admin", "claim", "settle"])
+        {
+            for value in [
+                serde_json::json!({"observer_credential":"fixture-owner-observer","observe":{"schema_version":1,"operation":name,"params":{}}}),
+                serde_json::json!({"observer_credential":"fixture-owner-observer","observe":identity,"command":{"name":name,"arguments":{}},"assertion":{"assertion_key":"fixture-owner-observer","invocation_key":"reused"}}),
+            ] {
+                let response = observer_exchange(&config, &store, value).await?;
+                assert_eq!(
+                    response["error"]["code"], "invalid",
+                    "observer must refuse {name}"
+                );
+                assert!(response.get("data").is_none());
+            }
+        }
+        let response = observer_exchange(
+            &config,
+            &store,
+            serde_json::json!({"command":{"name":"pool_list","arguments":{}}}),
+        )
+        .await?;
+        assert_eq!(response["Err"], "invalid");
+        let response = observer_exchange(&config, &store, serde_json::json!({"assertion":{"assertion_key":"fixture-owner-observer","invocation_key":"reused"},"command":{"name":"pool_list","arguments":{}}})).await?;
+        assert_eq!(response["Err"], "unavailable");
+        assert_eq!(fs::read(&config.database_path)?, db_before);
+        assert_eq!(fs::read(&wal)?, wal_before);
+        Ok(())
+    }
+
     /// A poisoned writer never authorizes later work; blocking failure is observed as Internal.
     #[tokio::test]
     async fn blocking_writer_panic_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
@@ -500,6 +692,7 @@ mod tests {
             bridge_audience: "fixture-backend".into(),
             bridge_observer_socket: None,
             bridge_observer_credential_file: None,
+            owner_observer_credential_file: None,
             run_socket: None,
         };
         let (stop, stopped) = watch::channel(false);
