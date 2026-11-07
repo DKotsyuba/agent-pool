@@ -48,9 +48,9 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "pool_create",
-            "Create a persistent pool and permanently become a global external leader. Current or pending members cannot create pools. Retry only the same request_key and intent.",
+            "Create a persistent pool and permanently become its external leader. Optional acceptance enables structured checks; an empty list uses the default goal criterion. Retry only the same request_key and intent.",
             object(
-                json!({"request_key":string(128),"name":string(80),"purpose":string(512)}),
+                json!({"request_key":string(128),"name":string(80),"purpose":string(8192),"acceptance":{"type":"array","maxItems":10,"items":object(json!({"id":string(32),"text":string(1024)}), &["id","text"])}}),
                 &["request_key", "name", "purpose"],
             ),
             false,
@@ -63,9 +63,9 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "pool_get",
-            "Read one bounded authenticated section: overview/members up to five assignments (two with owner mappings), history up to three events within 10 KiB, votes up to three ballots. after resumes within that section. proposal_id reads a retained decision. Owner-only binding requires member_id and after=0 and includes removed mappings. Removed members cannot read.",
+            "Read one bounded authenticated section. Forward history may wait up to 25 seconds; reverse history uses next_before. Content pages require field=purpose|snapshot and the prior expected_revision on continuation. Structured ballot checks follow vote_event_id in history. proposal_id selects a retained decision; owner-only binding requires member_id.",
             object(
-                json!({"pool_id":string(128),"after":{"type":"integer","minimum":0},"section":{"type":"string","enum":["overview","members","history","proposal","votes","deliveries","binding"]},"proposal_id":string(128),"member_id":string(128)}),
+                json!({"pool_id":string(128),"after":{"type":"integer","minimum":0},"section":{"type":"string","enum":["overview","members","history","proposal","votes","criteria","content","deliveries","binding"]},"proposal_id":string(128),"member_id":string(128),"wait_seconds":{"type":"number","minimum":0,"maximum":25},"reverse":{"type":"boolean"},"before":{"type":"string","pattern":"^[1-9][0-9]*$","maxLength":19},"field":{"type":"string","enum":["purpose","snapshot"]},"expected_revision":{"type":"integer","minimum":1}}),
                 &["pool_id"],
             ),
             true,
@@ -74,7 +74,7 @@ pub fn definitions() -> Vec<Value> {
             "pool_update",
             "Owner updates pool name and purpose at the current revision; current members are notified.",
             mutation(
-                json!({"name":string(80),"purpose":string(512)}),
+                json!({"name":string(80),"purpose":string(8192)}),
                 &["name", "purpose"],
             ),
             false,
@@ -93,8 +93,32 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "pool_start_agent",
-            "Owner reserves a pending member and durably requests one Run agent with onboarding and required MCP assertions. Lost responses never authorize a replacement agent.",
-            mutation(start, &["name", "role", "task", "spec"]),
+            "Owner reserves a pending member and requests one Run agent with retained history. Run must support read-only batch receipt lookup. Managed binding remains unavailable until attempt-bound identity is proven; lost responses never authorize a replacement agent.",
+            mutation(start.clone(), &["name", "role", "task", "spec"]),
+            false,
+        ),
+        tool(
+            "pool_start_batch",
+            "Reserve an ordered group and request atomic Run admission with durable history pins. The receipt confirms the Pool intent only. Managed binding remains unavailable until attempt-bound identity is proven; unresolved admission blocks roster changes and closure.",
+            mutation(
+                json!({"members":{"type":"array","minItems":1,"maxItems":20,"items":object(start, &["name","role","task","spec"])}}),
+                &["members"],
+            ),
+            false,
+        ),
+        tool(
+            "pool_replace",
+            "Request replacement of a Run-managed member after its latest lineage is terminal and fully cleaned. The old roster remains until an exact conditioned Run receipt commits; an unknown outcome keeps it frozen. Omit spec to reuse the original start.",
+            mutation(
+                json!({"member_id":string(128),"spec":{"type":["object","null"],"description":"Optional ordinary Run start specification, at most 64 KiB."}}),
+                &["member_id"],
+            ),
+            false,
+        ),
+        tool(
+            "pool_cancel_replacement",
+            "Cancel an exact replacement only before any Run admission may have been submitted. Once submission is possible, preserve the intent and reconcile its original receipt.",
+            mutation(json!({"operation_id":string(128)}), &["operation_id"]),
             false,
         ),
         tool(
@@ -110,6 +134,12 @@ pub fn definitions() -> Vec<Value> {
             false,
         ),
         tool(
+            "pool_release_history",
+            "After closing a pool, record an explicit intent to release one member's retained Run history. Release is not executed until Run can prove its persistent store identity; once executed it permits pruning and cannot be undone.",
+            mutation(json!({"member_id":string(128)}), &["member_id"]),
+            false,
+        ),
+        tool(
             "pool_join",
             "Pending agent acknowledges the current onboarding revision under fresh native identity. Leaders cannot join any pool. Delivery is not acknowledgment.",
             mutation(json!({}), &[]),
@@ -117,39 +147,39 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "pool_post",
-            "Post to current members, excluding the sender's duplicate wakeup. Leader is not automatically notified. Recorded in shared history.",
-            mutation(json!({"body":string(2048)}), &["body"]),
+            "Post to current members, excluding the sender's duplicate wakeup. Leader is not automatically notified. Bodies over 2048 bytes are committed as ordered history parts; notifications show the first part.",
+            mutation(json!({"body":string(8192)}), &["body"]),
             false,
         ),
         tool(
             "pool_send_member",
-            "Deliver to one exact current membership ID and record shared history. No external or cross-pool destination. Removed IDs are never redirected.",
+            "Deliver to one exact current membership ID and record shared history. Bodies over 2048 bytes are committed as ordered history parts; notifications show the first part. Removed IDs are never redirected.",
             mutation(
-                json!({"member_id":string(128),"body":string(2048)}),
+                json!({"member_id":string(128),"body":string(8192)}),
                 &["member_id", "body"],
             ),
             false,
         ),
         tool(
             "pool_notify_owner",
-            "Confirmed member explicitly notifies the hidden external owner, without an address argument. Recorded in shared history.",
-            mutation(json!({"body":string(2048)}), &["body"]),
+            "Confirmed member explicitly notifies the hidden external owner. Bodies over 2048 bytes are committed as ordered history parts; notifications show the first part.",
+            mutation(json!({"body":string(8192)}), &["body"]),
             false,
         ),
         tool(
             "pool_propose",
-            "Owner or confirmed member opens the current proposal with result, criteria and a frozen confirmed roster. Revising an open proposal at the current revision archives it as stale and clears current readiness. Accepted decisions remain immutable. Leader never votes.",
+            "Owner or confirmed member opens a proposal with result, criteria, optional full snapshot and a frozen confirmed roster. Revising an open proposal archives it as stale. Accepted decisions remain immutable; leader never votes.",
             mutation(
-                json!({"result":string(2048),"criteria":string(2048)}),
+                json!({"result":string(2048),"criteria":string(2048),"snapshot":string(65536)}),
                 &["result", "criteria"],
             ),
             false,
         ),
         tool(
             "pool_vote",
-            "Confirmed members vote against exact proposal_id and roster_key. Ready requires evidence; block/revoke persist. Unanimity accepts an immutable decision without closing the pool or stopping agents.",
+            "Confirmed members vote against exact proposal_id and roster_key. Structured ready requires a check for every acceptance criterion; an unmet check is recorded but prevents agreement. Other pools require ready/block evidence. Acceptance never closes the pool or stops agents.",
             mutation(
-                json!({"proposal_id":string(128),"roster_key":string(128),"choice":{"type":"string","enum":["ready","block","revoke"]},"evidence":{"type":"string","maxLength":2048}}),
+                json!({"proposal_id":string(128),"roster_key":string(128),"choice":{"type":"string","enum":["ready","block","revoke"]},"evidence":{"type":"string","maxLength":2048},"checks":{"type":"array","maxItems":10,"items":object(json!({"criterion_id":string(32),"status":{"type":"string","enum":["met","unmet"]},"evidence":string(1024)}), &["criterion_id","status","evidence"])}}),
                 &["proposal_id", "roster_key", "choice"],
             ),
             false,
@@ -170,9 +200,9 @@ pub fn templates() -> Vec<(&'static str, &'static str)> {
         ("pool_private", include_str!("../templates/pool_private.j2")),
     ]
 }
-/// Reports actual source stubs; live release qualification remains independently unverified.
+/// Keeps managed Run tools release-blocking until attempt-bound identity proof is implemented.
 pub fn incomplete() -> Vec<&'static str> {
-    Vec::new()
+    vec!["pool_start_agent", "pool_start_batch", "pool_replace"]
 }
 /// Handles credential-free identity only; Pool commands route through the authenticated resident.
 pub async fn call(
@@ -268,7 +298,11 @@ mod tests {
     #[test]
     fn tool_catalog_is_closed() {
         let defs = definitions();
-        assert_eq!(defs.len(), 16);
+        assert_eq!(defs.len(), 20);
+        assert_eq!(
+            incomplete(),
+            ["pool_start_agent", "pool_start_batch", "pool_replace"]
+        );
         for d in defs {
             assert_eq!(d["inputSchema"]["additionalProperties"], false);
             assert_eq!(d["inputSchema"]["type"], "object");
@@ -284,21 +318,39 @@ mod tests {
             pool_id: "pool-id".into(),
             revision: 9,
             created_id: None,
+            created_ids: Vec::new(),
             event: Event {
                 event_id: 7,
+                event_id_exact: None,
                 revision: 9,
                 kind: "message".into(),
                 author: Author::Member("member".into()),
                 body: format!("{{{{literal}}}}\n{}", "\\".repeat(4096)),
                 recipient: None,
+                check: None,
+                vote_event_id: None,
+                message_event_id: None,
+                part_index: None,
+                part_count: None,
             },
             status: "committed; delivery pending".into(),
         };
-        let normal = serde_json::to_string(&present(Ok(Reply::Receipt(r.clone())), &t)).unwrap();
+        let normal =
+            serde_json::to_string(&present(Ok(Reply::Receipt(Box::new(r.clone()))), &t)).unwrap();
         assert!(normal.contains("{{literal}}"));
         assert!(!normal.contains("presentation degraded"));
+        let mut replacement = r.clone();
+        replacement.event.kind = "replacement_requested".into();
+        replacement.created_ids.push("candidate-member".into());
+        let rendered =
+            serde_json::to_string(&present(Ok(Reply::Receipt(Box::new(replacement))), &t)).unwrap();
+        assert!(rendered.contains(
+            "Candidate replacement member (not current until admission): candidate-member"
+        ));
+        assert!(!rendered.contains("Created members in request order"));
         let broken = Templates::new(&[("pool_receipt", "{{ missing }}")]).unwrap();
-        let fallback = serde_json::to_string(&present(Ok(Reply::Receipt(r)), &broken)).unwrap();
+        let fallback =
+            serde_json::to_string(&present(Ok(Reply::Receipt(Box::new(r))), &broken)).unwrap();
         assert!(fallback.contains("COMMITTED pool pool-id revision=9 event=7"));
         assert!(fallback.contains("do not create a new request_key"));
     }

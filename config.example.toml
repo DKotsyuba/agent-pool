@@ -1,5 +1,6 @@
-# Replace paths and UID explicitly. Parent directories must exist with mode 0700;
-# socket/credential files must be owned by expected_uid with mode 0600.
+# Replace paths and UID explicitly. Private parent directories must exist with mode
+# 0700; private socket/credential files use expected_uid and mode 0600. See the
+# optional Linux Run peer exception below; it does not apply to Pool or Bridge.
 socket_path = "/absolute/private/agent-pool/pool.sock"
 database_path = "/absolute/private/agent-pool/pool.sqlite"
 expected_uid = 501
@@ -11,8 +12,15 @@ bridge_audience = "agent-pool-backend"
 # Optional separate opt-in read grant; both fields must be present together.
 # bridge_observer_socket = "/absolute/private/agent-bridge/adapter.sock"
 # bridge_observer_credential_file = "/absolute/private/agent-pool/observer.token"
-# Optional; external native-agent pools work without Run.
+# Optional; external native-agent pools work without Run. By default this socket
+# also uses the private same-UID policy above.
 # run_socket = "/absolute/private/agent-run/service.sock"
+# Linux only: an explicit different Run server UID permits a group-accessible
+# socket when the process has a full identity UID map. The socket must be owned
+# by this UID and deny other access. Ancestors from / must be root- or peer-owned
+# without group/other write; the immediate parent must also deny other access.
+# Existing OS permissions must grant access; this option does not change them.
+# run_peer_uid = 1000
 # Optional independent owner-only Pool observation grant; absent disables `observe`.
 # Provision a separate protected token explicitly; this is not a Bridge assertion or grant.
 # owner_observer_credential_file = "/absolute/private/agent-pool/owner-observer.token"

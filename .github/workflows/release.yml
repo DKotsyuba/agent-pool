@@ -1,16 +1,52 @@
 name: release
 on:
-  push:
-    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: Select release targets explicitly
+        required: true
+        type: choice
+        default: select-targets
+        options: [select-targets, paired, linux-only]
 permissions:
   contents: read
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      TMPDIR: ${{ runner.temp }}
+      TMP: ${{ runner.temp }}
+      TEMP: ${{ runner.temp }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require an annotated version tag at the dispatched source
+        shell: bash
+        env:
+          RELEASE_TARGETS: ${{ inputs.targets }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]
+          [[ "$RELEASE_TARGETS" == paired || "$RELEASE_TARGETS" == linux-only ]]
+          [[ "$GITHUB_REF" == refs/tags/v* ]]
+          test "$(git cat-file -t "$GITHUB_REF")" = tag
+          test "$(git rev-parse "$GITHUB_REF^{}")" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
   check:
+    needs: validate
+    if: github.event_name == 'workflow_dispatch' && inputs.targets == 'paired'
     runs-on: macos-26
     timeout-minutes: 40
+    env:
+      TMPDIR: ${{ runner.temp }}
+      TMP: ${{ runner.temp }}
+      TEMP: ${{ runner.temp }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -26,8 +62,14 @@ jobs:
       - run: cargo xtask check
   # Build independently of the source gate; publication requires both to pass.
   build:
+    needs: validate
+    if: github.event_name == 'workflow_dispatch' && inputs.targets == 'paired'
     runs-on: macos-26
     timeout-minutes: 40
+    env:
+      TMPDIR: ${{ runner.temp }}
+      TMP: ${{ runner.temp }}
+      TEMP: ${{ runner.temp }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -53,10 +95,123 @@ jobs:
           path: ${{ runner.temp }}/upload/
           if-no-files-found: error
           retention-days: 7
+  check-linux:
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      TMPDIR: ${{ runner.temp }}
+      TMP: ${{ runner.temp }}
+      TEMP: ${{ runner.temp }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: test "$(uname -s):$(uname -m)" = Linux:x86_64
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: product-check-v1-ubuntu-24.04-${{ runner.arch }}
+          cache-bin: false
+          save-if: false
+      - run: cargo fetch --locked
+      - run: cargo xtask check
+  build-linux:
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    outputs:
+      binary_sha256: ${{ steps.pin.outputs.binary_sha256 }}
+      manifest_sha256: ${{ steps.pin.outputs.manifest_sha256 }}
+    env:
+      TMPDIR: ${{ runner.temp }}
+      TMP: ${{ runner.temp }}
+      TEMP: ${{ runner.temp }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: test "$(uname -s):$(uname -m)" = Linux:x86_64
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: product-package-v1-ubuntu-24.04-${{ runner.arch }}
+          cache-bin: false
+          save-if: false
+      - run: cargo fetch --locked
+      - name: Build and pin the exact Linux payload
+        id: pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          clean=(env -u GH_TOKEN -u GITHUB_TOKEN -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN -u ACTIONS_RUNTIME_TOKEN -u ACTIONS_ID_TOKEN_REQUEST_TOKEN -u GITHUB_OUTPUT -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_STATE -u GITHUB_STEP_SUMMARY)
+          rustc -vV | grep -Fx 'host: x86_64-unknown-linux-gnu'
+          "${clean[@]}" cargo xtask package --out "$RUNNER_TEMP/linux-payload"
+          "${clean[@]}" cargo test --frozen --package agent-pool --test protocol --no-run --message-format=json > "$RUNNER_TEMP/protocol-artifacts.json"
+          protocol=$(jq -ser --arg source "$GITHUB_WORKSPACE/tests/protocol.rs" '[.[] | select(.reason == "compiler-artifact" and .target.name == "protocol" and .target.src_path == $source and .profile.test == true and (.target.kind | index("test")) != null and .executable != null)] | if length == 1 then .[0].executable else error("ambiguous protocol test") end' "$RUNNER_TEMP/protocol-artifacts.json")
+          [[ "$protocol" == /* && "$protocol" != *$'\n'* && -x "$protocol" ]]
+          "${clean[@]}" cargo xtask package verify "$RUNNER_TEMP/linux-payload"
+          dirty=$(git status --porcelain)
+          test -z "$dirty"
+          head=$(git rev-parse HEAD)
+          test "$head" = "$GITHUB_SHA"
+          binary="$RUNNER_TEMP/linux-payload/agent-pool-x86_64-unknown-linux-gnu"
+          manifest="$RUNNER_TEMP/linux-payload/release-manifest.json"
+          binary_sha=$(sha256sum "$binary" | awk '{print $1}')
+          manifest_sha=$(sha256sum "$manifest" | awk '{print $1}')
+          protocol_sha=$(sha256sum "$protocol" | awk '{print $1}')
+          printf 'binary_sha256=%s\nmanifest_sha256=%s\nprotocol_path=%s\nprotocol_sha256=%s\n' "$binary_sha" "$manifest_sha" "$protocol" "$protocol_sha" >> "$GITHUB_OUTPUT"
+      - name: Accept the pinned Linux payload
+        shell: bash
+        env:
+          EXPECTED_BINARY_SHA256: ${{ steps.pin.outputs.binary_sha256 }}
+          EXPECTED_MANIFEST_SHA256: ${{ steps.pin.outputs.manifest_sha256 }}
+          EXPECTED_PROTOCOL_SHA256: ${{ steps.pin.outputs.protocol_sha256 }}
+          PROTOCOL_TEST: ${{ steps.pin.outputs.protocol_path }}
+        run: |
+          set -euo pipefail
+          clean=(env -u GH_TOKEN -u GITHUB_TOKEN -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN -u ACTIONS_RUNTIME_TOKEN -u ACTIONS_ID_TOKEN_REQUEST_TOKEN -u GITHUB_OUTPUT -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_STATE -u GITHUB_STEP_SUMMARY)
+          binary="$RUNNER_TEMP/linux-payload/agent-pool-x86_64-unknown-linux-gnu"
+          manifest="$RUNNER_TEMP/linux-payload/release-manifest.json"
+          test "$(sha256sum "$binary" | awk '{print $1}')" = "$EXPECTED_BINARY_SHA256"
+          test "$(sha256sum "$manifest" | awk '{print $1}')" = "$EXPECTED_MANIFEST_SHA256"
+          test "$(sha256sum "$PROTOCOL_TEST" | awk '{print $1}')" = "$EXPECTED_PROTOCOL_SHA256"
+          package_id=$("${clean[@]}" cargo pkgid --frozen --package agent-pool)
+          version=${package_id##*#}
+          version=${version##*@}
+          actual_version=$("${clean[@]}" "$binary" --version)
+          test "$actual_version" = "agent-pool $version"
+          readiness=$("${clean[@]}" "$binary" contract readiness)
+          test "$(printf '%s' "$readiness" | tr -d '[:space:]')" = '[]'
+          dirty=$(git status --porcelain)
+          test -z "$dirty"
+          head=$(git rev-parse HEAD)
+          test "$head" = "$GITHUB_SHA"
+          test "$(sha256sum "$PROTOCOL_TEST" | awk '{print $1}')" = "$EXPECTED_PROTOCOL_SHA256"
+          MCP_TEST_BINARY="$binary" "${clean[@]}" "$PROTOCOL_TEST"
+          "${clean[@]}" cargo xtask package verify "$RUNNER_TEMP/linux-payload"
+          test "$(sha256sum "$binary" | awk '{print $1}')" = "$EXPECTED_BINARY_SHA256"
+          test "$(sha256sum "$manifest" | awk '{print $1}')" = "$EXPECTED_MANIFEST_SHA256"
+          test "$(sha256sum "$PROTOCOL_TEST" | awk '{print $1}')" = "$EXPECTED_PROTOCOL_SHA256"
+          dirty=$(git status --porcelain)
+          test -z "$dirty"
+          head=$(git rev-parse HEAD)
+          test "$head" = "$GITHUB_SHA"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: payload-linux
+          path: ${{ runner.temp }}/linux-payload/
+          if-no-files-found: error
+          retention-days: 7
   publish:
-    needs: [check, build]
+    needs: [validate, check, build, check-linux, build-linux]
+    if: github.event_name == 'workflow_dispatch' && inputs.targets == 'paired'
     runs-on: macos-26
     timeout-minutes: 40
+    env:
+      TMPDIR: ${{ runner.temp }}
+      TMP: ${{ runner.temp }}
+      TEMP: ${{ runner.temp }}
     permissions:
       contents: write
     environment: release
@@ -81,6 +236,10 @@ jobs:
         with:
           name: payload
           path: ${{ runner.temp }}/payload
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: payload-linux
+          path: ${{ runner.temp }}/payload-linux
       - name: Build only tooling, without release credentials in its environment
         run: |
           cargo fetch --locked
@@ -90,7 +249,7 @@ jobs:
           fi
           test "$(cargo deny --version)" = 'cargo-deny 0.20.2'
       - name: Save native cargo-deny
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && steps.cargo-deny-cache.outputs.cache-hit != 'true'
+        if: github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/') && steps.cargo-deny-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ~/.cargo/bin/cargo-deny
@@ -99,10 +258,64 @@ jobs:
         shell: bash
         run: |
           target/debug/xtask package verify "$RUNNER_TEMP/payload"
+          target/debug/xtask package verify "$RUNNER_TEMP/payload-linux"
           find "$RUNNER_TEMP/payload" -type f ! -name release-manifest.json -exec chmod 755 {} \;
       - name: Test the shipped payload, publish a complete draft, then make it visible
         env:
           GH_TOKEN: ${{ github.token }}
-        run: target/debug/xtask release publish "$RUNNER_TEMP/payload"
+          AGENT_POOL_LINUX_BINARY_SHA256: ${{ needs.build-linux.outputs.binary_sha256 }}
+          AGENT_POOL_LINUX_MANIFEST_SHA256: ${{ needs.build-linux.outputs.manifest_sha256 }}
+        run: target/debug/xtask release publish "$RUNNER_TEMP/payload" --linux-directory "$RUNNER_TEMP/payload-linux"
       # Publishing additionally refuses release.enabled=false, unqualified targets/hosts and stubs.
       # Configure required reviewers on the release environment; creating this file alone does not do it.
+  publish-linux:
+    needs: [validate, check-linux, build-linux]
+    if: github.event_name == 'workflow_dispatch' && inputs.targets == 'linux-only'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      TMPDIR: ${{ runner.temp }}
+      TMP: ${{ runner.temp }}
+      TEMP: ${{ runner.temp }}
+    permissions:
+      contents: write
+    environment: release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: test "$(uname -s):$(uname -m)" = Linux:x86_64
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: product-check-v1-ubuntu-24.04-${{ runner.arch }}
+          cache-bin: false
+          save-if: false
+      - name: Restore native cargo-deny
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.cargo/bin/cargo-deny
+          key: cargo-deny-${{ runner.os }}-${{ runner.arch }}-ubuntu-24.04-0.20.2-${{ hashFiles('rust-toolchain.toml') }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: payload-linux
+          path: ${{ runner.temp }}/payload-linux
+      - name: Build only tooling, without release credentials in its environment
+        run: |
+          cargo fetch --locked
+          cargo build --frozen -p xtask
+          if [ "$(cargo deny --version 2>/dev/null)" != 'cargo-deny 0.20.2' ]; then
+            cargo install cargo-deny --version 0.20.2 --locked --force
+          fi
+          test "$(cargo deny --version)" = 'cargo-deny 0.20.2'
+      - name: Verify hashes before giving the payload executable permissions
+        shell: bash
+        run: |
+          target/debug/xtask package verify "$RUNNER_TEMP/payload-linux"
+          find "$RUNNER_TEMP/payload-linux" -type f ! -name release-manifest.json -exec chmod 755 {} \;
+      - name: Test the shipped payload, publish a complete draft, then make it visible
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AGENT_POOL_LINUX_BINARY_SHA256: ${{ needs.build-linux.outputs.binary_sha256 }}
+          AGENT_POOL_LINUX_MANIFEST_SHA256: ${{ needs.build-linux.outputs.manifest_sha256 }}
+        run: target/debug/xtask release publish "$RUNNER_TEMP/payload-linux" --linux-only

@@ -1,0 +1,471 @@
+{
+  "cases": {
+    "mismatch": {
+      "request": {
+        "expected_store_id": "store_013af400171a556aae5e2597303c78e4",
+        "include_view": true,
+        "targets": [
+          {
+            "agent_id": "ag-20261107-002455-e0caf0d956",
+            "execution_ref": "ex1_ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "pin_id": "pin_c3293ac0ccd44cbd82d6019fcd7de7d0",
+            "sequence": 1
+          }
+        ],
+        "version": 1
+      },
+      "response": {
+        "result": {
+          "items": [
+            {
+              "canonical_agent_id": "ag-20261107-002455-e0caf0d956",
+              "cleanup": {
+                "scope": "lineage",
+                "state": "unknown"
+              },
+              "coverage": "unknown",
+              "lineage_terminal": null,
+              "match": "mismatch",
+              "pin_id": "pin_c3293ac0ccd44cbd82d6019fcd7de7d0",
+              "pin_state": "active",
+              "restart_resume": "unknown",
+              "retained_latest": null,
+              "selected": null,
+              "selector": {
+                "agent_id": "ag-20261107-002455-e0caf0d956",
+                "execution_ref": "ex1_ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                "pin_id": "pin_c3293ac0ccd44cbd82d6019fcd7de7d0",
+                "sequence": 1
+              },
+              "success_commit": "unknown",
+              "terminal_outcome": null
+            }
+          ],
+          "observed_at": 1794011095.2706451,
+          "store_id": "store_013af400171a556aae5e2597303c78e4",
+          "version": 1
+        }
+      }
+    },
+    "missing": {
+      "request": {
+        "expected_store_id": "store_013af400171a556aae5e2597303c78e4",
+        "include_view": true,
+        "targets": [
+          {
+            "agent_id": "ag-20261107-002455-e0caf0d956",
+            "pin_id": "pin_c3293ac0ccd44cbd82d6019fcd7de7d0",
+            "sequence": 9
+          }
+        ],
+        "version": 1
+      },
+      "response": {
+        "result": {
+          "items": [
+            {
+              "canonical_agent_id": "ag-20261107-002455-e0caf0d956",
+              "cleanup": {
+                "scope": "lineage",
+                "state": "unknown"
+              },
+              "coverage": "unknown",
+              "lineage_terminal": null,
+              "match": "missing",
+              "pin_id": "pin_c3293ac0ccd44cbd82d6019fcd7de7d0",
+              "pin_state": "active",
+              "restart_resume": "unknown",
+              "retained_latest": null,
+              "selected": null,
+              "selector": {
+                "agent_id": "ag-20261107-002455-e0caf0d956",
+                "pin_id": "pin_c3293ac0ccd44cbd82d6019fcd7de7d0",
+                "sequence": 9
+              },
+              "success_commit": "unknown",
+              "terminal_outcome": null
+            }
+          ],
+          "observed_at": 1794011095.2972646,
+          "store_id": "store_013af400171a556aae5e2597303c78e4",
+          "version": 1
+        }
+      }
+    },
+    "restart_pending_raw_terminal": {
+      "request": {
+        "include_view": true,
+        "targets": [
+          {
+            "agent_id": "ag-20261107-002454-1760e1908f",
+            "execution_ref": "ex1_5e649b667b24610d0289f9243e3afd58aa69a928bb7924d26e010fb1c5e256a7",
+            "pin_id": "pin_8e50c6e13c514972aad2efdf408eed33",
+            "sequence": 1
+          }
+        ],
+        "version": 1
+      },
+      "response": {
+        "result": {
+          "items": [
+            {
+              "canonical_agent_id": "ag-20261107-002454-1760e1908f",
+              "cleanup": {
+                "scope": "lineage",
+                "state": "pending"
+              },
+              "coverage": "complete",
+              "lineage_terminal": false,
+              "match": "verified",
+              "pin_id": "pin_8e50c6e13c514972aad2efdf408eed33",
+              "pin_state": "active",
+              "restart_resume": "pending",
+              "retained_latest": {
+                "execution_ref": "ex1_8926934b0a3533ce937d6d88eee2f6e349bdd3fc4e56d1eb29cbda21f1106efa",
+                "raw_status": "running",
+                "sequence": 2
+              },
+              "selected": {
+                "execution_ref": "ex1_5e649b667b24610d0289f9243e3afd58aa69a928bb7924d26e010fb1c5e256a7",
+                "raw_status": "succeeded",
+                "sequence": 1
+              },
+              "selector": {
+                "agent_id": "ag-20261107-002454-1760e1908f",
+                "execution_ref": "ex1_5e649b667b24610d0289f9243e3afd58aa69a928bb7924d26e010fb1c5e256a7",
+                "pin_id": "pin_8e50c6e13c514972aad2efdf408eed33",
+                "sequence": 1
+              },
+              "success_commit": "unknown",
+              "terminal_outcome": null
+            }
+          ],
+          "observed_at": 1794011095.0069597,
+          "store_id": "store_e457e699bf420541915c63fbe077ccda",
+          "version": 1,
+          "view": {
+            "agent": {
+              "acceptance": "pending",
+              "agent_id": "ag-20261107-002454-1760e1908f",
+              "answer_available": true,
+              "answer_bytes": null,
+              "answer_sha256": null,
+              "cleanup": null,
+              "created_at": 1794011094.8824158,
+              "delivery": {
+                "agent_id": "ag-20261107-002454-1760e1908f",
+                "ambiguous": false,
+                "attempts": 0,
+                "bound": false,
+                "last_attempt": null,
+                "last_error": null,
+                "notification_id": null,
+                "orchestrator_session_id": null,
+                "state": "not_created"
+              },
+              "effort": null,
+              "elapsed_seconds": 0.0,
+              "failure_kind": "native_failed",
+              "failure_text": null,
+              "finished_at": 1.0,
+              "last_progress_at": null,
+              "model": "fixture",
+              "observed_at": 1794011095.0079136,
+              "phase": "terminal",
+              "phase_started_at": 1.0,
+              "policy": null,
+              "process_state": "notstarted",
+              "profile": "review",
+              "runtime": "mock",
+              "runtime_outcome": "succeeded",
+              "sequence": 1,
+              "silence_seconds": null,
+              "started_at": null,
+              "status": "succeeded",
+              "task_summary": "fixture task",
+              "tool_counts": {
+                "calls": null,
+                "failed": null,
+                "unknown_results": null
+              },
+              "usage_cumulative": {
+                "cache_read_tokens": null,
+                "cache_write_tokens": null,
+                "cost_usd": null,
+                "executions": 2,
+                "input_tokens": null,
+                "num_turns": null,
+                "output_tokens": null,
+                "reasoning_tokens": null,
+                "total_tokens": null
+              },
+              "workdir": "/synthetic/redacted"
+            },
+            "match": "verified",
+            "sampled_at": 1794011095.0079136,
+            "selector_index": 0,
+            "status_scope": "selected_execution_raw"
+          }
+        }
+      }
+    },
+    "store_identity_mismatch": {
+      "request": {
+        "expected_store_id": "store_ffffffffffffffffffffffffffffffff",
+        "targets": [
+          {
+            "agent_id": "ag-20261107-002455-c2f39ba66f",
+            "sequence": 1
+          }
+        ],
+        "version": 1
+      },
+      "response": {
+        "error": {
+          "code": -32000,
+          "data": {
+            "code": "StoreIdentityMismatch",
+            "message": "store identity does not match expected store_id; reconcile the original request"
+          },
+          "message": "store identity does not match expected store_id; reconcile the original request"
+        }
+      }
+    },
+    "unverified": {
+      "request": {
+        "expected_store_id": "store_013af400171a556aae5e2597303c78e4",
+        "include_view": true,
+        "targets": [
+          {
+            "agent_id": "ag-20261107-002455-e0caf0d956",
+            "pin_id": "pin_c3293ac0ccd44cbd82d6019fcd7de7d0",
+            "sequence": 1
+          }
+        ],
+        "version": 1
+      },
+      "response": {
+        "result": {
+          "items": [
+            {
+              "canonical_agent_id": "ag-20261107-002455-e0caf0d956",
+              "cleanup": {
+                "scope": "lineage",
+                "state": "unknown"
+              },
+              "coverage": "complete",
+              "lineage_terminal": null,
+              "match": "unverified",
+              "pin_id": "pin_c3293ac0ccd44cbd82d6019fcd7de7d0",
+              "pin_state": "active",
+              "restart_resume": "none",
+              "retained_latest": {
+                "execution_ref": "ex1_f1816b6c97480f6d7f6fc5e7a9392b42dfce428bea2ecf596e965be53b21a662",
+                "raw_status": "running",
+                "sequence": 2
+              },
+              "selected": {
+                "execution_ref": "ex1_e39c4259e095240153791a611a7fba019a83a30d109ce4ac36fd40d4b263d6f4",
+                "raw_status": "succeeded",
+                "sequence": 1
+              },
+              "selector": {
+                "agent_id": "ag-20261107-002455-e0caf0d956",
+                "pin_id": "pin_c3293ac0ccd44cbd82d6019fcd7de7d0",
+                "sequence": 1
+              },
+              "success_commit": "unknown",
+              "terminal_outcome": null
+            }
+          ],
+          "observed_at": 1794011095.2825902,
+          "store_id": "store_013af400171a556aae5e2597303c78e4",
+          "version": 1,
+          "view": {
+            "agent": {
+              "acceptance": "pending",
+              "agent_id": "ag-20261107-002455-e0caf0d956",
+              "answer_available": false,
+              "answer_bytes": null,
+              "answer_sha256": null,
+              "cleanup": null,
+              "created_at": 1794011095.1142561,
+              "delivery": {
+                "agent_id": "ag-20261107-002455-e0caf0d956",
+                "ambiguous": true,
+                "attempts": 1,
+                "bound": false,
+                "last_attempt": null,
+                "last_error": null,
+                "notification_id": null,
+                "orchestrator_session_id": null,
+                "state": "retry_wait"
+              },
+              "effort": null,
+              "elapsed_seconds": 0.0,
+              "failure_kind": "native_failed",
+              "failure_text": null,
+              "finished_at": 1.0,
+              "last_progress_at": null,
+              "model": "fixture",
+              "observed_at": 1794011095.2835433,
+              "phase": "terminal",
+              "phase_started_at": 1.0,
+              "policy": null,
+              "process_state": "notstarted",
+              "profile": "review",
+              "runtime": "mock",
+              "runtime_outcome": "succeeded",
+              "sequence": 1,
+              "silence_seconds": null,
+              "started_at": null,
+              "status": "succeeded",
+              "task_summary": "fixture task",
+              "tool_counts": {
+                "calls": null,
+                "failed": null,
+                "unknown_results": null
+              },
+              "usage_cumulative": {
+                "cache_read_tokens": null,
+                "cache_write_tokens": null,
+                "cost_usd": null,
+                "executions": 2,
+                "input_tokens": null,
+                "num_turns": null,
+                "output_tokens": null,
+                "reasoning_tokens": null,
+                "total_tokens": null
+              },
+              "workdir": "/synthetic/redacted"
+            },
+            "match": "unverified",
+            "sampled_at": 1794011095.2835433,
+            "selector_index": 0,
+            "status_scope": "selected_execution_raw"
+          }
+        }
+      }
+    },
+    "verified_selected_not_tail": {
+      "request": {
+        "expected_store_id": "store_013af400171a556aae5e2597303c78e4",
+        "include_view": true,
+        "targets": [
+          {
+            "agent_id": "ag-20261107-002455-e0caf0d956",
+            "execution_ref": "ex1_e39c4259e095240153791a611a7fba019a83a30d109ce4ac36fd40d4b263d6f4",
+            "pin_id": "pin_c3293ac0ccd44cbd82d6019fcd7de7d0",
+            "sequence": 1
+          }
+        ],
+        "version": 1
+      },
+      "response": {
+        "result": {
+          "items": [
+            {
+              "canonical_agent_id": "ag-20261107-002455-e0caf0d956",
+              "cleanup": {
+                "scope": "lineage",
+                "state": "pending"
+              },
+              "coverage": "complete",
+              "lineage_terminal": false,
+              "match": "verified",
+              "pin_id": "pin_c3293ac0ccd44cbd82d6019fcd7de7d0",
+              "pin_state": "active",
+              "restart_resume": "none",
+              "retained_latest": {
+                "execution_ref": "ex1_f1816b6c97480f6d7f6fc5e7a9392b42dfce428bea2ecf596e965be53b21a662",
+                "raw_status": "running",
+                "sequence": 2
+              },
+              "selected": {
+                "execution_ref": "ex1_e39c4259e095240153791a611a7fba019a83a30d109ce4ac36fd40d4b263d6f4",
+                "raw_status": "succeeded",
+                "sequence": 1
+              },
+              "selector": {
+                "agent_id": "ag-20261107-002455-e0caf0d956",
+                "execution_ref": "ex1_e39c4259e095240153791a611a7fba019a83a30d109ce4ac36fd40d4b263d6f4",
+                "pin_id": "pin_c3293ac0ccd44cbd82d6019fcd7de7d0",
+                "sequence": 1
+              },
+              "success_commit": "unknown",
+              "terminal_outcome": null
+            }
+          ],
+          "observed_at": 1794011095.2558382,
+          "store_id": "store_013af400171a556aae5e2597303c78e4",
+          "version": 1,
+          "view": {
+            "agent": {
+              "acceptance": "pending",
+              "agent_id": "ag-20261107-002455-e0caf0d956",
+              "answer_available": false,
+              "answer_bytes": null,
+              "answer_sha256": null,
+              "cleanup": null,
+              "created_at": 1794011095.1142561,
+              "delivery": {
+                "agent_id": "ag-20261107-002455-e0caf0d956",
+                "ambiguous": true,
+                "attempts": 1,
+                "bound": false,
+                "last_attempt": null,
+                "last_error": null,
+                "notification_id": null,
+                "orchestrator_session_id": null,
+                "state": "retry_wait"
+              },
+              "effort": null,
+              "elapsed_seconds": 0.0,
+              "failure_kind": "native_failed",
+              "failure_text": null,
+              "finished_at": 1.0,
+              "last_progress_at": null,
+              "model": "fixture",
+              "observed_at": 1794011095.2567778,
+              "phase": "terminal",
+              "phase_started_at": 1.0,
+              "policy": null,
+              "process_state": "notstarted",
+              "profile": "review",
+              "runtime": "mock",
+              "runtime_outcome": "succeeded",
+              "sequence": 1,
+              "silence_seconds": null,
+              "started_at": null,
+              "status": "succeeded",
+              "task_summary": "fixture task",
+              "tool_counts": {
+                "calls": null,
+                "failed": null,
+                "unknown_results": null
+              },
+              "usage_cumulative": {
+                "cache_read_tokens": null,
+                "cache_write_tokens": null,
+                "cost_usd": null,
+                "executions": 2,
+                "input_tokens": null,
+                "num_turns": null,
+                "output_tokens": null,
+                "reasoning_tokens": null,
+                "total_tokens": null
+              },
+              "workdir": "/synthetic/redacted"
+            },
+            "match": "verified",
+            "sampled_at": 1794011095.2567778,
+            "selector_index": 0,
+            "status_scope": "selected_execution_raw"
+          }
+        }
+      }
+    }
+  },
+  "note": "Synthetic socket examples; view workdir redacted.",
+  "source_sha256": "f75302fe1a94653422dacda732238ef8826b8a17ae372810b453ff1abeb64ba2"
+}

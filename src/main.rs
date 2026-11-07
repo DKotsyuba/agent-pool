@@ -4,6 +4,7 @@ mod domain;
 mod integrations;
 mod observer;
 mod response;
+mod run_status;
 mod runtime;
 mod store;
 mod tools;
@@ -208,6 +209,20 @@ fn print_json(value: impl serde::Serialize) -> ExitCode {
         }
     }
 }
+/// Selects only a supported target for local installation and retained-version activation.
+fn installation_target() -> family_delivery::Result<&'static str> {
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        Ok("aarch64-apple-darwin")
+    } else if cfg!(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "gnu"
+    )) {
+        Ok("x86_64-unknown-linux-gnu")
+    } else {
+        Err("unsupported installation target".into())
+    }
+}
 /// Release qualification recorded in the embedded family manifest, so
 /// `doctor` and `get_status` report the same value the release tooling reads.
 /// An unreadable manifest fails closed to `not_verified`.
@@ -235,7 +250,9 @@ async fn main() -> ExitCode {
             bundle,
             home,
             bin_dir,
-        } => match family_delivery::install(&bundle, &home, &bin_dir) {
+        } => match installation_target().and_then(|target| {
+            family_delivery::install(&bundle, &home, &bin_dir, env!("CARGO_PKG_NAME"), target)
+        }) {
             Ok(m) => print_json(m),
             Err(e) => {
                 eprintln!("install: {e}");
@@ -249,7 +266,9 @@ async fn main() -> ExitCode {
                     home,
                     bin_dir,
                 },
-        } => match family_delivery::use_version(&home, &bin_dir, &version) {
+        } => match installation_target().and_then(|target| {
+            family_delivery::use_version(&home, &bin_dir, &version, env!("CARGO_PKG_NAME"), target)
+        }) {
             Ok(m) => print_json(m),
             Err(e) => {
                 eprintln!("activate: {e}");

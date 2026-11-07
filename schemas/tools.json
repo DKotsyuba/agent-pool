@@ -22,17 +22,41 @@
       "openWorldHint": true,
       "readOnlyHint": false
     },
-    "description": "Create a persistent pool and permanently become a global external leader. Current or pending members cannot create pools. Retry only the same request_key and intent.",
+    "description": "Create a persistent pool and permanently become its external leader. Optional acceptance enables structured checks; an empty list uses the default goal criterion. Retry only the same request_key and intent.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "acceptance": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "id": {
+                "maxLength": 32,
+                "minLength": 1,
+                "type": "string"
+              },
+              "text": {
+                "maxLength": 1024,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "text"
+            ],
+            "type": "object"
+          },
+          "maxItems": 10,
+          "type": "array"
+        },
         "name": {
           "maxLength": 80,
           "minLength": 1,
           "type": "string"
         },
         "purpose": {
-          "maxLength": 512,
+          "maxLength": 8192,
           "minLength": 1,
           "type": "string"
         },
@@ -80,13 +104,29 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Read one bounded authenticated section: overview/members up to five assignments (two with owner mappings), history up to three events within 10 KiB, votes up to three ballots. after resumes within that section. proposal_id reads a retained decision. Owner-only binding requires member_id and after=0 and includes removed mappings. Removed members cannot read.",
+    "description": "Read one bounded authenticated section. Forward history may wait up to 25 seconds; reverse history uses next_before. Content pages require field=purpose|snapshot and the prior expected_revision on continuation. Structured ballot checks follow vote_event_id in history. proposal_id selects a retained decision; owner-only binding requires member_id.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
         "after": {
           "minimum": 0,
           "type": "integer"
+        },
+        "before": {
+          "maxLength": 19,
+          "pattern": "^[1-9][0-9]*$",
+          "type": "string"
+        },
+        "expected_revision": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "field": {
+          "enum": [
+            "purpose",
+            "snapshot"
+          ],
+          "type": "string"
         },
         "member_id": {
           "maxLength": 128,
@@ -103,6 +143,9 @@
           "minLength": 1,
           "type": "string"
         },
+        "reverse": {
+          "type": "boolean"
+        },
         "section": {
           "enum": [
             "overview",
@@ -110,10 +153,17 @@
             "history",
             "proposal",
             "votes",
+            "criteria",
+            "content",
             "deliveries",
             "binding"
           ],
           "type": "string"
+        },
+        "wait_seconds": {
+          "maximum": 25,
+          "minimum": 0,
+          "type": "number"
         }
       },
       "required": [
@@ -149,7 +199,7 @@
           "type": "string"
         },
         "purpose": {
-          "maxLength": 512,
+          "maxLength": 8192,
           "minLength": 1,
           "type": "string"
         },
@@ -271,7 +321,7 @@
       "openWorldHint": true,
       "readOnlyHint": false
     },
-    "description": "Owner reserves a pending member and durably requests one Run agent with onboarding and required MCP assertions. Lost responses never authorize a replacement agent.",
+    "description": "Owner reserves a pending member and requests one Run agent with retained history. Run must support read-only batch receipt lookup. Managed binding remains unavailable until attempt-bound identity is proven; lost responses never authorize a replacement agent.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -321,6 +371,167 @@
       "type": "object"
     },
     "name": "pool_start_agent"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Reserve an ordered group and request atomic Run admission with durable history pins. The receipt confirms the Pool intent only. Managed binding remains unavailable until attempt-bound identity is proven; unresolved admission blocks roster changes and closure.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "expected_revision": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "members": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "maxLength": 80,
+                "minLength": 1,
+                "type": "string"
+              },
+              "role": {
+                "maxLength": 160,
+                "minLength": 1,
+                "type": "string"
+              },
+              "spec": {
+                "description": "Original Run start specification, at most 64 KiB. Required tools are asserted, never injected.",
+                "type": "object"
+              },
+              "task": {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "role",
+              "task",
+              "spec"
+            ],
+            "type": "object"
+          },
+          "maxItems": 20,
+          "minItems": 1,
+          "type": "array"
+        },
+        "pool_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "request_key": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "pool_id",
+        "expected_revision",
+        "request_key",
+        "members"
+      ],
+      "type": "object"
+    },
+    "name": "pool_start_batch"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Request replacement of a Run-managed member after its latest lineage is terminal and fully cleaned. The old roster remains until an exact conditioned Run receipt commits; an unknown outcome keeps it frozen. Omit spec to reuse the original start.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "expected_revision": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "member_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "pool_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "request_key": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "spec": {
+          "description": "Optional ordinary Run start specification, at most 64 KiB.",
+          "type": [
+            "object",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "pool_id",
+        "expected_revision",
+        "request_key",
+        "member_id"
+      ],
+      "type": "object"
+    },
+    "name": "pool_replace"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Cancel an exact replacement only before any Run admission may have been submitted. Once submission is possible, preserve the intent and reconcile its original receipt.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "expected_revision": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "operation_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "pool_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "request_key": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "pool_id",
+        "expected_revision",
+        "request_key",
+        "operation_id"
+      ],
+      "type": "object"
+    },
+    "name": "pool_cancel_replacement"
   },
   {
     "annotations": {
@@ -429,6 +640,47 @@
       "openWorldHint": true,
       "readOnlyHint": false
     },
+    "description": "After closing a pool, record an explicit intent to release one member's retained Run history. Release is not executed until Run can prove its persistent store identity; once executed it permits pruning and cannot be undone.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "expected_revision": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "member_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "pool_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "request_key": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "pool_id",
+        "expected_revision",
+        "request_key",
+        "member_id"
+      ],
+      "type": "object"
+    },
+    "name": "pool_release_history"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
     "description": "Pending agent acknowledges the current onboarding revision under fresh native identity. Leaders cannot join any pool. Delivery is not acknowledgment.",
     "inputSchema": {
       "additionalProperties": false,
@@ -464,12 +716,12 @@
       "openWorldHint": true,
       "readOnlyHint": false
     },
-    "description": "Post to current members, excluding the sender's duplicate wakeup. Leader is not automatically notified. Recorded in shared history.",
+    "description": "Post to current members, excluding the sender's duplicate wakeup. Leader is not automatically notified. Bodies over 2048 bytes are committed as ordered history parts; notifications show the first part.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
         "body": {
-          "maxLength": 2048,
+          "maxLength": 8192,
           "minLength": 1,
           "type": "string"
         },
@@ -505,12 +757,12 @@
       "openWorldHint": true,
       "readOnlyHint": false
     },
-    "description": "Deliver to one exact current membership ID and record shared history. No external or cross-pool destination. Removed IDs are never redirected.",
+    "description": "Deliver to one exact current membership ID and record shared history. Bodies over 2048 bytes are committed as ordered history parts; notifications show the first part. Removed IDs are never redirected.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
         "body": {
-          "maxLength": 2048,
+          "maxLength": 8192,
           "minLength": 1,
           "type": "string"
         },
@@ -552,12 +804,12 @@
       "openWorldHint": true,
       "readOnlyHint": false
     },
-    "description": "Confirmed member explicitly notifies the hidden external owner, without an address argument. Recorded in shared history.",
+    "description": "Confirmed member explicitly notifies the hidden external owner. Bodies over 2048 bytes are committed as ordered history parts; notifications show the first part.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
         "body": {
-          "maxLength": 2048,
+          "maxLength": 8192,
           "minLength": 1,
           "type": "string"
         },
@@ -593,7 +845,7 @@
       "openWorldHint": true,
       "readOnlyHint": false
     },
-    "description": "Owner or confirmed member opens the current proposal with result, criteria and a frozen confirmed roster. Revising an open proposal at the current revision archives it as stale and clears current readiness. Accepted decisions remain immutable. Leader never votes.",
+    "description": "Owner or confirmed member opens a proposal with result, criteria, optional full snapshot and a frozen confirmed roster. Revising an open proposal archives it as stale. Accepted decisions remain immutable; leader never votes.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -620,6 +872,11 @@
           "maxLength": 2048,
           "minLength": 1,
           "type": "string"
+        },
+        "snapshot": {
+          "maxLength": 65536,
+          "minLength": 1,
+          "type": "string"
         }
       },
       "required": [
@@ -640,10 +897,42 @@
       "openWorldHint": true,
       "readOnlyHint": false
     },
-    "description": "Confirmed members vote against exact proposal_id and roster_key. Ready requires evidence; block/revoke persist. Unanimity accepts an immutable decision without closing the pool or stopping agents.",
+    "description": "Confirmed members vote against exact proposal_id and roster_key. Structured ready requires a check for every acceptance criterion; an unmet check is recorded but prevents agreement. Other pools require ready/block evidence. Acceptance never closes the pool or stops agents.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "checks": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "criterion_id": {
+                "maxLength": 32,
+                "minLength": 1,
+                "type": "string"
+              },
+              "evidence": {
+                "maxLength": 1024,
+                "minLength": 1,
+                "type": "string"
+              },
+              "status": {
+                "enum": [
+                  "met",
+                  "unmet"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "criterion_id",
+              "status",
+              "evidence"
+            ],
+            "type": "object"
+          },
+          "maxItems": 10,
+          "type": "array"
+        },
         "choice": {
           "enum": [
             "ready",

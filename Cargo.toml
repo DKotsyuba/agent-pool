@@ -11,6 +11,7 @@ license = "MIT"
 publish = false
 
 [workspace.dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 clap = { version = "4.5", features = ["derive"] }
 minijinja = { version = "=2.24.0", default-features = false, features = ["serde", "fuel"] }
 rmcp = { version = "=3.4.0", default-features = false, features = ["server", "transport-io"] }
@@ -35,6 +36,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+chrono.workspace = true
 clap.workspace = true
 mcp-presentation = { path = "crates/mcp-presentation" }
 family-delivery = { path = "crates/family-delivery" }

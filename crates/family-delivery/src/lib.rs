@@ -15,9 +15,9 @@ use std::path::{Path, PathBuf};
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 /// Only one bounded executable and a small manifest are accepted.
 pub const MAX_BINARY_BYTES: u64 = 512 * 1024 * 1024;
-/// The product's current on-disk state schema (`state/v1`). Packaging stamps
+/// The product's current on-disk state schema. Packaging stamps
 /// this into new manifests; keep it in lockstep with the store layout.
-pub const CURRENT_STATE_SCHEMA: u32 = 1;
+pub const CURRENT_STATE_SCHEMA: u32 = 5;
 
 /// The explicit single-binary profile is separate from the older bundle manifest.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -41,7 +41,7 @@ pub struct Manifest {
     pub size: u64,
     /// SHA-256 of the executable.
     pub sha256: String,
-    /// State schema the release expects: 0 = stateless, 1 = `CURRENT_STATE_SCHEMA`.
+    /// State schema the release expects: 0 = stateless, positive values are versioned state.
     pub state_schema: u32,
     /// GitHub run identity, when built there.
     pub run_id: Option<u64>,
@@ -60,6 +60,36 @@ pub fn component(s: &str) -> bool {
 fn regular(path: &Path) -> Result<()> {
     if !fs::symlink_metadata(path)?.file_type().is_file() {
         return Err("expected a regular file, not a link".into());
+    }
+    Ok(())
+}
+/// Creates a new file without following an existing destination link.
+fn create_new_file(path: &Path, mode: u32) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(mode);
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    Ok(options.open(path)?)
+}
+/// Copies no more than the declared limit into a newly created file and syncs it.
+fn copy_new(source: &Path, destination: &Path, mode: u32, max: u64) -> Result<()> {
+    let mut input = File::open(source)?.take(max + 1);
+    let mut output = create_new_file(destination, mode)?;
+    if std::io::copy(&mut input, &mut output)? > max {
+        return Err("staged file exceeds size limit".into());
+    }
+    output.sync_all()?;
+    #[cfg(unix)]
+    if mode & 0o100 != 0 {
+        use std::os::unix::fs::PermissionsExt;
+        if output.metadata()?.permissions().mode() & 0o500 != 0o500 {
+            return Err("staged executable lacks owner read or execute permission".into());
+        }
     }
     Ok(())
 }
@@ -154,39 +184,57 @@ pub fn package(binary: &Path, output: &Path, mut manifest: Manifest) -> Result<M
     out.sync_all()?;
     verify(output)
 }
-fn private_dir(path: &Path) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(m) if !m.is_dir() => return Err("installation path is a link or non-directory".into()),
-        Ok(_) => (),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => fs::create_dir(path)?,
+fn private_dir(path: &Path, create: bool) -> Result<bool> {
+    let (metadata, created) = match fs::symlink_metadata(path) {
+        Ok(metadata) => (metadata, false),
+        Err(e) if create && e.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                fs::DirBuilder::new().mode(0o700).create(path)?;
+            }
+            #[cfg(not(unix))]
+            fs::create_dir(path)?;
+            (fs::symlink_metadata(path)?, true)
+        }
         Err(e) => return Err(e.into()),
+    };
+    if !metadata.is_dir() {
+        return Err("installation path is a link or non-directory".into());
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        if metadata.permissions().mode() & 0o7777 != 0o700 {
+            return Err("installation directory must be private (0700)".into());
+        }
     }
-    Ok(())
+    Ok(created)
 }
-fn layout(home: &Path) -> Result<(PathBuf, File)> {
+fn layout(home: &Path, create: bool) -> Result<(PathBuf, File)> {
     if !home.is_absolute() {
         return Err("installation home must be absolute".into());
     }
-    private_dir(home)?;
+    private_dir(home, create)?;
     let base = home.join("standalone");
-    private_dir(&base)?;
-    private_dir(&base.join("releases"))?;
+    let base_created = private_dir(&base, create)?;
     let lock_path = base.join("install.lock");
-    if fs::symlink_metadata(&lock_path).is_ok() {
+    if !base_created {
+        if fs::symlink_metadata(&lock_path).is_err() {
+            return Err("existing installation lock missing or inaccessible; check for an active installer before recovery".into());
+        }
         regular(&lock_path)?;
     }
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(lock_path)?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(base_created);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(lock_path)?;
     FileExt::lock_exclusive(&file)?;
+    private_dir(&base.join("releases"), create)?;
     Ok((base, file))
 }
 fn shell_quote(value: &str) -> String {
@@ -223,7 +271,10 @@ fn activate(base: &Path, manifest: &Manifest, bin_dir: &Path) -> Result<()> {
         {
             return Err("unmanaged current target".into());
         }
-        let old = verify(&base.join(previous))?;
+        let old = verify(&base.join(&previous))?;
+        if previous != Path::new("releases").join(&old.version) {
+            return Err("current path does not match its release manifest".into());
+        }
         if old.product != manifest.product || old.target != manifest.target {
             return Err("incompatible previous installation".into());
         }
@@ -244,13 +295,12 @@ fn activate(base: &Path, manifest: &Manifest, bin_dir: &Path) -> Result<()> {
         manifest.product,
         std::process::id()
     ));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_launcher)?;
+    let mut file = create_new_file(&temp_launcher, 0o755)?;
     file.write_all(body.as_bytes())?;
     file.sync_all()?;
-    fs::set_permissions(&temp_launcher, fs::Permissions::from_mode(0o755))?;
+    if file.metadata()?.permissions().mode() & 0o500 != 0o500 {
+        return Err("launcher lacks owner read or execute permission".into());
+    }
     let next = base.join(format!(".current-{}", std::process::id()));
     symlink(Path::new("releases").join(&manifest.version), &next)?;
     // Both versions use the same target-specific asset name. Existing services are not restarted.
@@ -262,10 +312,25 @@ fn activate(base: &Path, manifest: &Manifest, bin_dir: &Path) -> Result<()> {
 fn activate(_: &Path, _: &Manifest, _: &Path) -> Result<()> {
     Err("installer supports Unix only".into())
 }
-/// Install without migration, pruning, stopping services or changing host configuration.
-pub fn install(bundle: &Path, home: &Path, bin_dir: &Path) -> Result<Manifest> {
+/// Refuses a bundle outside the calling product and target before activation.
+fn require_installation_identity(manifest: &Manifest, product: &str, target: &str) -> Result<()> {
+    if manifest.product != product || manifest.target != target {
+        return Err("bundle does not match this product and installation target".into());
+    }
+    Ok(())
+}
+
+/// Install the selected product/target without migration, pruning, stopping services or host changes.
+pub fn install(
+    bundle: &Path,
+    home: &Path,
+    bin_dir: &Path,
+    product: &str,
+    target: &str,
+) -> Result<Manifest> {
     let manifest = verify(bundle)?;
-    let (base, _lock) = layout(home)?;
+    require_installation_identity(&manifest, product, target)?;
+    let (base, _lock) = layout(home, true)?;
     let destination = base.join("releases").join(&manifest.version);
     if fs::symlink_metadata(&destination).is_ok() {
         if verify(&destination)? != manifest {
@@ -274,32 +339,43 @@ pub fn install(bundle: &Path, home: &Path, bin_dir: &Path) -> Result<Manifest> {
     } else {
         let stage = base.join(format!(".install-{}", std::process::id()));
         fs::create_dir(&stage)?;
-        fs::copy(bundle.join(&manifest.binary), stage.join(&manifest.binary))?;
-        fs::copy(
-            bundle.join("release-manifest.json"),
-            stage.join("release-manifest.json"),
+        copy_new(
+            &bundle.join(&manifest.binary),
+            &stage.join(&manifest.binary),
+            0o755,
+            MAX_BINARY_BYTES,
         )?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(
-                stage.join(&manifest.binary),
-                fs::Permissions::from_mode(0o755),
-            )?;
+        copy_new(
+            &bundle.join("release-manifest.json"),
+            &stage.join("release-manifest.json"),
+            0o600,
+            16384,
+        )?;
+        if verify(&stage)? != manifest {
+            return Err("bundle changed during staging".into());
         }
-        verify(&stage)?;
         fs::rename(stage, &destination)?;
     }
     activate(&base, &manifest, bin_dir)?;
     Ok(manifest)
 }
-/// Activate a retained version only after verifying its integrity and state profile.
-pub fn use_version(home: &Path, bin_dir: &Path, version: &str) -> Result<Manifest> {
+/// Activate a retained version only for the selected product/target and compatible state profile.
+pub fn use_version(
+    home: &Path,
+    bin_dir: &Path,
+    version: &str,
+    product: &str,
+    target: &str,
+) -> Result<Manifest> {
     if !component(version) {
         return Err("invalid version component".into());
     }
-    let (base, _lock) = layout(home)?;
+    let (base, _lock) = layout(home, false)?;
     let manifest = verify(&base.join("releases").join(version))?;
+    require_installation_identity(&manifest, product, target)?;
+    if manifest.version != version {
+        return Err("retained path does not match its release manifest".into());
+    }
     activate(&base, &manifest, bin_dir)?;
     Ok(manifest)
 }
@@ -311,6 +387,14 @@ pub fn use_version(home: &Path, bin_dir: &Path, version: &str) -> Result<Manifes
 )]
 mod tests {
     use super::*;
+    /// Existing fixture bundles represent the macOS candidate on every test host.
+    fn install(bundle: &Path, home: &Path, bin_dir: &Path) -> Result<Manifest> {
+        super::install(bundle, home, bin_dir, "agent-test", "aarch64-apple-darwin")
+    }
+    /// Selects retained versions within the same fixture product and target.
+    fn use_version(home: &Path, bin_dir: &Path, version: &str) -> Result<Manifest> {
+        super::use_version(home, bin_dir, version, "agent-test", "aarch64-apple-darwin")
+    }
     fn fixture(root: &Path, version: &str, state_schema: u32) -> PathBuf {
         let binary = root.join(format!("source-{version}"));
         fs::write(&binary, b"fixture, not executable").unwrap();
@@ -343,6 +427,209 @@ mod tests {
             verify(&fixture(t.path(), "0.1.0", 0)).unwrap().version,
             "0.1.0"
         );
+    }
+    /// Staging never follows an already present destination link into another file.
+    #[cfg(unix)]
+    #[test]
+    fn staged_copy_refuses_existing_symlink() {
+        use std::os::unix::fs::symlink;
+        let t = tempfile::tempdir().unwrap();
+        let source = t.path().join("source");
+        let victim = t.path().join("victim");
+        let destination = t.path().join("destination");
+        fs::write(&source, b"new").unwrap();
+        fs::write(&victim, b"keep").unwrap();
+        symlink(&victim, &destination).unwrap();
+        assert!(copy_new(&source, &destination, 0o600, 16384).is_err());
+        assert_eq!(fs::read(victim).unwrap(), b"keep");
+    }
+    /// A staging source that grows past its budget cannot be accepted.
+    #[test]
+    fn staged_copy_rejects_excess_bytes() {
+        let t = tempfile::tempdir().unwrap();
+        let source = t.path().join("source");
+        let destination = t.path().join("destination");
+        fs::write(&source, b"four").unwrap();
+        assert!(copy_new(&source, &destination, 0o600, 3).is_err());
+        assert_eq!(fs::read(source).unwrap(), b"four");
+    }
+    /// Cross-target verification remains useful, but installation refuses a foreign product or target.
+    #[test]
+    fn installation_refuses_foreign_identity_before_creating_home() {
+        let t = tempfile::tempdir().unwrap();
+        let bundle = fixture(t.path(), "0.1.0", 0);
+        let home = t.path().join("home");
+        let bin = t.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        assert!(verify(&bundle).is_ok());
+        assert!(
+            super::install(&bundle, &home, &bin, "agent-other", "aarch64-apple-darwin").is_err()
+        );
+        assert!(!home.exists());
+        assert!(
+            super::install(
+                &bundle,
+                &home,
+                &bin,
+                "agent-test",
+                "x86_64-unknown-linux-gnu"
+            )
+            .is_err()
+        );
+        assert!(!home.exists());
+        assert!(fs::read_dir(&bin).unwrap().next().is_none());
+    }
+    /// A mismatched retained version cannot replace a previously active launcher.
+    #[cfg(unix)]
+    #[test]
+    fn activation_refuses_foreign_identity_without_changing_current() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join("home");
+        let bin = t.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        install(&fixture(t.path(), "0.1.0", 0), &home, &bin).unwrap();
+        let current = fs::read_link(home.join("standalone/current")).unwrap();
+        let launcher = fs::read(bin.join("agent-test")).unwrap();
+        assert!(
+            super::use_version(
+                &home,
+                &bin,
+                "0.1.0",
+                "agent-test",
+                "x86_64-unknown-linux-gnu"
+            )
+            .is_err()
+        );
+        assert!(
+            super::use_version(&home, &bin, "0.1.0", "agent-other", "aarch64-apple-darwin")
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_link(home.join("standalone/current")).unwrap(),
+            current
+        );
+        assert_eq!(fs::read(bin.join("agent-test")).unwrap(), launcher);
+    }
+    /// A valid bundle stored under a different version cannot redirect activation to another path.
+    #[cfg(unix)]
+    #[test]
+    fn activation_refuses_manifest_version_mismatch() {
+        use std::os::unix::fs::symlink;
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join("home");
+        let bin = t.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        let bundle = fixture(t.path(), "0.1.0", 0);
+        install(&bundle, &home, &bin).unwrap();
+        let base = home.join("standalone");
+        let current = base.join("current");
+        let launcher = fs::read(bin.join("agent-test")).unwrap();
+        let mismatched = base.join("releases/0.2.0");
+        fs::create_dir(&mismatched).unwrap();
+        fs::copy(
+            bundle.join("release-manifest.json"),
+            mismatched.join("release-manifest.json"),
+        )
+        .unwrap();
+        fs::copy(
+            bundle.join("agent-test-aarch64-apple-darwin"),
+            mismatched.join("agent-test-aarch64-apple-darwin"),
+        )
+        .unwrap();
+        assert!(use_version(&home, &bin, "0.2.0").is_err());
+        assert_eq!(
+            fs::read_link(&current).unwrap(),
+            PathBuf::from("releases/0.1.0")
+        );
+        assert_eq!(fs::read(bin.join("agent-test")).unwrap(), launcher);
+
+        fs::remove_file(&current).unwrap();
+        symlink("releases/0.2.0", &current).unwrap();
+        assert!(install(&fixture(t.path(), "0.3.0", 0), &home, &bin).is_err());
+        assert_eq!(
+            fs::read_link(&current).unwrap(),
+            PathBuf::from("releases/0.2.0")
+        );
+        assert_eq!(fs::read(bin.join("agent-test")).unwrap(), launcher);
+    }
+    /// Installation refuses an existing non-private home without changing its mode or contents.
+    #[cfg(unix)]
+    #[test]
+    fn install_preserves_existing_unprivate_home() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let bin = t.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        let bundle = fixture(t.path(), "0.1.0", 0);
+        for (index, mode) in [0o755, 0o1700].into_iter().enumerate() {
+            let home = t.path().join(format!("home-{index}"));
+            fs::create_dir(&home).unwrap();
+            fs::set_permissions(&home, fs::Permissions::from_mode(mode)).unwrap();
+            fs::write(home.join("sentinel"), b"keep").unwrap();
+            assert!(install(&bundle, &home, &bin).is_err());
+            assert_eq!(
+                fs::metadata(&home).unwrap().permissions().mode() & 0o7777,
+                mode
+            );
+            assert_eq!(fs::read(home.join("sentinel")).unwrap(), b"keep");
+            assert!(!home.join("standalone").exists());
+            assert!(fs::read_dir(&bin).unwrap().next().is_none());
+        }
+    }
+    /// An insecure nested installation directory is refused without changing it.
+    #[cfg(unix)]
+    #[test]
+    fn install_preserves_existing_unprivate_nested_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join("home");
+        let base = home.join("standalone");
+        let bin = t.path().join("bin");
+        fs::create_dir(&home).unwrap();
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir(&base).unwrap();
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::create_dir(&bin).unwrap();
+        fs::write(base.join("sentinel"), b"keep").unwrap();
+        assert!(install(&fixture(t.path(), "0.1.0", 0), &home, &bin).is_err());
+        assert_eq!(
+            fs::metadata(&base).unwrap().permissions().mode() & 0o7777,
+            0o755
+        );
+        assert_eq!(fs::read(base.join("sentinel")).unwrap(), b"keep");
+        assert!(!base.join("releases").exists());
+    }
+    /// Selecting a version in a missing home must not create an installation layout.
+    #[cfg(unix)]
+    #[test]
+    fn activation_of_missing_home_has_no_side_effects() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join("home");
+        let bin = t.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        assert!(use_version(&home, &bin, "0.1.0").is_err());
+        assert!(!home.exists());
+        assert!(fs::read_dir(bin).unwrap().next().is_none());
+    }
+    /// A missing lock in an existing installation is never silently recreated.
+    #[cfg(unix)]
+    #[test]
+    fn missing_existing_install_lock_is_not_recreated() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join("home");
+        let bin = t.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        let bundle = fixture(t.path(), "0.1.0", 0);
+        install(&bundle, &home, &bin).unwrap();
+        let base = home.join("standalone");
+        let current = fs::read_link(base.join("current")).unwrap();
+        let launcher = fs::read(bin.join("agent-test")).unwrap();
+        fs::remove_file(base.join("install.lock")).unwrap();
+        assert!(install(&bundle, &home, &bin).is_err());
+        assert!(use_version(&home, &bin, "0.1.0").is_err());
+        assert!(!base.join("install.lock").exists());
+        assert_eq!(fs::read_link(base.join("current")).unwrap(), current);
+        assert_eq!(fs::read(bin.join("agent-test")).unwrap(), launcher);
     }
     #[test]
     fn tampered_binary_rejected() {
@@ -395,10 +682,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn stateful_upgrade_and_rollback_keep_owner_state_intact() {
+        use std::os::unix::fs::PermissionsExt;
         let t = tempfile::tempdir().unwrap();
         let h = t.path().join("home");
         // The owner's pre-existing local state, outside `standalone/`.
         fs::create_dir_all(h.join("state/v1")).unwrap();
+        fs::set_permissions(&h, fs::Permissions::from_mode(0o700)).unwrap();
         fs::write(h.join("config.toml"), b"[storage]\nroot = \"/tmp/wt\"\n").unwrap();
         fs::write(h.join("state/v1/registry.json"), b"{\"entries\":[]}\n").unwrap();
         let (config, registry) = (
@@ -433,6 +722,30 @@ mod tests {
         assert_eq!(
             fs::read_link(h.join("standalone/current")).unwrap(),
             PathBuf::from("releases/0.1.0")
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn upgraded_state_refuses_older_release_rollback() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join("home");
+        let bin = t.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        install(&fixture(t.path(), "0.1.0", 1), &home, &bin).unwrap();
+        install(&fixture(t.path(), "0.2.0", 2), &home, &bin).unwrap();
+        install(&fixture(t.path(), "0.3.0", 3), &home, &bin).unwrap();
+        install(
+            &fixture(t.path(), "0.4.0", CURRENT_STATE_SCHEMA),
+            &home,
+            &bin,
+        )
+        .unwrap();
+        assert!(use_version(&home, &bin, "0.1.0").is_err());
+        assert!(use_version(&home, &bin, "0.2.0").is_err());
+        assert!(use_version(&home, &bin, "0.3.0").is_err());
+        assert_eq!(
+            fs::read_link(home.join("standalone/current")).unwrap(),
+            PathBuf::from("releases/0.4.0")
         );
     }
     #[cfg(unix)]

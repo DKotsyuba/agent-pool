@@ -21,7 +21,11 @@ done
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]] || { echo 'Use an explicit version' >&2; exit 2; }
 [[ "$REPO" =~ ^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || { echo 'Repository is missing or invalid' >&2; exit 2; }
 [[ "$home" == /* && "$bin_dir" == /* ]] || { echo 'Installation paths must be absolute' >&2; exit 2; }
-case "$(uname -s):$(uname -m)" in Darwin:arm64) target=aarch64-apple-darwin;; *) echo 'This installer is currently macOS arm64 only' >&2; exit 2;; esac
+case "$(uname -s):$(uname -m)" in
+  Darwin:arm64) target=aarch64-apple-darwin; remote_manifest=release-manifest.json; checksum=(shasum -a 256);;
+  Linux:x86_64) target=x86_64-unknown-linux-gnu; remote_manifest=release-manifest-x86_64-unknown-linux-gnu.json; checksum=(sha256sum);;
+  *) echo 'This installer supports macOS arm64 and Linux x86_64 only' >&2; exit 2;;
+esac
 asset="$PRODUCT-$target"
 temp=$(mktemp -d "${TMPDIR:-/tmp}/agent-mcp-install.XXXXXXXX")
 trap 'rm -rf -- "$temp"' EXIT
@@ -43,14 +47,17 @@ download() {
   (($(wc -c < "$output") <= max)) || return 1
 }
 download SHA256SUMS "$temp/SHA256SUMS" 8192
-download release-manifest.json "$temp/bundle/release-manifest.json" 16384
+download "$remote_manifest" "$temp/bundle/release-manifest.json" 16384
 download "$asset" "$temp/bundle/$asset" 536870912
-for name in "$asset" release-manifest.json; do
+verify_asset() {
+  local name=$1 path=$2 expected actual
   expected=$(awk -v n="$name" '$2 == n {count++; hash=$1} END {if(count != 1) exit 1; print hash}' "$temp/SHA256SUMS")
   [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || { echo 'Invalid checksum entry' >&2; exit 1; }
-  actual=$(shasum -a 256 "$temp/bundle/$name" | awk '{print $1}')
+  actual=$("${checksum[@]}" "$path" | awk '{print $1}')
   [[ "$actual" == "$expected" ]] || { echo 'Checksum mismatch; no candidate executed' >&2; exit 1; }
-done
+}
+verify_asset "$asset" "$temp/bundle/$asset"
+verify_asset "$remote_manifest" "$temp/bundle/release-manifest.json"
 # Checksums are not signatures. Trust is the authenticated GitHub origin / explicitly selected public origin.
 unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
 mkdir -p "$bin_dir"

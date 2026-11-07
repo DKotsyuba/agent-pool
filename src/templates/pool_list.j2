@@ -1,5 +1,7 @@
 OK accessible pools; more={{ has_more }}
 {% for pool in pools %}{{ pool.pool_id }} | revision={{ pool.revision }} | closed={{ pool.closed }} | {{ pool.name|quote }}
 Purpose: {{ pool.purpose|quote }}
+{% if pool.purpose_bytes is defined %}Purpose preview; full length={{ pool.purpose_bytes }} bytes. Read pool_get section=content field=purpose.
+{% endif %}
 {% endfor %}{% if next_after %}Cursor: {{ next_after }}
 {% endif %}The leader can own several pools and remains outside every roster.

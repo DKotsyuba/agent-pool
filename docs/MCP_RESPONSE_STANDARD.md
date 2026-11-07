@@ -403,9 +403,9 @@ This page read succeeded even though one listed job failed. Tool-call success is
 
 ## 16. Implementation map and adoption
 
-The template reference lives in `scaffold/crates/mcp-presentation`: a pure local Rust crate, four embedded templates, typed projections, a bounded writer, read-page decoding and a status-preserving mutation receipt example. The starter's existing `get_status` and invalid-argument replies use the renderer. Job-page and mutation examples are library examples, not newly registered MCP tools and not new external effects.
+The presentation reference lives in `crates/mcp-presentation`: a pure local Rust crate, four embedded templates, typed projections, a bounded writer, read-page decoding and a status-preserving mutation receipt example. The product's `get_status` and invalid-argument replies use the renderer. Job-page and mutation examples are library examples, not newly registered MCP tools and not new external effects.
 
-The canonical document is `standard/MCP_RESPONSE_STANDARD.md`. Its exact export in `scaffold/docs/MCP_RESPONSE_STANDARD.md` contains no private inventory; CI compares the copies. Update the canonical file and export in the same PR.
+Maintain this document with the product and keep its examples consistent with the presentation crate and tool contracts.
 
 Adopt this profile in existing products incrementally: inventory each tool's current result/consumer; define its compact view and essential fields; add representative fixtures; wire the renderer; check supported hosts; then remove raw-payload output. Do not change IDs, retry semantics, storage, workflow or tool names just to change formatting. Do not automatically migrate other repositories when editing the template.
 

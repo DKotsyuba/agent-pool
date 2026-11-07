@@ -1,5 +1,9 @@
 COMMITTED pool {{ pool_id }} revision={{ revision }} event={{ event.event_id }}
 {{ event.kind }}{% if created_id %}; created_id={{ created_id }}{% endif %}
+{% if created_ids is defined %}{% if event.kind == "replacement_requested" %}Candidate replacement member (not current until admission):{% else %}Created members in request order:{% endif %}{% for member_id in created_ids %} {{ member_id }}{% endfor %}
+{% endif %}
 Body: {{ event.body|quote }}
+{% if event.part_count is defined %}Message {{ event.message_event_id }} has {{ event.part_count }} history parts; this receipt shows part 1.
+{% endif %}
 Status: {{ status }}. External receipt is not proof that an agent read the message.
 Next: pool_get pool_id={{ pool_id }} for the current revision; repeat only the same request_key and intent after a lost reply.

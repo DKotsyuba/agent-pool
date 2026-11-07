@@ -13,6 +13,10 @@ jobs:
   check:
     runs-on: macos-26
     timeout-minutes: 30
+    env:
+      TMPDIR: ${{ runner.temp }}
+      TMP: ${{ runner.temp }}
+      TEMP: ${{ runner.temp }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -47,11 +51,34 @@ jobs:
         with:
           path: ~/.cargo/bin/cargo-deny
           key: ${{ steps.cargo-deny-cache.outputs.cache-primary-key }}
-  # One trusted main producer warms optimized dependencies without publishing.
+  check-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      TMPDIR: ${{ runner.temp }}
+      TMP: ${{ runner.temp }}
+      TEMP: ${{ runner.temp }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: test "$(uname -s):$(uname -m)" = Linux:x86_64
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: product-check-v1-ubuntu-24.04-${{ runner.arch }}
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - run: cargo fetch --locked
+      - run: cargo xtask check
+  # Main and manual runs retain a native macOS candidate without publishing a release.
   package:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: macos-26
     timeout-minutes: 30
+    env:
+      TMPDIR: ${{ runner.temp }}
+      TMP: ${{ runner.temp }}
+      TEMP: ${{ runner.temp }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -63,11 +90,66 @@ jobs:
           cache-bin: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - run: cargo fetch --locked
-      - name: Warm and verify the native package workload
+      - name: Build and verify the archived native candidate
         shell: bash
         run: |
-          bundle=$(cargo xtask package | tail -n 1)
-          cargo xtask package verify "$bundle"
+          set -euo pipefail
+          rustc -vV | grep -Fx 'host: aarch64-apple-darwin'
+          cargo xtask package --out "$RUNNER_TEMP/macos-payload"
+          tar -C "$RUNNER_TEMP/macos-payload" -czf "$RUNNER_TEMP/macos-payload.tar.gz" .
+          mkdir "$RUNNER_TEMP/macos-inspect"
+          tar -C "$RUNNER_TEMP/macos-inspect" -xzf "$RUNNER_TEMP/macos-payload.tar.gz"
+          cargo xtask package verify "$RUNNER_TEMP/macos-inspect"
+          package_id=$(cargo pkgid --frozen --package agent-pool)
+          version=${package_id##*#}
+          version=${version##*@}
+          actual_version=$("$RUNNER_TEMP/macos-inspect/agent-pool-aarch64-apple-darwin" --version)
+          test "$actual_version" = "agent-pool $version"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: candidate-macos-aarch64
+          path: ${{ runner.temp }}/macos-payload.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+  package-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      TMPDIR: ${{ runner.temp }}
+      TMP: ${{ runner.temp }}
+      TEMP: ${{ runner.temp }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: test "$(uname -s):$(uname -m)" = Linux:x86_64
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: product-package-v1-ubuntu-24.04-${{ runner.arch }}
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - run: cargo fetch --locked
+      - name: Build and verify the archived native candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc -vV | grep -Fx 'host: x86_64-unknown-linux-gnu'
+          cargo xtask package --out "$RUNNER_TEMP/linux-payload"
+          tar -C "$RUNNER_TEMP/linux-payload" -czf "$RUNNER_TEMP/linux-payload.tar.gz" .
+          mkdir "$RUNNER_TEMP/linux-inspect"
+          tar -C "$RUNNER_TEMP/linux-inspect" -xzf "$RUNNER_TEMP/linux-payload.tar.gz"
+          cargo xtask package verify "$RUNNER_TEMP/linux-inspect"
+          package_id=$(cargo pkgid --frozen --package agent-pool)
+          version=${package_id##*#}
+          version=${version##*@}
+          actual_version=$("$RUNNER_TEMP/linux-inspect/agent-pool-x86_64-unknown-linux-gnu" --version)
+          test "$actual_version" = "agent-pool $version"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: candidate-linux-x86_64
+          path: ${{ runner.temp }}/linux-payload.tar.gz
+          if-no-files-found: error
+          retention-days: 7
   dependencies:
     runs-on: ubuntu-24.04
     timeout-minutes: 20

@@ -20,6 +20,7 @@ impl Templates {
         env.set_fuel(Some(50_000));
         env.set_recursion_limit(16);
         env.set_formatter(mcp_presentation::json_bool_formatter);
+        env.add_test("defined", |value: minijinja::Value| !value.is_undefined());
         env.add_filter("quote", |value: String| {
             serde_json::to_string(&value).unwrap_or_else(|_| "\"unavailable\"".into())
         });

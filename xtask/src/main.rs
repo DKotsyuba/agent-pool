@@ -111,6 +111,13 @@ fn helper(root: &Path, program: &str) -> Command {
             "GITHUB_TOKEN",
             "GH_ENTERPRISE_TOKEN",
             "GITHUB_ENTERPRISE_TOKEN",
+            "ACTIONS_RUNTIME_TOKEN",
+            "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+            "GITHUB_OUTPUT",
+            "GITHUB_ENV",
+            "GITHUB_PATH",
+            "GITHUB_STATE",
+            "GITHUB_STEP_SUMMARY",
         ] {
             command.env_remove(name);
         }
@@ -522,6 +529,14 @@ impl Project {
         );
         Ok(())
     }
+    /// Resolves the one state schema expected by packaging and release verification.
+    pub(crate) fn state_schema(&self) -> Result<u32> {
+        match self.family["profiles"]["state"].as_str() {
+            Some("local") => Ok(family_delivery::CURRENT_STATE_SCHEMA),
+            Some("none") => Ok(0),
+            other => Err(format!("unsupported state profile for packaging: {other:?}").into()),
+        }
+    }
     /// Builds and verifies an immutable bundle from committed source, returning its directory.
     /// `out` selects an explicit new artifact path; omission retains the standard dist layout.
     /// Existing bundle directories are refused; packaging never activates or restarts a service.
@@ -536,13 +551,7 @@ impl Project {
             .find_map(|s| s.strip_prefix("host: "))
             .ok_or("host target missing")?
             .to_owned();
-        let state_schema = match self.family["profiles"]["state"].as_str() {
-            Some("local") => family_delivery::CURRENT_STATE_SCHEMA,
-            Some("none") => 0,
-            other => {
-                return Err(format!("unsupported state profile for packaging: {other:?}").into());
-            }
-        };
+        let state_schema = self.state_schema()?;
         self.build(true)?;
         let output = out.unwrap_or_else(|| {
             self.root

@@ -45,7 +45,7 @@ pub struct Get {
     /// Exact opaque pool ID.
     pub pool_id: String,
     /// Section-local exclusive cursor; zero starts at the beginning.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "cursor")]
     pub after: u64,
     /// Existing section names, plus decisions for the retained proposal archive.
     #[serde(default = "overview")]
@@ -53,15 +53,79 @@ pub struct Get {
     /// Exact archived proposal, valid only for proposal or votes.
     #[serde(default)]
     pub proposal_id: Option<String>,
-    /// Exact current or removed incarnation, required only for binding.
+    /// Exact current or removed incarnation, required for binding and Run proof.
     #[serde(default)]
     pub member_id: Option<String>,
+    /// Selects the long-content field only for the content section.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<domain::ContentField>,
     /// Include native/Run mappings on roster pages; false omits them entirely.
     #[serde(default)]
     pub include_bindings: bool,
     /// Required on mutable roster/vote continuation; exact revision from the preceding view.
     #[serde(default)]
     pub expected_revision: Option<u64>,
+    /// Opt-in history direction; omission preserves the original forward response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<HistoryDirection>,
+    /// Exclusive oldest boundary for a backward history page.
+    #[serde(
+        default,
+        deserialize_with = "optional_cursor",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub before: Option<u64>,
+    /// Inclusive, fixed history watermark returned by an earlier page.
+    #[serde(
+        default,
+        deserialize_with = "optional_cursor",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub through: Option<u64>,
+}
+/// Direction of an explicitly requested history page.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryDirection {
+    /// Read events after the cursor in ascending order.
+    Forward,
+    /// Read the newest events before the cursor, returning them in ascending order.
+    Backward,
+}
+/// A cursor accepts exact decimal text as well as the original JSON integer.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Cursor {
+    Integer(u64),
+    Text(String),
+}
+impl Cursor {
+    /// Rejects noncanonical or overflowing decimal strings before any read.
+    fn value<E: serde::de::Error>(self) -> Result<u64, E> {
+        match self {
+            Self::Integer(value) => Ok(value),
+            Self::Text(value)
+                if !value.is_empty()
+                    && value.bytes().all(|byte| byte.is_ascii_digit())
+                    && (value.len() == 1 || !value.starts_with('0')) =>
+            {
+                value.parse().map_err(E::custom)
+            }
+            Self::Text(_) => Err(E::custom("invalid decimal cursor")),
+        }
+    }
+}
+/// Deserializes the defaulted forward cursor without losing integer precision.
+fn cursor<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    Cursor::deserialize(deserializer)?.value()
+}
+/// Deserializes an optional exact cursor, including an explicit null.
+fn optional_cursor<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    Option::<Cursor>::deserialize(deserializer)?
+        .map(Cursor::value)
+        .transpose()
 }
 /// Default section matches the existing participant API.
 fn overview() -> String {
@@ -78,11 +142,19 @@ impl Get {
             section,
             proposal_id: self.proposal_id.clone(),
             member_id: self.member_id.clone(),
+            wait_seconds: 0.0,
+            reverse: false,
+            before: None,
+            field: self.field.clone(),
+            expected_revision: self.expected_revision,
         };
         domain::Command::Get(get.clone()).validate()?;
         if matches!(
             get.section,
-            domain::Section::Overview | domain::Section::Members | domain::Section::Votes
+            domain::Section::Overview
+                | domain::Section::Members
+                | domain::Section::Votes
+                | domain::Section::Content
         ) && self.after > 0
             && self.expected_revision.is_none()
         {
@@ -105,13 +177,51 @@ impl Request {
         if self.schema_version != 1 {
             return Err(Fault::Invalid);
         }
+        if let Operation::Get(args) = &self.operation {
+            if (args.direction.is_some() || args.before.is_some() || args.through.is_some())
+                && args.section != "history"
+            {
+                return Err(Fault::Invalid);
+            }
+            if args.direction.is_none() && (args.before.is_some() || args.through.is_some()) {
+                return Err(Fault::Invalid);
+            }
+            if let Some(direction) = args.direction
+                && (i64::try_from(args.after).is_err()
+                    || args
+                        .before
+                        .is_some_and(|n| n == 0 || i64::try_from(n).is_err())
+                    || args.through.is_some_and(|n| i64::try_from(n).is_err())
+                    || (direction == HistoryDirection::Backward && args.after != 0)
+                    || (direction == HistoryDirection::Forward && args.before.is_some()))
+            {
+                return Err(Fault::Invalid);
+            }
+        }
         match &self.operation {
             Operation::Identity(_) => Ok(()),
             Operation::List(args) => domain::Command::List(args.clone()).validate(),
             Operation::Get(args) if args.section == "decisions" => {
                 domain::identifier(&args.pool_id)?;
                 i64::try_from(args.after).map_err(|_| Fault::Invalid)?;
-                if args.proposal_id.is_some() || args.member_id.is_some() || args.include_bindings {
+                if args.proposal_id.is_some()
+                    || args.member_id.is_some()
+                    || args.include_bindings
+                    || args.field.is_some()
+                {
+                    return Err(Fault::Invalid);
+                }
+                Ok(())
+            }
+            Operation::Get(args) if args.section == "run_proof" => {
+                domain::identifier(&args.pool_id)?;
+                domain::identifier(args.member_id.as_deref().ok_or(Fault::Invalid)?)?;
+                if args.after != 0
+                    || args.proposal_id.is_some()
+                    || args.include_bindings
+                    || args.field.is_some()
+                    || args.expected_revision == Some(0)
+                {
                     return Err(Fault::Invalid);
                 }
                 Ok(())
@@ -124,6 +234,7 @@ impl Request {
         match self.operation {
             Operation::Identity(_) => "identity",
             Operation::List(_) => "pool_page",
+            Operation::Get(ref args) if args.section == "run_proof" => "run_proof",
             Operation::Get(_) => "pool_detail",
         }
     }
@@ -173,6 +284,98 @@ pub enum Data {
     Pools(PoolPage),
     /// Existing safe section projection plus explicit owner-only mappings when requested.
     Detail(Box<Detail>),
+    /// Historical Run evidence for one exact owner-selected membership.
+    RunProof(#[serde(deserialize_with = "crate::integrations::json_object")] Box<RunProof>),
+}
+/// Whether the status source returned a validated snapshot for this membership.
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunProofState {
+    /// Run returned a correlated status snapshot, which may itself report mismatch or unknown.
+    Observed,
+    /// No exact status snapshot is available.
+    Unknown,
+}
+/// Safe explanation for an unavailable proof, without paths or provider messages.
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunProofReason {
+    /// The membership has no complete Run identity and retained pin.
+    IncompleteBinding,
+    /// Its original accepted store route is missing, ambiguous, or differs from configuration.
+    OriginUnavailable,
+    /// The scoped Run status call failed or its response was not trustworthy.
+    RunUnavailable,
+}
+/// Run status does not prove who made a Pool call.
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunProofAuthority {
+    /// Caller and current attempt have not been established by this observation.
+    Unknown,
+}
+/// Owner-only historical execution evidence; it never establishes the caller's authority.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunProof {
+    /// Exact pool and membership selected by the owner.
+    pub pool_id: String,
+    /// Exact membership selected by the owner.
+    pub member_id: String,
+    /// Pool revision rechecked after any Run read.
+    pub pool_revision: u64,
+    /// Whether this membership remains in the current roster.
+    pub current: bool,
+    /// Pool's own observation time in Unix milliseconds.
+    pub observed_at_unix_ms: u64,
+    /// Result availability, distinct from the execution's Run match state.
+    pub state: RunProofState,
+    /// Reason when no trustworthy Run snapshot is available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<RunProofReason>,
+    /// Original Run store identity, when known from the binding.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub store_id: Option<String>,
+    /// Run's own snapshot time in Unix seconds, not a Pool revision.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_observed_at: Option<f64>,
+    /// Exact validated execution evidence, when available.
+    #[serde(
+        default,
+        deserialize_with = "crate::integrations::nullable_object",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub proof: Option<crate::run_status::ProofProjection>,
+    /// Caller and current attempt are not established by this read-only observation.
+    pub author_identity: RunProofAuthority,
+}
+impl RunProof {
+    /// Checks the observer envelope without turning missing evidence into a positive proof.
+    fn valid(&self) -> bool {
+        domain::identifier(&self.pool_id).is_ok()
+            && domain::identifier(&self.member_id).is_ok()
+            && self.pool_revision > 0
+            && self
+                .store_id
+                .as_deref()
+                .is_none_or(|id| domain::store_id(id).is_ok())
+            && match self.state {
+                RunProofState::Observed => {
+                    self.reason.is_none()
+                        && self.store_id.is_some()
+                        && self
+                            .run_observed_at
+                            .is_some_and(|time| time.is_finite() && time >= 0.0)
+                        && self
+                            .proof
+                            .as_ref()
+                            .is_some_and(crate::run_status::ProofProjection::valid)
+                }
+                RunProofState::Unknown => {
+                    self.reason.is_some() && self.run_observed_at.is_none() && self.proof.is_none()
+                }
+            }
+    }
 }
 /// Authenticated resident identity, without an invented installed/source revision.
 #[derive(Serialize, Deserialize)]
@@ -207,7 +410,7 @@ pub struct Page {
     pub returned: usize,
     /// Source snapshot observation time, in Unix milliseconds.
     pub observed_at_unix_ms: u64,
-    /// Historical timestamps are absent from Store schema v1, explicitly null.
+    /// Historical timestamps are absent from Store schema v5, explicitly null.
     pub source_timestamp: Option<u64>,
     /// Explicit paging/snapshot and missing timestamp limitations.
     pub coverage: String,
@@ -235,6 +438,9 @@ pub struct Detail {
     pub bindings: Option<Vec<domain::Binding>>,
     /// Retained proposal metadata without votes, retrieved via proposal_id and votes pages.
     pub decisions: Vec<domain::Proposal>,
+    /// Exact fixed upper event ID for opt-in history paging; absent on legacy reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_watermark: Option<String>,
     /// Paging and freshness metadata for the selected section only.
     #[serde(flatten)]
     pub page: Page,
@@ -243,11 +449,11 @@ impl Page {
     /// Constructs truthful metadata; each request is a current resident snapshot, not a cross-page snapshot.
     pub fn new(cursor: Option<String>, has_more: bool, returned: usize) -> Result<Self, Fault> {
         Ok(Self { cursor, has_more, returned, observed_at_unix_ms: now()?, source_timestamp:None,
-            coverage:"Selected section only; follow cursor while has_more. Pages observe current state independently. Historical source timestamps are not recorded in Store schema v1.".into() })
+            coverage:"Selected section only; follow cursor while has_more. Pages observe current state independently. Historical source timestamps are not recorded in Store schema v5.".into() })
     }
 }
 /// Returns current Unix milliseconds, refusing clocks before the epoch or unrepresentable values.
-fn now() -> Result<u64, Fault> {
+pub(crate) fn now() -> Result<u64, Fault> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| Fault::Unavailable)?
@@ -276,7 +482,16 @@ impl Envelope {
             product: "agent-pool".into(),
             version: env!("CARGO_PKG_VERSION").into(),
             qualification: crate::qualification().into(),
-            capabilities: vec!["identity".into(), "list".into(), "get".into()],
+            capabilities: vec![
+                "identity".into(),
+                "list".into(),
+                "get".into(),
+                "history_window_v1".into(),
+                "structured_acceptance_v1".into(),
+                "message_parts_v1".into(),
+                "content_pages_v1".into(),
+                "run_proof_v1".into(),
+            ],
             observed_at_unix_ms: now()?,
         }))
     }
@@ -325,6 +540,14 @@ pub async fn frontend(request: Request, path: &Path) -> Result<Envelope, Fault> 
     .await
     .map_err(|_| Fault::Internal)??;
     let expected_kind = request.kind();
+    let expected_proof = match &request.operation {
+        Operation::Get(args) if args.section == "run_proof" => Some((
+            args.pool_id.clone(),
+            args.member_id.clone().ok_or(Fault::Invalid)?,
+            args.expected_revision,
+        )),
+        _ => None,
+    };
     let bytes = serde_json::to_vec(&Ingress {
         observer_credential: credential,
         observe: request,
@@ -358,9 +581,22 @@ pub async fn frontend(request: Request, path: &Path) -> Result<Envelope, Fault> 
                 ("identity", Data::Identity(_))
                     | ("pool_page", Data::Pools(_))
                     | ("pool_detail", Data::Detail(_))
+                    | ("run_proof", Data::RunProof(_))
             )
         }) {
             return Err(Fault::Unavailable);
+        }
+        if let Some(Data::RunProof(proof)) = &envelope.data {
+            let Some((pool_id, member_id, revision)) = &expected_proof else {
+                return Err(Fault::Unavailable);
+            };
+            if !proof.valid()
+                || &proof.pool_id != pool_id
+                || &proof.member_id != member_id
+                || revision.is_some_and(|revision| revision != proof.pool_revision)
+            {
+                return Err(Fault::Unavailable);
+            }
         }
         Ok(envelope)
     })
@@ -439,16 +675,151 @@ mod tests {
             serde_json::json!({"pool_id":"pool","section":"history","include_bindings":true}),
             serde_json::json!({"pool_id":"pool","section":"binding"}),
             serde_json::json!({"pool_id":"pool","section":"decisions","after":u64::MAX}),
+            serde_json::json!({"pool_id":"pool","section":"run_proof"}),
+            serde_json::json!({"pool_id":"pool","section":"run_proof","member_id":"member","after":1}),
+            serde_json::json!({"pool_id":"pool","section":"run_proof","member_id":"member","include_bindings":true}),
+            serde_json::json!({"pool_id":"pool","section":"run_proof","member_id":"member","expected_revision":0}),
         ] {
             let request: Request = serde_json::from_value(
                 serde_json::json!({"schema_version":1,"operation":"get","params":params}),
             )?;
             assert!(matches!(request.validate(), Err(Fault::Invalid)));
         }
+        let proof: Request = serde_json::from_value(serde_json::json!({
+            "schema_version":1,"operation":"get","params":{
+                "pool_id":"pool","section":"run_proof","member_id":"member","expected_revision":1
+            }
+        }))?;
+        proof.validate()?;
+        assert_eq!(proof.kind(), "run_proof");
         let request: Request = serde_json::from_value(
             serde_json::json!({"schema_version":2,"operation":"identity","params":{}}),
         )?;
         assert!(matches!(request.validate(), Err(Fault::Invalid)));
+        let request: Request = serde_json::from_value(serde_json::json!({
+            "schema_version":1,"operation":"get","params":{
+                "pool_id":"pool","section":"history","direction":"forward",
+                "after":"9007199254740993","through":"9007199254740993"
+            }
+        }))?;
+        let decoded: Request = serde_json::from_slice(&serde_json::to_vec(&request)?)?;
+        decoded.validate()?;
+        let Operation::Get(args) = decoded.operation else {
+            return Err("history request changed operation".into());
+        };
+        assert_eq!(args.after, 9_007_199_254_740_993);
+        assert_eq!(args.through, Some(9_007_199_254_740_993));
+        Ok(())
+    }
+
+    /// A decoded owner proof cannot claim stronger evidence or caller authority than its status.
+    #[test]
+    fn run_proof_envelope_rejects_contradictory_fields() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/run-status-v1-success.json"))?;
+        let request = &fixture["socket"]["request"];
+        let store = request["expected_store_id"].as_str().ok_or("store")?;
+        let targets: Vec<crate::run_status::Target> =
+            serde_json::from_value(request["targets"].clone())?;
+        let bytes = serde_json::to_vec(&fixture["socket"]["result"])?;
+        let evidence = crate::run_status::parse(&bytes, store, &targets)
+            .map_err(|error| format!("{error:?}"))?;
+        let proof = evidence.items().next().ok_or("item")?.projection();
+        let valid = RunProof {
+            pool_id: "pool".into(),
+            member_id: "member".into(),
+            pool_revision: 1,
+            current: true,
+            observed_at_unix_ms: 1,
+            state: RunProofState::Observed,
+            reason: None,
+            store_id: Some(store.into()),
+            run_observed_at: Some(evidence.observed_at()),
+            proof: Some(proof),
+            author_identity: RunProofAuthority::Unknown,
+        };
+        assert!(valid.valid());
+        let mut value = serde_json::to_value(valid)?;
+        value["proof"]["historical_success"] = serde_json::json!(false);
+        assert!(!serde_json::from_value::<RunProof>(value.clone())?.valid());
+        value["proof"]["historical_success"] = serde_json::json!(true);
+        value["author_identity"] = serde_json::json!("verified");
+        assert!(serde_json::from_value::<RunProof>(value).is_err());
+        Ok(())
+    }
+
+    /// The real frontend refuses a valid proof for another requested member, pool or revision.
+    #[tokio::test]
+    async fn run_proof_frontend_correlates_request() -> Result<(), Box<dyn std::error::Error>> {
+        use std::{
+            fs,
+            os::unix::fs::{MetadataExt, PermissionsExt},
+        };
+        let directory =
+            tempfile::tempdir_in(std::env::var_os("TMPDIR").ok_or("task TMPDIR required")?)?;
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))?;
+        let path = directory.path();
+        let socket = path.join("pool.sock");
+        let listener = tokio::net::UnixListener::bind(&socket)?;
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
+        let token = path.join("observer.token");
+        fs::write(&token, "fixture-observer")?;
+        fs::set_permissions(&token, fs::Permissions::from_mode(0o600))?;
+        let config = path.join("config.toml");
+        fs::write(
+            &config,
+            format!(
+                "socket_path={socket:?}\ndatabase_path={:?}\nexpected_uid={}\nbridge_registration_socket={:?}\nbridge_core_socket={:?}\nbridge_credential_file={:?}\nbridge_producer_id=\"fixture\"\nbridge_audience=\"fixture\"\nowner_observer_credential_file={token:?}\n",
+                path.join("unused.db"),
+                fs::metadata(path)?.uid(),
+                path.join("registration"),
+                path.join("bridge"),
+                path.join("bridge.token")
+            ),
+        )?;
+        for (pool, member, reply_revision, requested_revision, succeeds) in [
+            ("pool", "member", 7, Some(7), true),
+            ("other", "member", 7, Some(7), false),
+            ("pool", "other", 7, Some(7), false),
+            ("pool", "member", 8, Some(7), false),
+            ("pool", "member", 8, None, true),
+        ] {
+            let request: Request = serde_json::from_value(serde_json::json!({
+                "schema_version":1,"operation":"get","params":{
+                    "pool_id":"pool","section":"run_proof","member_id":"member",
+                    "expected_revision":requested_revision
+                }
+            }))?;
+            let response = serde_json::json!({
+                "schema_version":1,"kind":"run_proof","data":{
+                    "pool_id":pool,"member_id":member,"pool_revision":reply_revision,
+                    "current":true,"observed_at_unix_ms":1,"state":"unknown",
+                    "reason":"incomplete_binding","author_identity":"unknown"
+                }
+            });
+            let (received, served) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    tokio::join!(frontend(request, &config), async {
+                        let (mut stream, _) = listener.accept().await?;
+                        let bytes = integrations::read_frame(&mut stream)
+                            .await
+                            .map_err(std::io::Error::other)?;
+                        let forwarded: serde_json::Value = serde_json::from_slice(&bytes)?;
+                        assert_eq!(forwarded["observer_credential"], "fixture-observer");
+                        let mut bytes = serde_json::to_vec(&response)?;
+                        bytes.push(b'\n');
+                        stream.write_all(&bytes).await?;
+                        Ok::<_, Box<dyn std::error::Error>>(())
+                    })
+                })
+                .await?;
+            served?;
+            assert_eq!(received.is_ok(), succeeds);
+            if !succeeds {
+                assert!(matches!(received, Err(Fault::Unavailable)));
+            }
+        }
+        assert!(!path.join("unused.db").exists());
         Ok(())
     }
     /// Byte accounting includes UTF-8, JSON escaping and newline; no partial result escapes on overflow.
@@ -468,6 +839,26 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&success)?;
         assert!(value.get("error").is_none());
         assert_eq!(value["data"]["product"], "agent-pool");
+        assert!(
+            value["data"]["capabilities"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item == "history_window_v1"))
+        );
+        assert!(
+            value["data"]["capabilities"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item == "structured_acceptance_v1"))
+        );
+        assert!(
+            value["data"]["capabilities"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item == "message_parts_v1"))
+        );
+        assert!(
+            value["data"]["capabilities"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item == "content_pages_v1"))
+        );
         assert!(value["data"].get("source_revision").is_none());
         Ok(())
     }
