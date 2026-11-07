@@ -22,7 +22,7 @@ jobs:
         with:
           persist-credentials: false
       - run: test "$(uname -m)" = arm64
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: product-check-v2-macos-26-${{ runner.arch }}
           cache-bin: false
@@ -63,7 +63,7 @@ jobs:
         with:
           persist-credentials: false
       - run: test "$(uname -s):$(uname -m)" = Linux:x86_64
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: product-check-v1-ubuntu-24.04-${{ runner.arch }}
           cache-bin: false
@@ -84,7 +84,7 @@ jobs:
         with:
           persist-credentials: false
       - run: test "$(uname -m)" = arm64
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: product-package-v1-macos-26-${{ runner.arch }}
           cache-bin: false
@@ -105,7 +105,7 @@ jobs:
           version=${version##*@}
           actual_version=$("$RUNNER_TEMP/macos-inspect/agent-pool-aarch64-apple-darwin" --version)
           test "$actual_version" = "agent-pool $version"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: candidate-macos-aarch64
           path: ${{ runner.temp }}/macos-payload.tar.gz
@@ -123,7 +123,7 @@ jobs:
         with:
           persist-credentials: false
       - run: test "$(uname -s):$(uname -m)" = Linux:x86_64
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: product-package-v1-ubuntu-24.04-${{ runner.arch }}
           cache-bin: false
@@ -144,7 +144,7 @@ jobs:
           version=${version##*@}
           actual_version=$("$RUNNER_TEMP/linux-inspect/agent-pool-x86_64-unknown-linux-gnu" --version)
           test "$actual_version" = "agent-pool $version"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: candidate-linux-x86_64
           path: ${{ runner.temp }}/linux-payload.tar.gz
