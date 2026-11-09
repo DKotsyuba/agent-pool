@@ -12,8 +12,8 @@ its EOF never starts, stops or replaces the resident.
 - `store.rs` owns the single SQLite writer and synchronous transactions. A process
   lifetime file lock excludes a second writer. WAL, full synchronization, foreign
   keys and schema version 8 are explicit. Future schema versions refuse to open.
-  Schema v1–v7 upgrades transactionally to v8 before use; older binaries must
-  refuse v8 because they cannot preserve newer durable state. The v5 replacement
+  Schema v1–v8 upgrades transactionally to v9 before use; older binaries must
+  refuse v9 because they cannot preserve newer durable state. The v5 replacement
   and stable-slot migration and v6 inventory revision fence remain in that upgrade.
 - `runtime.rs` supervises bounded frontend connections, one serial effect worker
   and rotating observation batches. Blocking database work never spans provider I/O.
@@ -421,7 +421,10 @@ The exact proposed wire is in the shared `contracts/pool-p1-wire.md`.
 
 Schema v7 adds separate managed binding generations, binding epochs, original
 contexts and rebind records; v8 adds managed intents, domain-key reservations and
-ballot provenance. Legacy members and ballots do not acquire verified provenance
+ballot provenance; v9 adds an open-ballot invalidation overlay, retained binding
+incarnation and current-read ownership for bounded capacity. Where migration
+cannot recover an incarnation from an authenticated retained receipt, the next
+attested rebind bumps its generation. Legacy members and ballots do not acquire verified provenance
 by migration. The optional `managed_run_transport` pins the Run attempt endpoint
 and its route independently of the legacy Run socket. `frontend_enabled` defaults
 to false; enabling it requires the matching reader grant and the exact `mcp_server`
@@ -433,6 +436,14 @@ Bridge may return `relaunch_required` when the resident predates managed-role
 initialization. Pool preserves that typed refusal and tells the caller to relaunch
 the resident, while retaining original request keys for recovery. It never
 restarts the resident itself.
+
+The explicit opt-in is safe only because Run issues a current receipt after the
+exact launch has a durable managed-role qualification. A missing or unqualified
+role returns `attempt_not_ready` or `role_unqualified`; Pool refuses the call
+before participant reads, domain-key reservation or effects. Both Codex and Claude
+use Bridge B1's configured `mcp__{server}__{command_name}` hook convention;
+Bridge verifies the exact mapping and Pool checks the same association. Installed
+provider hook behavior remains subject to separate dobi qualification.
 
 For a managed call the frontend prepares the original B1 context. The resident
 persists the pinned routes and original key, then asks Run for rootless ingress
@@ -461,11 +472,32 @@ CAS. A superseded verified voter triggers a separately capability-gated Run egre
 rebind before the old consensus attempt is aborted. A nonfinal vote can be
 recorded without changing other ballots or evaluating acceptance. Egress
 currentness uses its own Run capability and provides no delivery or owner handoff.
+A member rebind marks that member's open ballot not-ready without changing the pool
+revision; other voters can still record nonfinal votes. A freshly re-observed
+actor-epoch change bumps its binding generation even if the Run attempt is the
+same. The aggregate binding/roster epoch fences consensus CAS, while an unrelated
+member's context is fenced by its own binding generation and the domain roster.
+These refinements follow shared `contracts/attempt-binding-v1-errata.md` E1 and E7.
 The existing managed join and incomplete-tool guards remain closed, and no managed
-capability is advertised. This code has synthetic coverage; actual Run/Bridge
+participant capability is advertised. This code has synthetic coverage; actual Run/Bridge
 endpoints, installed providers and managed-harness role qualification have not
 been qualified together. The grant installs no service, endpoint, credential or
 release.
+
+The owner observer capability `managed_capacity_v1` accepts
+`{"schema_version":1,"operation":"managed_capacity","params":{}}` through
+the existing separately authorized owner grant. It returns a single SQLite
+snapshot of active, retained, reserved, limit and reservation-adjusted headroom
+for namespaces, bootstraps, contexts, intents and currentness requests, plus
+bootstrap and context reservation totals. It is diagnostic, not a promise that
+a future operation fits. Only active/unresolved work consumes these admission
+limits; permanent rejecting keys and terminal evidence remain retained. A sealed
+namespace compacts no-longer-actionable command and snapshot payloads while
+preserving intent outcomes, domain replay keys, routes and remote recovery
+receipts. Sealed namespace fences and per-key tombstones do not expire; retained
+storage can still grow and requires operator monitoring. `doctor --config PATH`
+uses that same explicitly configured owner grant to include the capacity snapshot;
+without a config, `doctor` remains a nonmutating local resource check.
 
 ### Run execution evidence v1
 
@@ -541,7 +573,7 @@ delivery are separate facts. Inventory orders by pool ID; archive orders by
 retained proposal insertion sequence; other sections preserve existing cursor
 semantics. Pages observe current state independently; mutable offset sections
 require the revision fence on continuation.
-Store schema v8 has no historical timestamps: `source_timestamp:null` and
+Store schema v9 has no historical timestamps: `source_timestamp:null` and
 coverage text disclose that absence. Complete encoded envelopes including the
 newline are capped at 1 MiB; oversized results fail explicitly without partial
 publication or silently advancing a cursor. Resident exchanges use the existing

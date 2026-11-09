@@ -468,6 +468,9 @@ mod tests {
             },
         };
         assert!(validate_consume(&consumed, &key, "pool", &command, "epoch").is_ok());
+        let mut claude = consumed.clone();
+        claude.receipt.observation.actor.address = "host/claude-code/store/session".into();
+        assert!(validate_consume(&claude, &key, "pool", &command, "epoch").is_ok());
         consumed.receipt.observation.tool_name = "mcp__pool__pool_vote".into();
         assert_eq!(
             validate_consume(&consumed, &key, "pool", &command, "epoch"),

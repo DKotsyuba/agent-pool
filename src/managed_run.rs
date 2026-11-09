@@ -1279,6 +1279,8 @@ mod tests {
         error.code = "attempt_not_ready".into();
         error.recovery = "none".into();
         assert_eq!(classify_error(&error, "store"), RunError::Unknown);
+        error.code = "role_unqualified".into();
+        assert_eq!(classify_error(&error, "store"), RunError::Refused);
     }
     #[test]
     fn admission_lookup_never_treats_absence_as_abort_fence() {

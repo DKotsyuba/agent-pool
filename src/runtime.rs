@@ -414,6 +414,10 @@ mod managed_dispatch {
             lease: &'a ManagedLease,
         ) -> Response<'a, ConsensusFence> {
             Box::pin(async move {
+                let owner = match &lease._inner.work {
+                    ManagedWork::Intent(id) if id == pending.intent_id() => id.clone(),
+                    _ => return Err(Fault::Unauthorized),
+                };
                 let voters = pending.voters().to_vec();
                 let mut observations = Vec::with_capacity(voters.len());
                 for voter in &voters {
@@ -434,8 +438,9 @@ mod managed_dispatch {
                     let request_id = crate::domain::id();
                     let transport_id = crate::domain::id();
                     let voter = voter.clone();
+                    let owner = owner.clone();
                     let query = stored_managed(store, lease, move |store| {
-                        store.managed_stage_voter(&pin, &voter, &request_id, &transport_id)
+                        store.managed_stage_voter(&pin, &voter, &request_id, &transport_id, &owner)
                     })
                     .await?;
                     observations.push(
@@ -446,6 +451,7 @@ mod managed_dispatch {
                 }
                 let authority =
                     ConsensusAuthority::combine(observations).map_err(|_| Fault::Unavailable)?;
+                let mut rebound = false;
                 for voter in &voters {
                     let observation = authority.consensus(
                         &voter.binding.run_route,
@@ -474,8 +480,9 @@ mod managed_dispatch {
                     let transport_id = crate::domain::id();
                     let staged_id = request_id.clone();
                     let bound = voter.attempt.clone();
+                    let owner = owner.clone();
                     let query = stored_managed(store, lease, move |store| {
-                        store.managed_stage_egress(&pin, &bound, &staged_id, &transport_id)
+                        store.managed_stage_egress(&pin, &bound, &staged_id, &transport_id, &owner)
                     })
                     .await?;
                     let current = peer
@@ -495,6 +502,14 @@ mod managed_dispatch {
                         store.managed_rebind(&current, &old, &successor, &incarnation, "egress")
                     })
                     .await?;
+                    rebound = true;
+                }
+                if rebound {
+                    let refreshed = stored_managed(store, lease, move |store| {
+                        store.managed_refresh_consensus(pending)
+                    })
+                    .await?;
+                    return refreshed.verify(&authority);
                 }
                 pending.verify(&authority)
             })
@@ -6100,6 +6115,199 @@ mod tests {
         })
         .await?;
         assert_eq!(state, "committed");
+        Ok(())
+    }
+
+    /// An unqualified Run launch cannot reach any managed participant operation.
+    #[tokio::test]
+    async fn unqualified_launch_blocks_all_managed_participant_commands()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::managed_state::tests::{
+            fake_bridge_pin, fake_config, fake_run_endpoint, fixture, native_proof,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Clone)]
+        struct Refusing {
+            binding: crate::managed_state::ManagedBinding,
+            checks: Arc<AtomicUsize>,
+            later: Arc<AtomicUsize>,
+        }
+        impl managed_dispatch::IngressClient for Refusing {
+            fn current<'a>(
+                &'a self,
+                _: &'a crate::managed_run::IngressQuery,
+            ) -> managed_dispatch::Response<
+                'a,
+                crate::managed_run::CurrentAuthority,
+                crate::managed_run::RunError,
+            > {
+                Box::pin(async move {
+                    if self.checks.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Err(crate::managed_run::RunError::NotReady)
+                    } else {
+                        Err(crate::managed_run::RunError::Refused)
+                    }
+                })
+            }
+        }
+        impl managed_dispatch::Client for Refusing {
+            fn admit<'a>(
+                &'a self,
+                _: &'a crate::managed_state::AdmissionPlan,
+            ) -> managed_dispatch::Response<
+                'a,
+                crate::managed_run::Admission,
+                crate::managed_run::RunError,
+            > {
+                Box::pin(async move {
+                    self.later.fetch_add(1, Ordering::SeqCst);
+                    Err(crate::managed_run::RunError::Refused)
+                })
+            }
+            fn consensus<'a>(
+                &'a self,
+                _: crate::managed_state::PendingConsensus,
+                _: &'a SharedStore,
+                _: &'a ManagedLease,
+            ) -> managed_dispatch::Response<'a, crate::managed_state::ConsensusFence> {
+                Box::pin(async move {
+                    self.later.fetch_add(1, Ordering::SeqCst);
+                    Err(Fault::Unavailable)
+                })
+            }
+        }
+        impl managed_dispatch::SessionClient for Refusing {
+            fn current_pin<'a>(
+                &'a self,
+            ) -> managed_dispatch::Response<'a, crate::managed_state::RunPin> {
+                Box::pin(async move {
+                    let endpoint = fake_run_endpoint(&self.binding);
+                    Ok(crate::managed_state::RunPin {
+                        route: endpoint.route,
+                        socket: endpoint.socket,
+                        executable: endpoint.executable,
+                        executable_sha256: endpoint.executable_sha256,
+                        capabilities: vec![
+                            "attempt_current_ingress_v1".into(),
+                            "attempt_admission_v1".into(),
+                        ],
+                    })
+                })
+            }
+            fn endpoint(&self) -> crate::managed_state::RunEndpointPin {
+                fake_run_endpoint(&self.binding)
+            }
+            fn pool_route(&self) -> crate::managed_state::Route {
+                crate::managed_state::Route {
+                    component_store_id: self.binding.pool_store_id.clone(),
+                    route_id: "pool-route".into(),
+                    worker_uid: self.binding.run_route.worker_uid,
+                }
+            }
+            fn consume(
+                &self,
+                _: &crate::managed_bridge::ConsumeKey<'_>,
+                _: &bridge_sdk::bridge_protocol::Secret,
+                _: &str,
+                _: &Command,
+                _: &str,
+            ) -> Result<crate::managed_bridge::Consumed, crate::managed_bridge::BridgeFailure>
+            {
+                self.later.fetch_add(1, Ordering::SeqCst);
+                Err(crate::managed_bridge::BridgeFailure::Refused)
+            }
+        }
+        let cases = [
+            serde_json::json!({"name":"pool_post","arguments":{"pool_id":"pool","expected_revision":1,"request_key":"key","body":"body"}}),
+            serde_json::json!({"name":"pool_vote","arguments":{"pool_id":"pool","expected_revision":1,"request_key":"key","proposal_id":"proposal","roster_key":"roster","choice":"ready","evidence":"evidence"}}),
+            serde_json::json!({"name":"pool_propose","arguments":{"pool_id":"pool","expected_revision":1,"request_key":"key","result":"result","criteria":"criteria"}}),
+            serde_json::json!({"name":"pool_remove","arguments":{"pool_id":"pool","expected_revision":1,"request_key":"key","member_id":"member"}}),
+            serde_json::json!({"name":"pool_send_member","arguments":{"pool_id":"pool","expected_revision":1,"request_key":"key","member_id":"member","body":"body"}}),
+            serde_json::json!({"name":"pool_notify_owner","arguments":{"pool_id":"pool","expected_revision":1,"request_key":"key","body":"body"}}),
+            serde_json::json!({"name":"pool_get","arguments":{"pool_id":"pool"}}),
+            serde_json::json!({"name":"pool_list","arguments":{}}),
+        ];
+        for value in cases {
+            let (_directory, initial, binding, _, _) = fixture();
+            let (command, normalized) = crate::managed_codec::normalize_command(value)?;
+            let pin = fake_bridge_pin(&binding);
+            let mut config = fake_config(&binding);
+            let transport = config.managed_run_transport.as_mut().ok_or("transport")?;
+            transport.frontend_enabled = true;
+            transport.mcp_server = Some("pool".into());
+            let begin = crate::managed_session::Begin {
+                version: 1,
+                bootstrap_id: "bootstrap".into(),
+                invocation_key: "inv".into(),
+                command: normalized.clone(),
+                proof: native_proof(),
+                bridge_pin: pin.clone(),
+            };
+            let store = Arc::new(Mutex::new(initial));
+            let activity = Arc::new(ManagedActivity::default());
+            let lease = activity
+                .acquire(ManagedWork::Bootstrap("bootstrap".into()))?
+                .ok_or("lease")?;
+            let fake = Refusing {
+                binding,
+                checks: Arc::new(AtomicUsize::new(0)),
+                later: Arc::new(AtomicUsize::new(0)),
+            };
+            let service = fake.clone();
+            let task_store = Arc::clone(&store);
+            let task_activity = Arc::clone(&activity);
+            let (mut client, mut server) = UnixStream::pair()?;
+            let task = tokio::spawn(async move {
+                managed_session_core(
+                    &mut server,
+                    &config,
+                    &task_store,
+                    &task_activity,
+                    begin,
+                    command,
+                    normalized,
+                    pin,
+                    lease,
+                    service,
+                )
+                .await
+            });
+            assert!(matches!(
+                crate::managed_session::receive::<crate::managed_session::ServerFrame>(&mut client)
+                    .await?,
+                crate::managed_session::ServerFrame::Ready
+            ));
+            crate::managed_session::send(
+                &mut client,
+                &crate::managed_session::ClientFrame::Epoch {
+                    issuer_epoch: "epoch".into(),
+                },
+            )
+            .await?;
+            assert!(matches!(
+                crate::managed_session::receive::<crate::managed_session::ServerFrame>(&mut client)
+                    .await?,
+                crate::managed_session::ServerFrame::Reserved
+            ));
+            crate::managed_session::send(
+                &mut client,
+                &crate::managed_session::ClientFrame::Prepared {
+                    store_id: fake.binding.bridge_route.component_store_id.clone(),
+                    bridge_context_ref: bridge_sdk::bridge_protocol::Secret::new("ref"),
+                    invocation_key: "inv".into(),
+                    expires_at_ms: 1,
+                },
+            )
+            .await?;
+            assert_eq!(task.await?.err(), Some(Fault::Unavailable));
+            assert_eq!(fake.checks.load(Ordering::SeqCst), 2);
+            assert_eq!(fake.later.load(Ordering::SeqCst), 0);
+            let unchanged = stored(&store, |store| {
+                let db = store.test_db();
+                Ok(db.query_row("SELECT (SELECT count(*) FROM managed_contexts),(SELECT count(*) FROM managed_intents),(SELECT count(*) FROM events),(SELECT count(*) FROM effects)",[],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?,row.get::<_,i64>(3)?)))?)
+            }).await?;
+            assert_eq!(unchanged, (0, 0, 0, 0));
+        }
         Ok(())
     }
 

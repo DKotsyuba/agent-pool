@@ -209,6 +209,158 @@ fn read_generation(value: &[u8]) -> Result<u64, Fault> {
     let bytes: [u8; 8] = value.try_into().map_err(|_| Fault::Internal)?;
     Ok(u64::from_be_bytes(bytes))
 }
+
+const MANAGED_CAPACITY: u64 = 100_000;
+
+/// One capacity gauge; retained includes permanent rejecting keys and terminal evidence.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CapacityGauge {
+    /// Active operations consuming the admission budget.
+    pub active: u64,
+    /// All retained records, including permanent terminal fences.
+    pub retained: u64,
+    /// Slots reserved for earlier stages that have not created this record yet.
+    pub reserved: u64,
+    /// Configured fixed active-operation limit.
+    pub limit: u64,
+    /// Remaining active slots after outstanding reservations.
+    pub headroom: u64,
+}
+/// Point-in-time owner diagnostics, not a promise that a future reservation fits.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedCapacity {
+    /// Open or draining namespaces and retained namespace fences.
+    pub namespaces: CapacityGauge,
+    /// Active bootstrap reservations and retained invocation keys.
+    pub bootstraps: CapacityGauge,
+    /// Active contexts and retained context keys.
+    pub contexts: CapacityGauge,
+    /// Unresolved intents and retained terminal outcomes.
+    pub intents: CapacityGauge,
+    /// Active currentness reads and retained rejecting keys.
+    pub current_requests: CapacityGauge,
+    /// Active bootstrap slots reserved for later context and intent creation.
+    pub bootstrap_reservations: u64,
+    /// Active contexts reserving a later intent slot.
+    pub contexts_without_intent: u64,
+}
+impl ManagedCapacity {
+    pub(crate) fn valid(&self) -> bool {
+        [
+            &self.namespaces,
+            &self.bootstraps,
+            &self.contexts,
+            &self.intents,
+            &self.current_requests,
+        ]
+        .iter()
+        .all(|g| {
+            g.limit == MANAGED_CAPACITY
+                && g.active <= g.retained
+                && g.headroom == g.limit.saturating_sub(g.active.saturating_add(g.reserved))
+        }) && self.bootstrap_reservations <= self.bootstraps.active
+            && self.contexts_without_intent <= self.contexts.active
+            && self.contexts.reserved == self.bootstrap_reservations
+            && self.intents.reserved
+                == self
+                    .bootstrap_reservations
+                    .saturating_add(self.contexts_without_intent)
+            && self.namespaces.reserved == 0
+            && self.bootstraps.reserved == 0
+            && self.current_requests.reserved == 0
+    }
+}
+fn gauge(
+    db: &Connection,
+    table: &str,
+    active: &str,
+    include_retained: bool,
+) -> Result<CapacityGauge, Fault> {
+    // Table and predicate are internal constants, never caller-provided SQL.
+    let sql = format!("SELECT count(*) FROM {table} WHERE {active}");
+    let active: i64 = db.query_row(&sql, [], |row| row.get(0))?;
+    let retained: i64 = if include_retained {
+        db.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })?
+    } else {
+        active
+    };
+    let retained = u64::try_from(retained).map_err(|_| Fault::Internal)?;
+    let active = u64::try_from(active).map_err(|_| Fault::Internal)?;
+    Ok(CapacityGauge {
+        active,
+        retained,
+        reserved: 0,
+        limit: MANAGED_CAPACITY,
+        headroom: MANAGED_CAPACITY.saturating_sub(active),
+    })
+}
+fn managed_capacity_inner(
+    db: &Connection,
+    include_retained: bool,
+) -> Result<ManagedCapacity, Fault> {
+    let namespaces = gauge(
+        db,
+        "managed_namespaces",
+        "state!='sealed'",
+        include_retained,
+    )?;
+    let bootstraps = gauge(
+        db,
+        "managed_bootstrap",
+        "state IN ('prepared','submitted')",
+        include_retained,
+    )?;
+    let mut contexts = gauge(
+        db,
+        "managed_contexts c",
+        "EXISTS(SELECT 1 FROM managed_intents i WHERE i.context_id=c.id AND (i.state NOT IN ('committed','aborted') OR i.bridge_resolved=0 OR i.run_resolved=0)) OR (NOT EXISTS(SELECT 1 FROM managed_intents i WHERE i.context_id=c.id) AND EXISTS(SELECT 1 FROM managed_namespaces n WHERE n.id=c.namespace_id AND n.state!='sealed') AND (c.state='prepared' OR EXISTS(SELECT 1 FROM managed_bootstrap b WHERE b.namespace_id=c.namespace_id AND b.invocation_key=c.invocation_key AND b.state='submitted')))",
+        include_retained,
+    )?;
+    let mut intents = gauge(
+        db,
+        "managed_intents",
+        "state NOT IN ('committed','aborted') OR bridge_resolved=0 OR run_resolved=0",
+        include_retained,
+    )?;
+    let current_requests = gauge(
+        db,
+        "managed_current_requests r",
+        "r.state IN ('prepared','received') AND ((r.namespace_id IS NOT NULL AND EXISTS(SELECT 1 FROM managed_bootstrap b WHERE b.namespace_id=r.namespace_id AND b.invocation_key=COALESCE(json_extract(r.request,'$.invocation_key'),json_extract(r.request,'$.observation_ref.invocation_key')) AND b.state='submitted')) OR (r.namespace_id IS NULL AND (r.owner_intent IS NULL OR EXISTS(SELECT 1 FROM managed_intents i WHERE i.id=r.owner_intent AND i.state IN ('admitting','admitted')))))",
+        include_retained,
+    )?;
+    let bootstrap_reservations: i64 = db.query_row("SELECT count(*) FROM managed_bootstrap b WHERE b.state IN ('prepared','submitted') AND NOT EXISTS(SELECT 1 FROM managed_contexts c WHERE c.invocation_key=b.invocation_key)", [], |row| row.get(0))?;
+    let contexts_without_intent: i64 = db.query_row("SELECT count(*) FROM managed_contexts c WHERE c.state='prepared' AND EXISTS(SELECT 1 FROM managed_namespaces n WHERE n.id=c.namespace_id AND n.state!='sealed') AND NOT EXISTS(SELECT 1 FROM managed_intents i WHERE i.context_id=c.id)", [], |row| row.get(0))?;
+    let bootstrap_reservations =
+        u64::try_from(bootstrap_reservations).map_err(|_| Fault::Internal)?;
+    let contexts_without_intent =
+        u64::try_from(contexts_without_intent).map_err(|_| Fault::Internal)?;
+    contexts.reserved = bootstrap_reservations;
+    contexts.headroom =
+        MANAGED_CAPACITY.saturating_sub(contexts.active.saturating_add(contexts.reserved));
+    intents.reserved = bootstrap_reservations.saturating_add(contexts_without_intent);
+    intents.headroom =
+        MANAGED_CAPACITY.saturating_sub(intents.active.saturating_add(intents.reserved));
+    Ok(ManagedCapacity {
+        namespaces,
+        bootstraps,
+        contexts,
+        intents,
+        current_requests,
+        bootstrap_reservations,
+        contexts_without_intent,
+    })
+}
+/// The owner sees all gauges from one SQLite read snapshot.
+pub(crate) fn managed_capacity(db: &Connection) -> Result<ManagedCapacity, Fault> {
+    let tx = db.unchecked_transaction()?;
+    let result = managed_capacity_inner(&tx, true)?;
+    tx.commit()?;
+    Ok(result)
+}
 /// Wire opaque strings are case-sensitive and need not use Pool's identifier alphabet.
 fn wire_string(value: &str) -> Result<(), Fault> {
     if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
@@ -415,14 +567,14 @@ fn rebind_inner(
     if let Some(authority) = authority {
         require_staged_current(&tx, authority, &receipt, &old.run_route, false)?;
     }
-    let row: Option<(Vec<u8>, String)> = tx
+    let row: Option<(Vec<u8>, String, Option<String>)> = tx
         .query_row(
-            "SELECT generation,binding FROM managed_bindings WHERE member=?1 AND pool=?2",
+            "SELECT generation,binding,incarnation FROM managed_bindings WHERE member=?1 AND pool=?2",
             params![old.member_id, old.pool_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
-    let (generation, stored) = row.ok_or(Fault::Forbidden)?;
+    let (generation, stored, old_incarnation) = row.ok_or(Fault::Forbidden)?;
     if generation != sqlite_generation(old.binding_generation) || stored != old_json {
         return Err(Fault::Stale);
     }
@@ -434,7 +586,9 @@ fn rebind_inner(
     if !is_current {
         return Err(Fault::Stale);
     }
-    if old == new {
+    let incarnation_json = encoded(incarnation)?;
+    let incarnation_changed = old_incarnation.as_deref() != Some(incarnation_json.as_str());
+    if old == new && !incarnation_changed {
         tx.execute(
             "INSERT INTO managed_rebinds VALUES(?1,?2,?3,?4,?5,?5)",
             params![receipt_id, old.member_id, old_json, new_json, generation],
@@ -442,7 +596,7 @@ fn rebind_inner(
         tx.commit()?;
         return Ok(old.binding_generation);
     }
-    if old.attempt == new.attempt {
+    if old.attempt == new.attempt && old.actor.epoch == new.actor.epoch && !incarnation_changed {
         return Err(Fault::Conflict);
     }
     let next = read_generation(&generation)?
@@ -451,9 +605,26 @@ fn rebind_inner(
     let mut updated = new.clone();
     updated.binding_generation = next;
     tx.execute(
-        "UPDATE managed_bindings SET generation=?2,binding=?3 WHERE member=?1",
-        params![old.member_id, sqlite_generation(next), encoded(&updated)?],
+        "UPDATE managed_bindings SET generation=?2,binding=?3,incarnation=?4 WHERE member=?1",
+        params![
+            old.member_id,
+            sqlite_generation(next),
+            encoded(&updated)?,
+            incarnation_json
+        ],
     )?;
+    let pool_json: String = tx.query_row(
+        "SELECT data FROM pools WHERE id=?1",
+        [&old.pool_id],
+        |row| row.get(0),
+    )?;
+    let pool: crate::domain::Pool = decoded(&pool_json)?;
+    if let Some(proposal) = pool.proposal.as_ref().filter(|proposal| {
+        proposal.state == crate::domain::ProposalState::Open
+            && proposal.votes.contains_key(&old.member_id)
+    }) {
+        tx.execute("INSERT OR IGNORE INTO managed_invalidated_ballots(pool,proposal,member) VALUES(?1,?2,?3)",params![old.pool_id,proposal.proposal_id,old.member_id])?;
+    }
     tx.execute("INSERT INTO managed_pool_epochs(pool,epoch) VALUES(?1,1) ON CONFLICT(pool) DO UPDATE SET epoch=epoch+1",[&old.pool_id])?;
     tx.execute("UPDATE managed_contexts SET state='invalidated' WHERE id IN (SELECT context_id FROM managed_context_bindings WHERE member=?1) AND state='prepared'",[&old.member_id])?;
     tx.execute("UPDATE managed_current_requests SET state='aborted' WHERE COALESCE(json_extract(request,'$.invocation_key'),json_extract(request,'$.observation_ref.invocation_key')) IN (SELECT c.invocation_key FROM managed_contexts c JOIN managed_context_bindings b ON b.context_id=c.id WHERE b.member=?1) AND state IN ('prepared','received')",[&old.member_id])?;
@@ -760,16 +931,23 @@ pub(crate) fn prepare_context(
         if state != "prepared" {
             return Err(Fault::Stale);
         }
-        if (old_command, old_context, old_digest, old_snapshot)
-            != (command_json, context_json, digest.clone(), snapshot)
+        let old_pools: std::collections::BTreeMap<String, (i64, String)> = decoded(&old_snapshot)?;
+        let new_pools: std::collections::BTreeMap<String, (i64, String)> = decoded(&snapshot)?;
+        let same_rosters = old_pools.len() == new_pools.len()
+            && old_pools.iter().all(|(pool, (_, fingerprint))| {
+                new_pools
+                    .get(pool)
+                    .is_some_and(|(_, current)| current == fingerprint)
+            });
+        if (old_command, old_context, old_digest) != (command_json, context_json, digest.clone())
+            || !same_rosters
         {
             return Err(Fault::Conflict);
         }
         return Ok(digest);
     }
     // No network reservation should be made when local durable capacity is exhausted.
-    let count: i64 = tx.query_row("SELECT count(*) FROM managed_contexts", [], |r| r.get(0))?;
-    if count >= 100_000 {
+    if managed_capacity_inner(&tx, false)?.contexts.active >= MANAGED_CAPACITY {
         return Err(Fault::Unavailable);
     }
     tx.execute("INSERT INTO managed_contexts(id,namespace_id,intent_id,invocation_key,command,context,digest,snapshot,state) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'prepared')",params![context_id,namespace_id,context.intent_id,context.invocation_key,command_json,context_json,digest,snapshot])?;
@@ -812,14 +990,14 @@ fn context_current(
         [context_id],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
     )?;
+    let namespace_open: bool = db.query_row("SELECT n.state='open' FROM managed_namespaces n JOIN managed_contexts c ON c.namespace_id=n.id WHERE c.id=?1",[context_id],|r|r.get(0))?;
+    if state != "prepared" || !namespace_open {
+        return Err(Fault::Stale);
+    }
     let context: SecurityContext = decoded(&context_json)?;
     let (normalized, recomputed) = validate_context(command, &context)?;
     if stored_command != normalized || stored_digest != digest || recomputed != digest {
         return Err(Fault::Conflict);
-    }
-    let namespace_open: bool = db.query_row("SELECT n.state='open' FROM managed_namespaces n JOIN managed_contexts c ON c.namespace_id=n.id WHERE c.id=?1",[context_id],|r|r.get(0))?;
-    if state != "prepared" || !namespace_open {
-        return Err(Fault::Stale);
     }
     for binding in &context.bindings {
         let row: Option<(Vec<u8>, String)> = db
@@ -847,16 +1025,9 @@ fn context_current(
         }
     }
     let stored: std::collections::BTreeMap<String, (i64, String)> = decoded(&snapshot)?;
-    for (pool, (epoch, fingerprint)) in stored {
-        let actual: i64 = db
-            .query_row(
-                "SELECT epoch FROM managed_pool_epochs WHERE pool=?1",
-                [&pool],
-                |r| r.get(0),
-            )
-            .optional()?
-            .unwrap_or(0);
-        if epoch != actual || (check_snapshot && fingerprint != pool_fingerprint(db, &pool)?) {
+    for (pool, (_epoch, fingerprint)) in stored {
+        // Aggregate binding epoch fences consensus, not unrelated member contexts.
+        if check_snapshot && fingerprint != pool_fingerprint(db, &pool)? {
             return Err(Fault::Stale);
         }
     }
@@ -1680,6 +1851,9 @@ pub(crate) fn reserve_bootstrap(
             }
         }
         None => {
+            if managed_capacity_inner(&tx, false)?.namespaces.active >= MANAGED_CAPACITY {
+                return Err(Fault::Unavailable);
+            }
             tx.execute("INSERT INTO managed_namespaces(id,bridge_route,bridge_pin,producer,issuer_epoch,state) VALUES(?1,?2,?3,?4,?5,'open')",params![namespace_id,route_json,bridge_pin_json,producer,issuer_epoch])?;
         }
     }
@@ -1704,17 +1878,19 @@ pub(crate) fn reserve_bootstrap(
     if reused {
         return Err(Fault::Conflict);
     }
-    let count: i64 = tx.query_row("SELECT count(*) FROM managed_bootstrap", [], |r| r.get(0))?;
-    let reserved: i64 = tx.query_row("SELECT count(*) FROM managed_bootstrap b WHERE b.state IN ('prepared','submitted') AND NOT EXISTS(SELECT 1 FROM managed_contexts c WHERE c.invocation_key=b.invocation_key)",[],|r|r.get(0))?;
-    let contexts: i64 = tx.query_row("SELECT count(*) FROM managed_contexts", [], |r| r.get(0))?;
-    let intents: i64 = tx.query_row("SELECT count(*) FROM managed_intents", [], |r| r.get(0))?;
-    let unreserved_contexts:i64=tx.query_row("SELECT count(*) FROM managed_contexts c WHERE c.state='prepared' AND NOT EXISTS(SELECT 1 FROM managed_intents i WHERE i.context_id=c.id)",[],|r|r.get(0))?;
-    if count >= 100_000
-        || contexts.saturating_add(reserved) >= 100_000
-        || intents
-            .saturating_add(reserved)
-            .saturating_add(unreserved_contexts)
-            >= 100_000
+    let capacity = managed_capacity_inner(&tx, false)?;
+    if capacity.bootstraps.active >= MANAGED_CAPACITY
+        || capacity
+            .contexts
+            .active
+            .saturating_add(capacity.bootstrap_reservations)
+            >= MANAGED_CAPACITY
+        || capacity
+            .intents
+            .active
+            .saturating_add(capacity.bootstrap_reservations)
+            .saturating_add(capacity.contexts_without_intent)
+            >= MANAGED_CAPACITY
     {
         return Err(Fault::Unavailable);
     }
@@ -1881,6 +2057,24 @@ pub(crate) struct SealStatus {
     pub seal_id: String,
     pub sealed: bool,
 }
+/// Strip no-longer-actionable command/snapshot payloads while retaining all keys,
+/// terminal outcomes, route bindings and remote recovery receipts as tombstones.
+pub(crate) fn compact_sealed(db: &Connection, namespace_id: &str) -> Result<(), Fault> {
+    let sealed: bool = db.query_row(
+        "SELECT state='sealed' FROM managed_namespaces WHERE id=?1",
+        [namespace_id],
+        |row| row.get(0),
+    )?;
+    let pending: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM managed_bootstrap WHERE namespace_id=?1 AND state NOT IN ('terminal','stale_epoch')) OR EXISTS(SELECT 1 FROM managed_intents i JOIN managed_contexts c ON c.id=i.context_id WHERE c.namespace_id=?1 AND (i.state NOT IN ('committed','aborted') OR i.bridge_resolved=0 OR i.run_resolved=0))",[namespace_id],|row|row.get(0))?;
+    if !sealed || pending {
+        return Err(Fault::Stale);
+    }
+    db.execute("UPDATE managed_bootstrap SET command='{}' WHERE namespace_id=?1 AND state IN ('terminal','stale_epoch') AND command!='{}'",[namespace_id])?;
+    db.execute("UPDATE managed_contexts SET command='{}',snapshot='{}',state='invalidated' WHERE namespace_id=?1 AND (command!='{}' OR snapshot!='{}' OR state!='invalidated')",[namespace_id])?;
+    db.execute("UPDATE managed_intents SET command='{}' WHERE context_id IN (SELECT id FROM managed_contexts WHERE namespace_id=?1) AND state IN ('committed','aborted') AND bridge_resolved=1 AND run_resolved=1 AND command!='{}'",[namespace_id])?;
+    db.execute("UPDATE managed_current_requests SET request='{}',state='aborted' WHERE (namespace_id=?1 OR owner_intent IN (SELECT i.id FROM managed_intents i JOIN managed_contexts c ON c.id=i.context_id WHERE c.namespace_id=?1)) AND (request!='{}' OR state!='aborted')",[namespace_id])?;
+    Ok(())
+}
 pub(crate) fn seal_namespace(
     db: &mut Connection,
     route: &Route,
@@ -1909,9 +2103,7 @@ pub(crate) fn seal_namespace(
     let (namespace_id, state, old_request, old_key, old_seal) = if let Some(row) = row {
         row
     } else {
-        let count: i64 =
-            tx.query_row("SELECT count(*) FROM managed_namespaces", [], |r| r.get(0))?;
-        if count >= 100_000 {
+        if managed_capacity_inner(&tx, false)?.namespaces.active >= MANAGED_CAPACITY {
             return Err(Fault::Unavailable);
         }
         let namespace_id = crate::domain::id();
@@ -1930,6 +2122,8 @@ pub(crate) fn seal_namespace(
         old_seal.ok_or(Fault::Internal)?
     };
     if state == "sealed" {
+        compact_sealed(&tx, &namespace_id)?;
+        tx.commit()?;
         return Ok(SealStatus {
             seal_id,
             sealed: true,
@@ -1948,6 +2142,7 @@ pub(crate) fn seal_namespace(
             "UPDATE managed_namespaces SET state='sealed' WHERE id=?1",
             [&namespace_id],
         )?;
+        compact_sealed(&tx, &namespace_id)?;
     }
     tx.commit()?;
     Ok(SealStatus {
@@ -2101,7 +2296,7 @@ pub(crate) mod tests {
                 worker_uid: uid,
             },
         };
-        db.execute("INSERT INTO managed_bindings(member,pool,generation,binding) VALUES('member','pool',?1,?2)",params![sqlite_generation(1),encoded(&binding).unwrap()]).unwrap();
+        db.execute("INSERT INTO managed_bindings(member,pool,generation,binding,incarnation) VALUES('member','pool',?1,?2,?3)",params![sqlite_generation(1),encoded(&binding).unwrap(),encoded(&incarnation).unwrap()]).unwrap();
         persist_bridge_route(db, &fake_bridge_pin(&binding)).unwrap();
         persist_run_route(db, &fake_run_endpoint(&binding)).unwrap();
         db.execute(
@@ -2256,16 +2451,45 @@ pub(crate) mod tests {
         invocation: &str,
         cmd: &Command,
     ) -> String {
+        prepare_command_in_namespace(
+            db,
+            run,
+            binding,
+            incarnation,
+            id,
+            intent,
+            invocation,
+            cmd,
+            "namespace",
+            "epoch",
+        )
+    }
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Test isolates namespace and issuer replay identities"
+    )]
+    fn prepare_command_in_namespace(
+        db: &mut Connection,
+        run: &FakeRun,
+        binding: &ManagedBinding,
+        incarnation: &Incarnation,
+        id: &str,
+        intent: &str,
+        invocation: &str,
+        cmd: &Command,
+        namespace: &str,
+        issuer: &str,
+    ) -> String {
         let proof = native_proof();
         reserve_bootstrap(
             db,
             &BootstrapRequest {
-                namespace_id: "namespace",
+                namespace_id: namespace,
                 bootstrap_id: id,
                 route: &binding.bridge_route,
                 bridge_pin: &fake_bridge_pin(binding),
                 producer: "pool",
-                issuer_epoch: "epoch",
+                issuer_epoch: issuer,
                 invocation_key: invocation,
                 command: cmd,
                 native_proof: &proof,
@@ -2285,7 +2509,7 @@ pub(crate) mod tests {
             db,
             run,
             id,
-            "namespace",
+            namespace,
             cmd,
             &context(binding, intent, invocation),
             &[(
@@ -2303,7 +2527,8 @@ pub(crate) mod tests {
             &fake_bridge_pin(binding),
         )
         .unwrap();
-        let consumed = fake_consumed(binding, incarnation, intent, invocation, &digest, cmd);
+        let mut consumed = fake_consumed(binding, incarnation, intent, invocation, &digest, cmd);
+        consumed.receipt.issuer_epoch = issuer.into();
         let key = crate::managed_bridge::ConsumeKey {
             abort_request_id: "abort-1",
             expected_store_id: &binding.bridge_route.component_store_id,
@@ -2322,7 +2547,7 @@ pub(crate) mod tests {
             &consumed,
             "pool",
             cmd,
-            "epoch",
+            issuer,
             &fake_bridge_pin(binding),
         )
         .unwrap();
@@ -4230,6 +4455,57 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(keys, 0);
     }
+
+    #[test]
+    fn outcome_pins_settlement_reference_vector() {
+        let (_directory, mut store, binding, incarnation, run) = fixture();
+        let db = store.test_db();
+        let original = prepare(
+            db,
+            &run,
+            &binding,
+            &incarnation,
+            "context-1",
+            "intent-1",
+            "inv-1",
+            1,
+        );
+        assert_eq!(
+            reserve(
+                db,
+                &run,
+                &binding,
+                &incarnation,
+                "context-1",
+                "inv-1",
+                "intent-1",
+                &command(1),
+                &original
+            )
+            .unwrap(),
+            IntentReservation::Created
+        );
+        let digest = "a".repeat(64);
+        db.execute("UPDATE inventory_source SET store_id='pool-store-uuid'", [])
+            .unwrap();
+        db.execute("UPDATE managed_intents SET state='committed',security_digest=?1,terminal_receipt='receipt' WHERE id='intent-1'", [&digest]).unwrap();
+        let value = serde_json::json!({"version":1,"pool_store_id":"pool-store-uuid","intent_id":"intent-1","security_digest":digest,"state":"committed"});
+        let (length, hash) =
+            crate::managed_codec::digest(b"agent-mcp/attempt-binding/settlement/v1\0", &value)
+                .unwrap();
+        assert_eq!(length, 223);
+        assert_eq!(
+            hash,
+            "10a5159c5c085fd018534a640862ed8600fdf334cbfac41be9964659d72de8eb"
+        );
+        assert_eq!(
+            outcome(db, "intent-1", &digest)
+                .unwrap()
+                .outcome_digest
+                .as_deref(),
+            Some(hash.as_str())
+        );
+    }
     #[test]
     fn consensus_voter_finished_after_vote() {
         let (_dir, _store, binding, incarnation, mut run) = fixture();
@@ -4304,6 +4580,623 @@ pub(crate) mod tests {
             Some(Fault::Unavailable)
         );
         assert_eq!(run.calls.get(), 2);
+    }
+
+    /// A resumed voter invalidates only its prior open ballot, not another member's context.
+    #[test]
+    fn consensus_every_voter_current_rebind_fences_old_ballot_but_records_other_vote() {
+        use crate::domain::{Ballot, Choice, MemberState, Pool, Proposal, ProposalState, Vote};
+        struct Live;
+        impl RunAuthority for Live {
+            fn current_receipt(&self, _: &Route, _: &str) -> Result<CurrentReceipt, Fault> {
+                Err(Fault::Unavailable)
+            }
+            fn consensus(
+                &self,
+                _: &Route,
+                attempt: &AttemptRef,
+                incarnation: &Incarnation,
+            ) -> Result<VoterObservation, Fault> {
+                Ok(VoterObservation {
+                    state: VoterState::Live,
+                    last_attempt: Some(attempt.clone()),
+                    last_incarnation: Some(incarnation.clone()),
+                    successor_proof: Some(SuccessorProof {
+                        lineage_root_id: attempt.lineage_root_id.clone(),
+                        bound_execution_id: attempt.execution_id.clone(),
+                        current_execution_id: attempt.execution_id.clone(),
+                        chain: vec![SuccessorLink {
+                            execution_id: attempt.execution_id.clone(),
+                            parent_execution_id: (attempt.sequence > 1)
+                                .then(|| attempt.lineage_root_id.clone()),
+                            sequence: attempt.sequence,
+                        }],
+                    }),
+                })
+            }
+        }
+        let (_dir, mut store, binding, incarnation, run) = fixture();
+        let db = store.test_db();
+        index_managed_member(db, &binding);
+        let raw: String = db
+            .query_row("SELECT data FROM members WHERE id='member'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let mut author: crate::domain::Binding = decoded(&raw).unwrap();
+        author.member.state = MemberState::Active;
+        db.execute(
+            "UPDATE members SET data=?1 WHERE id='member'",
+            [encoded(&author).unwrap()],
+        )
+        .unwrap();
+        let mut other = author.clone();
+        other.member.member_id = "other".into();
+        other.member.name = "other".into();
+        other.address = Some("host/codex/store/other".into());
+        other.run_id = Some("root-other".into());
+        other.run_sequence = Some(1);
+        db.execute(
+            "INSERT INTO members(id,pool,address,current,data) VALUES('other','pool',?1,1,?2)",
+            params![other.address, encoded(&other).unwrap()],
+        )
+        .unwrap();
+        let mut other_binding = binding.clone();
+        other_binding.member_id = "other".into();
+        other_binding.actor.address = "host/codex/store/other".into();
+        other_binding.actor.native_id = "other".into();
+        other_binding.attempt.lineage_root_id = "root-other".into();
+        other_binding.attempt.execution_id = "root-other".into();
+        db.execute("INSERT INTO managed_bindings(member,pool,generation,binding) VALUES('other','pool',?1,?2)",params![sqlite_generation(1),encoded(&other_binding).unwrap()]).unwrap();
+        let event = serde_json::json!({"event_id":1,"revision":1,"kind":"vote_recorded","author":{"kind":"member","member_id":"other"},"body":"Proposal proposal: Ready.\nevidence","recipient":null});
+        db.execute(
+            "INSERT INTO events(pool,data) VALUES('pool',?1)",
+            [event.to_string()],
+        )
+        .unwrap();
+        let event_id = db.last_insert_rowid();
+        let mut pool: Pool = decoded(
+            &db.query_row::<String, _, _>("SELECT data FROM pools WHERE id='pool'", [], |row| {
+                row.get(0)
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let ballot = Ballot {
+            choice: Choice::Ready,
+            evidence: "evidence".into(),
+            checks_met: None,
+            vote_event_id: Some(event_id.to_string()),
+            checks_count: None,
+            validity: None,
+        };
+        pool.proposal = Some(Proposal {
+            proposal_id: "proposal".into(),
+            roster_key: "roster".into(),
+            voters: vec!["member".into(), "other".into()],
+            result: "result".into(),
+            criteria: "criteria".into(),
+            snapshot: None,
+            snapshot_bytes: None,
+            state: ProposalState::Open,
+            votes: std::collections::BTreeMap::from([("other".into(), ballot)]),
+        });
+        db.execute(
+            "INSERT INTO proposals(id,pool,state,data) VALUES('proposal','pool','open',?1)",
+            [encoded(pool.proposal.as_ref().unwrap()).unwrap()],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE pools SET data=?1 WHERE id='pool'",
+            [encoded(&pool).unwrap()],
+        )
+        .unwrap();
+        db.execute("INSERT INTO managed_ballot_provenance(pool,proposal,member,event_id,generation,attempt,incarnation,admission_id,security_digest) VALUES('pool','proposal','other',?1,?2,?3,?4,'old-admission',?5)",params![event_id,sqlite_generation(1),encoded(&other_binding.attempt).unwrap(),encoded(&incarnation).unwrap(),"a".repeat(64)]).unwrap();
+        let vote = Command::Vote(Vote {
+            change: Change {
+                pool_id: "pool".into(),
+                expected_revision: 1,
+                request_key: "vote-key".into(),
+            },
+            proposal_id: "proposal".into(),
+            roster_key: "roster".into(),
+            choice: Choice::Ready,
+            evidence: "evidence".into(),
+            checks: vec![],
+        });
+        let independent_digest = prepare_command(
+            db,
+            &run,
+            &binding,
+            &incarnation,
+            "independent-context",
+            "independent-intent",
+            "independent-inv",
+            &vote,
+        );
+        let digest = prepare_command(
+            db,
+            &run,
+            &binding,
+            &incarnation,
+            "vote-context",
+            "vote-intent",
+            "vote-inv",
+            &vote,
+        );
+        assert_eq!(
+            reserve(
+                db,
+                &run,
+                &binding,
+                &incarnation,
+                "vote-context",
+                "vote-inv",
+                "vote-intent",
+                &vote,
+                &digest
+            )
+            .unwrap(),
+            IntentReservation::Created
+        );
+        let admission = consumed_admission(
+            db,
+            &run,
+            &binding,
+            &incarnation,
+            "vote-intent",
+            "vote-inv",
+            &digest,
+            &vote,
+        );
+        mark_admitted(db, "vote-intent", &digest, &admission).unwrap();
+        let pending = snapshot_consensus(db, "vote-intent", &digest).unwrap();
+        assert_eq!(pending.voters().len(), 2);
+        let old_fence = pending.verify(&Live).unwrap();
+        let pending_before_rebind = snapshot_consensus(db, "vote-intent", &digest).unwrap();
+        let mut next = other_binding.clone();
+        next.attempt.execution_id = "next-other".into();
+        next.attempt.sequence = 2;
+        next.attempt.attempt_id = "next-attempt".into();
+        next.attempt.launch_id = "00000000-0000-4000-8000-000000000004".into();
+        let mut other_receipt = run.receipt.clone();
+        other_receipt.receipt_id = "other-rebind".into();
+        other_receipt.lineage_root_id = "root-other".into();
+        other_receipt.bound_execution_id = "root-other".into();
+        other_receipt.attempt = next.attempt.clone();
+        other_receipt.actor = next.actor.clone();
+        other_receipt.successor_proof = SuccessorProof {
+            lineage_root_id: "root-other".into(),
+            bound_execution_id: "root-other".into(),
+            current_execution_id: "next-other".into(),
+            chain: vec![
+                SuccessorLink {
+                    execution_id: "root-other".into(),
+                    parent_execution_id: None,
+                    sequence: 1,
+                },
+                SuccessorLink {
+                    execution_id: "next-other".into(),
+                    parent_execution_id: Some("root-other".into()),
+                    sequence: 2,
+                },
+            ],
+        };
+        let other_run = FakeRun {
+            receipt: other_receipt,
+            observation: run.observation.clone(),
+        };
+        assert_eq!(
+            rebind(
+                db,
+                &other_run,
+                &other_binding,
+                &next,
+                &incarnation,
+                "other-rebind",
+                "ingress"
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            db.query_row::<i64, _, _>(
+                "SELECT json_extract(data,'$.revision') FROM pools WHERE id='pool'",
+                [],
+                |row| row.get(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert!(context_current(db, "vote-context", &vote, &digest, true).is_ok());
+        assert_eq!(
+            prepare_context(
+                db,
+                &run,
+                "independent-context",
+                "namespace",
+                &vote,
+                &context(&binding, "independent-intent", "independent-inv"),
+                &[("fixture-initial-independent-context", incarnation.clone())]
+            )
+            .unwrap(),
+            independent_digest
+        );
+        assert_eq!(
+            commit_vote(db, "vote-intent", &digest, old_fence, |_, _| panic!(
+                "stale voter CAS executed"
+            ))
+            .err(),
+            Some(Fault::Stale)
+        );
+        assert_eq!(
+            db.query_row::<i64, _, _>(
+                "SELECT count(*) FROM managed_invalidated_ballots WHERE member='other'",
+                [],
+                |row| row.get(0)
+            )
+            .unwrap(),
+            1
+        );
+        let pending = pending_before_rebind.refresh_after_rebind(db).unwrap();
+        assert!(pending.voters().is_empty());
+        let fence = pending.verify(&Live).unwrap();
+        let receipt = commit_domain_vote(db, "vote-intent", &digest, fence).unwrap();
+        let reply: crate::domain::Reply = decoded(&receipt).unwrap();
+        let crate::domain::Reply::Receipt(receipt) = reply else {
+            panic!("vote receipt")
+        };
+        assert_eq!(receipt.event.kind, "vote_recorded");
+        let final_pool: Pool = decoded(
+            &db.query_row::<String, _, _>("SELECT data FROM pools WHERE id='pool'", [], |row| {
+                row.get(0)
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let proposal = final_pool.proposal.unwrap();
+        assert_eq!(proposal.state, ProposalState::Open);
+        assert!(proposal.votes.contains_key("member"));
+        assert!(proposal.votes.contains_key("other"));
+        next.binding_generation = 2;
+        let other_vote = Command::Vote(Vote {
+            change: Change {
+                pool_id: "pool".into(),
+                expected_revision: 2,
+                request_key: "other-key".into(),
+            },
+            proposal_id: "proposal".into(),
+            roster_key: "roster".into(),
+            choice: Choice::Ready,
+            evidence: "fresh evidence".into(),
+            checks: vec![],
+        });
+        let other_digest = prepare_command(
+            db,
+            &other_run,
+            &next,
+            &incarnation,
+            "other-context",
+            "other-intent",
+            "other-inv",
+            &other_vote,
+        );
+        let authority = fresh_authority(db, &next, "other-context", "other-inv").unwrap();
+        let consumed = fake_consumed(
+            &next,
+            &incarnation,
+            "other-intent",
+            "other-inv",
+            &other_digest,
+            &other_vote,
+        );
+        let pool_route = Route {
+            component_store_id: next.pool_store_id.clone(),
+            route_id: "pool-route".into(),
+            worker_uid: next.run_route.worker_uid,
+        };
+        assert_eq!(
+            reserve_intent(
+                db,
+                "other-context",
+                "other",
+                &other_vote,
+                &other_digest,
+                authority,
+                &consumed,
+                &pool_route
+            )
+            .unwrap(),
+            IntentReservation::Created
+        );
+        let mut admission = consumed_admission(
+            db,
+            &other_run,
+            &next,
+            &incarnation,
+            "other-intent",
+            "other-inv",
+            &other_digest,
+            &other_vote,
+        );
+        admission.admission_id = "other-admission".into();
+        admission.successor_proof.bound_execution_id = next.attempt.execution_id.clone();
+        admission.successor_proof.chain =
+            vec![admission.successor_proof.chain.last().unwrap().clone()];
+        mark_admitted(db, "other-intent", &other_digest, &admission).unwrap();
+        let pending = snapshot_consensus(db, "other-intent", &other_digest).unwrap();
+        assert_eq!(pending.voters().len(), 2);
+        commit_domain_vote(
+            db,
+            "other-intent",
+            &other_digest,
+            pending.verify(&Live).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            db.query_row::<i64, _, _>(
+                "SELECT count(*) FROM managed_invalidated_ballots WHERE member='other'",
+                [],
+                |row| row.get(0)
+            )
+            .unwrap(),
+            0
+        );
+        let accepted: Pool = decoded(
+            &db.query_row::<String, _, _>("SELECT data FROM pools WHERE id='pool'", [], |row| {
+                row.get(0)
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(accepted.proposal.unwrap().state, ProposalState::Accepted);
+    }
+
+    #[test]
+    fn same_attempt_actor_epoch_rebind_fences_old_context_and_admits_new() {
+        use crate::domain::{MemberState, Message};
+        let (_dir, mut store, binding, incarnation, mut run) = fixture();
+        let db = store.test_db();
+        index_managed_member(db, &binding);
+        let raw: String = db
+            .query_row("SELECT data FROM members WHERE id='member'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let mut member: crate::domain::Binding = decoded(&raw).unwrap();
+        member.member.state = MemberState::Active;
+        member.run_id = Some(binding.attempt.execution_id.clone());
+        member.run_sequence = Some(u64::from(binding.attempt.sequence));
+        db.execute(
+            "UPDATE members SET data=?1 WHERE id='member'",
+            [encoded(&member).unwrap()],
+        )
+        .unwrap();
+        let post = Command::Post(Message {
+            change: Change {
+                pool_id: "pool".into(),
+                expected_revision: 1,
+                request_key: "new-key".into(),
+            },
+            body: "epoch-bound".into(),
+        });
+        let old_digest = prepare_command(
+            db,
+            &run,
+            &binding,
+            &incarnation,
+            "old-context",
+            "old-intent",
+            "old-inv",
+            &post,
+        );
+        let mut next = binding.clone();
+        next.actor.epoch += 1;
+        run.receipt.receipt_id = "epoch-rebind".into();
+        run.receipt.actor = next.actor.clone();
+        let pin = fake_bridge_pin(&binding);
+        let proof = native_proof();
+        reserve_bootstrap(
+            db,
+            &BootstrapRequest {
+                namespace_id: "namespace-2",
+                bootstrap_id: "stage-context",
+                route: &binding.bridge_route,
+                bridge_pin: &pin,
+                producer: "pool",
+                issuer_epoch: "epoch-2",
+                invocation_key: "stage-inv",
+                command: &post,
+                native_proof: &proof,
+            },
+        )
+        .unwrap();
+        let dispatch = mark_bootstrap_submitted(db, "stage-context").unwrap();
+        record_bootstrap_ref(
+            db,
+            dispatch,
+            &crate::managed_bridge::Prepared {
+                store_id: binding.bridge_route.component_store_id.clone(),
+                bridge_context_ref: bridge_sdk::bridge_protocol::Secret::new(
+                    "bridge-stage-context",
+                ),
+                invocation_key: "stage-inv".into(),
+                expires_at_ms: 100,
+            },
+            &pin,
+        )
+        .unwrap();
+        record_fake_current(
+            db,
+            &run,
+            &binding,
+            &incarnation,
+            "stage-context",
+            "stage-inv",
+            "initial",
+        );
+        let (request,pin_json,receipt):(String,String,String)=db.query_row("SELECT request,run_pin,receipt FROM managed_current_requests WHERE id='initial-stage-context'",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+        let staged_pin: RunPin = decoded(&pin_json).unwrap();
+        let authority = crate::managed_run::CurrentAuthority::fixture(
+            staged_pin.endpoint(),
+            decoded(&receipt).unwrap(),
+            "stage-inv",
+            "initial-stage-context",
+            decoded(&request).unwrap(),
+        );
+        let selected =
+            select_ingress_binding(db, &authority, &binding.bridge_route, "pool", &post).unwrap();
+        next.binding_generation = 2;
+        assert_eq!(selected, next);
+        abandon_unregistered_bootstrap(db, "stage-context").unwrap();
+        assert_eq!(
+            context_current(db, "old-context", &post, &old_digest, false).err(),
+            Some(Fault::Stale)
+        );
+        let digest = prepare_command_in_namespace(
+            db,
+            &run,
+            &next,
+            &incarnation,
+            "new-context",
+            "new-intent",
+            "new-inv",
+            &post,
+            "namespace-2",
+            "epoch-2",
+        );
+        let authority = fresh_authority(db, &next, "new-context", "new-inv").unwrap();
+        let mut consumed =
+            fake_consumed(&next, &incarnation, "new-intent", "new-inv", &digest, &post);
+        consumed.receipt.issuer_epoch = "epoch-2".into();
+        let pool_route = Route {
+            component_store_id: next.pool_store_id.clone(),
+            route_id: "pool-route".into(),
+            worker_uid: next.run_route.worker_uid,
+        };
+        assert_eq!(
+            reserve_intent(
+                db,
+                "new-context",
+                "member",
+                &post,
+                &digest,
+                authority,
+                &consumed,
+                &pool_route
+            )
+            .unwrap(),
+            IntentReservation::Created
+        );
+        let mut admission = consumed_admission(
+            db,
+            &run,
+            &next,
+            &incarnation,
+            "new-intent",
+            "new-inv",
+            &digest,
+            &post,
+        );
+        admission.consumed_ref.issuer_epoch = "epoch-2".into();
+        mark_admitted(db, "new-intent", &digest, &admission).unwrap();
+        let result = commit_domain(db, "new-intent", &digest).unwrap();
+        let crate::domain::Reply::Receipt(receipt) = decoded(&result).unwrap() else {
+            panic!("post receipt")
+        };
+        assert_eq!(receipt.event.body, "epoch-bound");
+        assert_eq!(receipt.revision, 2);
+    }
+
+    #[test]
+    fn same_binding_requires_same_recorded_incarnation_for_noop() {
+        let (_dir, mut store, binding, incarnation, mut run) = fixture();
+        let db = store.test_db();
+        assert_eq!(
+            rebind(
+                db,
+                &run,
+                &binding,
+                &binding,
+                &incarnation,
+                "receipt-1",
+                "ingress"
+            )
+            .unwrap(),
+            1
+        );
+        let digest = prepare(
+            db,
+            &run,
+            &binding,
+            &incarnation,
+            "old-context",
+            "old-intent",
+            "old-inv",
+            1,
+        );
+        let mut changed = incarnation.clone();
+        changed.pid += 1;
+        changed.start_ticks += 1;
+        run.receipt.receipt_id = "incarnation-rebind".into();
+        run.receipt.incarnation = changed.clone();
+        assert_eq!(
+            rebind(
+                db,
+                &run,
+                &binding,
+                &binding,
+                &changed,
+                "incarnation-rebind",
+                "ingress"
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            context_current(db, "old-context", &command(1), &digest, false).err(),
+            Some(Fault::Stale)
+        );
+        let stored: String = db
+            .query_row(
+                "SELECT incarnation FROM managed_bindings WHERE member='member'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, encoded(&changed).unwrap());
+    }
+
+    #[test]
+    fn unknown_migrated_incarnation_requires_a_generation_fence() {
+        let (_dir, mut store, binding, incarnation, run) = fixture();
+        let db = store.test_db();
+        db.execute(
+            "UPDATE managed_bindings SET incarnation=NULL WHERE member='member'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            rebind(
+                db,
+                &run,
+                &binding,
+                &binding,
+                &incarnation,
+                "receipt-1",
+                "ingress"
+            )
+            .unwrap(),
+            2
+        );
+        let stored: String = db
+            .query_row(
+                "SELECT incarnation FROM managed_bindings WHERE member='member'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, encoded(&incarnation).unwrap());
     }
     #[test]
     fn ballot_provenance_is_atomic_and_legacy_is_unverified() {
@@ -4903,6 +5796,525 @@ pub(crate) mod tests {
             .err(),
             Some(Fault::Conflict)
         );
+    }
+
+    #[test]
+    fn managed_capacity_counts_only_live_work_and_compacts_after_seal() {
+        let (directory, mut store, binding, incarnation, run) = fixture();
+        let path = directory.path().join("pool.db");
+        let digest;
+        let outcome_digest;
+        {
+            let db = store.test_db();
+            digest = prepare(
+                db,
+                &run,
+                &binding,
+                &incarnation,
+                "context-1",
+                "intent-1",
+                "inv-1",
+                1,
+            );
+            let before = managed_capacity(db).unwrap();
+            assert!(before.valid());
+            assert_eq!(before.bootstraps.active, 1);
+            assert_eq!(before.contexts.active, 1);
+            assert_eq!(before.contexts_without_intent, 1);
+            assert_eq!(before.intents.reserved, 1);
+            assert_eq!(before.intents.headroom, MANAGED_CAPACITY - 1);
+            let mut invalid = before.clone();
+            invalid.intents.headroom += 1;
+            assert!(!invalid.valid());
+            assert_eq!(
+                reserve(
+                    db,
+                    &run,
+                    &binding,
+                    &incarnation,
+                    "context-1",
+                    "inv-1",
+                    "intent-1",
+                    &command(1),
+                    &digest
+                )
+                .unwrap(),
+                IntentReservation::Created
+            );
+            let admission = consumed_admission(
+                db,
+                &run,
+                &binding,
+                &incarnation,
+                "intent-1",
+                "inv-1",
+                &digest,
+                &command(1),
+            );
+            mark_admitted(db, "intent-1", &digest, &admission).unwrap();
+            db.execute("INSERT INTO managed_current_requests(id,run_pin,request,digest,after_consume,state,owner_intent) VALUES('owned-current','{}','{}','hash',0,'prepared','intent-1')",[]).unwrap();
+            assert_eq!(managed_capacity(db).unwrap().current_requests.active, 1);
+            commit(
+                db,
+                "intent-1",
+                &digest,
+                |_, _| Ok("terminal-receipt".into()),
+            )
+            .unwrap();
+            let before = managed_capacity(db).unwrap();
+            assert_eq!(before.intents.active, 1);
+            assert_eq!(before.contexts.active, 1);
+            assert_eq!(before.current_requests.active, 0);
+            let draining =
+                seal_namespace(db, &binding.bridge_route, "pool", "epoch", "seal", "retire")
+                    .unwrap();
+            assert!(!draining.sealed);
+            assert_ne!(
+                db.query_row::<String, _, _>(
+                    "SELECT command FROM managed_intents WHERE id='intent-1'",
+                    [],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+                "{}"
+            );
+            outcome_digest = outcome(db, "intent-1", &digest)
+                .unwrap()
+                .outcome_digest
+                .unwrap();
+            let settlement = crate::managed_run::Lookup {
+                state: "settled_committed".into(),
+                admission: Some(admission),
+                outcome_digest: Some(outcome_digest.clone()),
+            };
+            record_run_settlement(db, "intent-1", &digest, &settlement).unwrap();
+            let sealed =
+                seal_namespace(db, &binding.bridge_route, "pool", "epoch", "seal", "retire")
+                    .unwrap();
+            assert!(sealed.sealed);
+            assert_eq!(sealed.seal_id, draining.seal_id);
+            let payloads:(String,String,String,String)=db.query_row("SELECT b.command,c.command,c.snapshot,i.command FROM managed_bootstrap b JOIN managed_contexts c ON c.invocation_key=b.invocation_key JOIN managed_intents i ON i.context_id=c.id WHERE i.id='intent-1'",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+            assert_eq!(
+                payloads,
+                ("{}".into(), "{}".into(), "{}".into(), "{}".into())
+            );
+            assert_eq!(
+                outcome(db, "intent-1", &digest)
+                    .unwrap()
+                    .outcome_digest
+                    .as_deref(),
+                Some(outcome_digest.as_str())
+            );
+            assert!(authorize_outcome_route(db, "intent-1", &binding.run_route).is_ok());
+            assert_eq!(
+                db.query_row::<String, _, _>(
+                    "SELECT terminal_receipt FROM managed_intents WHERE id='intent-1'",
+                    [],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+                "terminal-receipt"
+            );
+            assert_eq!(
+                db.query_row::<i64, _, _>(
+                    "SELECT count(*) FROM managed_domain_keys WHERE intent_id='intent-1'",
+                    [],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+                1
+            );
+            let after = managed_capacity(db).unwrap();
+            assert!(after.valid());
+            assert_eq!(
+                (
+                    after.namespaces.active,
+                    after.bootstraps.active,
+                    after.contexts.active,
+                    after.intents.active,
+                    after.current_requests.active
+                ),
+                (0, 0, 0, 0, 0)
+            );
+            assert!(
+                after.bootstraps.retained > 0
+                    && after.contexts.retained > 0
+                    && after.intents.retained > 0
+            );
+            assert_eq!(after.intents.headroom, MANAGED_CAPACITY);
+            let again =
+                seal_namespace(db, &binding.bridge_route, "pool", "epoch", "seal", "retire")
+                    .unwrap();
+            assert_eq!(again.seal_id, sealed.seal_id);
+            let proof = native_proof();
+            let pin = fake_bridge_pin(&binding);
+            assert_eq!(
+                reserve_bootstrap(
+                    db,
+                    &BootstrapRequest {
+                        namespace_id: "namespace-2",
+                        bootstrap_id: "new-bootstrap",
+                        route: &binding.bridge_route,
+                        bridge_pin: &pin,
+                        producer: "pool",
+                        issuer_epoch: "epoch-2",
+                        invocation_key: "inv-1",
+                        command: &command(1),
+                        native_proof: &proof
+                    }
+                )
+                .err(),
+                Some(Fault::Conflict)
+            );
+            let fresh_command = command(1);
+            let fresh_digest = prepare_command_in_namespace(
+                db,
+                &run,
+                &binding,
+                &incarnation,
+                "fresh-context",
+                "fresh-intent",
+                "fresh-inv",
+                &fresh_command,
+                "namespace-2",
+                "epoch-2",
+            );
+            let mut fresh_consumed = fake_consumed(
+                &binding,
+                &incarnation,
+                "fresh-intent",
+                "fresh-inv",
+                &fresh_digest,
+                &fresh_command,
+            );
+            fresh_consumed.receipt.issuer_epoch = "epoch-2".into();
+            let fresh_authority =
+                fresh_authority(db, &binding, "fresh-context", "fresh-inv").unwrap();
+            let pool_route = Route {
+                component_store_id: binding.pool_store_id.clone(),
+                route_id: "pool-route".into(),
+                worker_uid: binding.run_route.worker_uid,
+            };
+            assert_eq!(
+                reserve_intent(
+                    db,
+                    "fresh-context",
+                    "member",
+                    &fresh_command,
+                    &fresh_digest,
+                    fresh_authority,
+                    &fresh_consumed,
+                    &pool_route
+                )
+                .unwrap(),
+                IntentReservation::Committed("terminal-receipt".into())
+            );
+            assert_eq!(
+                db.query_row::<i64, _, _>("SELECT count(*) FROM managed_intents", [], |row| row
+                    .get(0))
+                    .unwrap(),
+                1
+            );
+            let BootstrapRecoveryAction::BridgeAbort {
+                context_id,
+                pin,
+                key,
+            } = stage_bootstrap_recovery(db, "fresh-context").unwrap()
+            else {
+                panic!("fresh replay requires Bridge abort")
+            };
+            let abort = crate::managed_bridge::Abort {
+                store_id: binding.bridge_route.component_store_id.clone(),
+                aborted: true,
+                receipt: Some(fresh_consumed.receipt.clone()),
+            };
+            record_bootstrap_abort(db, &context_id, &key.borrowed(), &abort, &pin).unwrap();
+            db.execute("INSERT INTO managed_current_requests(id,run_pin,request,digest,after_consume,state) VALUES('orphan','{}','{}','hash',0,'prepared')",[]).unwrap();
+            assert_eq!(managed_capacity(db).unwrap().current_requests.active, 1);
+        }
+        drop(store);
+        let mut store = Store::open(&path).unwrap();
+        assert_eq!(
+            store
+                .managed_outcome("intent-1", &digest, &binding.run_route)
+                .unwrap()
+                .outcome_digest
+                .as_deref(),
+            Some(outcome_digest.as_str())
+        );
+        let observation = crate::observer::Request {
+            schema_version: 1,
+            operation: crate::observer::Operation::ManagedCapacity(
+                crate::observer::IdentityParams {},
+            ),
+        };
+        let crate::observer::Data::ManagedCapacity(capacity) = store.observe(&observation).unwrap()
+        else {
+            panic!("capacity projection")
+        };
+        assert!(capacity.valid());
+        assert_eq!(capacity.current_requests.active, 0);
+        assert!(capacity.current_requests.retained > 0);
+        assert_eq!(
+            store
+                .test_db()
+                .query_row::<String, _, _>(
+                    "SELECT state FROM managed_current_requests WHERE id='orphan'",
+                    [],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+            "aborted"
+        );
+    }
+
+    /// Permanent old keys cannot permanently consume the live reservation budget.
+    #[test]
+    fn terminal_keys_above_capacity_do_not_exhaust_new_work() {
+        let (_directory, mut store, binding, _incarnation, _run) = fixture();
+        let db = store.test_db();
+        let pin = fake_bridge_pin(&binding);
+        let proof = native_proof();
+        let command = command(1);
+        let request = |id: &'static str, invocation: &'static str| BootstrapRequest {
+            namespace_id: "namespace",
+            bootstrap_id: id,
+            route: &binding.bridge_route,
+            bridge_pin: &pin,
+            producer: "pool",
+            issuer_epoch: "epoch",
+            invocation_key: invocation,
+            command: &command,
+            native_proof: &proof,
+        };
+        reserve_bootstrap(db, &request("first", "first-inv")).unwrap();
+        abandon_unregistered_bootstrap(db, "first").unwrap();
+        db.execute_batch("BEGIN IMMEDIATE; WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM seq WHERE n<100000) INSERT INTO managed_bootstrap(id,namespace_id,invocation_key,command,proof_hash,state) SELECT 'old-'||n,'namespace','old-inv-'||n,'{}','hash','terminal' FROM seq; WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM seq WHERE n<100000) INSERT INTO managed_current_requests(id,run_pin,request,digest,after_consume,state) SELECT 'old-current-'||n,'{}','{}','hash',0,'used' FROM seq; COMMIT;").unwrap();
+        let before = managed_capacity(db).unwrap();
+        assert_eq!(before.bootstraps.retained, MANAGED_CAPACITY + 1);
+        assert_eq!(before.bootstraps.active, 0);
+        assert_eq!(before.current_requests.retained, MANAGED_CAPACITY);
+        assert_eq!(before.current_requests.headroom, MANAGED_CAPACITY);
+        reserve_bootstrap(db, &request("next", "next-inv")).unwrap();
+        let dispatch = mark_bootstrap_submitted(db, "next").unwrap();
+        record_bootstrap_ref(
+            db,
+            dispatch,
+            &crate::managed_bridge::Prepared {
+                store_id: binding.bridge_route.component_store_id.clone(),
+                bridge_context_ref: bridge_sdk::bridge_protocol::Secret::new("ref"),
+                invocation_key: "next-inv".into(),
+                expires_at_ms: 1,
+            },
+            &pin,
+        )
+        .unwrap();
+        let endpoint = fake_run_endpoint(&binding);
+        let run_pin = RunPin {
+            route: endpoint.route,
+            socket: endpoint.socket,
+            executable: endpoint.executable,
+            executable_sha256: endpoint.executable_sha256,
+            capabilities: vec!["attempt_current_ingress_v1".into()],
+        };
+        let input = CurrentIntent::Ingress {
+            version: 1,
+            expected_store_id: binding.run_route.component_store_id.clone(),
+            request_id: "new-current".into(),
+            observation_ref: bridge_sdk::bridge_protocol::Secret::new("ref"),
+            invocation_key: "next-inv".into(),
+        };
+        prepare_current_request(db, &run_pin, &input).unwrap();
+        let after = managed_capacity(db).unwrap();
+        assert_eq!(after.bootstraps.active, 1);
+        assert_eq!(after.current_requests.active, 1);
+        assert!(after.valid());
+        db.execute(
+            "UPDATE managed_bootstrap SET state='prepared' WHERE id LIKE 'old-%'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            reserve_bootstrap(db, &request("blocked", "blocked-inv")).err(),
+            Some(Fault::Unavailable)
+        );
+        assert_eq!(
+            db.query_row::<i64, _, _>(
+                "SELECT count(*) FROM managed_bootstrap WHERE id='blocked'",
+                [],
+                |row| row.get(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn v8_upgrade_compacts_already_sealed_namespace_without_losing_fences() {
+        let (directory, mut store, binding, _incarnation, _run) = fixture();
+        let path = directory.path().join("pool.db");
+        let pin = fake_bridge_pin(&binding);
+        let proof = native_proof();
+        {
+            let db = store.test_db();
+            reserve_bootstrap(
+                db,
+                &BootstrapRequest {
+                    namespace_id: "namespace",
+                    bootstrap_id: "old",
+                    route: &binding.bridge_route,
+                    bridge_pin: &pin,
+                    producer: "pool",
+                    issuer_epoch: "epoch",
+                    invocation_key: "old-inv",
+                    command: &command(1),
+                    native_proof: &proof,
+                },
+            )
+            .unwrap();
+            abandon_unregistered_bootstrap(db, "old").unwrap();
+            let seal = seal_namespace(db, &binding.bridge_route, "pool", "epoch", "seal", "retire")
+                .unwrap();
+            assert!(seal.sealed);
+            db.execute(
+                "UPDATE managed_bootstrap SET command='legacy-command' WHERE id='old'",
+                [],
+            )
+            .unwrap();
+            db.execute("INSERT INTO managed_contexts(id,namespace_id,intent_id,invocation_key,command,context,digest,snapshot,state) VALUES('old-context','namespace','old-intent','old-inv','legacy-command','{}','digest','legacy-snapshot','invalidated')",[]).unwrap();
+            db.execute_batch("DROP TABLE managed_invalidated_ballots; DROP INDEX managed_current_state_owner; ALTER TABLE managed_current_requests DROP COLUMN owner_intent; ALTER TABLE managed_bindings DROP COLUMN incarnation; DROP INDEX managed_bootstrap_state; DROP INDEX managed_intent_state; PRAGMA user_version=8;").unwrap();
+        }
+        drop(store);
+        let mut reopened = Store::open(&path).unwrap();
+        let db = reopened.test_db();
+        assert_eq!(
+            db.query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap(),
+            9
+        );
+        let payloads:(String,String,String)=db.query_row("SELECT b.command,c.command,c.snapshot FROM managed_bootstrap b JOIN managed_contexts c ON c.invocation_key=b.invocation_key WHERE b.id='old'",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+        assert_eq!(payloads, ("{}".into(), "{}".into(), "{}".into()));
+        assert_eq!(
+            reserve_bootstrap(
+                db,
+                &BootstrapRequest {
+                    namespace_id: "new-namespace",
+                    bootstrap_id: "new",
+                    route: &binding.bridge_route,
+                    bridge_pin: &pin,
+                    producer: "pool",
+                    issuer_epoch: "next-epoch",
+                    invocation_key: "old-inv",
+                    command: &command(1),
+                    native_proof: &proof
+                }
+            )
+            .err(),
+            Some(Fault::Conflict)
+        );
+        assert!(
+            seal_namespace(db, &binding.bridge_route, "pool", "epoch", "seal", "retire")
+                .unwrap()
+                .sealed
+        );
+    }
+
+    #[test]
+    fn v8_upgrade_recovers_incarnation_only_from_retained_rebind_receipt() {
+        let (directory, mut store, binding, incarnation, run) = fixture();
+        let path = directory.path().join("pool.db");
+        {
+            let db = store.test_db();
+            prepare(
+                db,
+                &run,
+                &binding,
+                &incarnation,
+                "old-context",
+                "old-intent",
+                "old-inv",
+                1,
+            );
+            db.execute("INSERT INTO managed_rebinds(receipt_id,member,old_binding,new_binding,generation_before,generation_after) VALUES('fixture-initial-old-context','member',?1,?1,?2,?2)",params![encoded(&binding).unwrap(),sqlite_generation(1)]).unwrap();
+            db.execute_batch("DROP TABLE managed_invalidated_ballots; DROP INDEX managed_current_state_owner; ALTER TABLE managed_current_requests DROP COLUMN owner_intent; ALTER TABLE managed_bindings DROP COLUMN incarnation; DROP INDEX managed_bootstrap_state; DROP INDEX managed_intent_state; PRAGMA user_version=8;").unwrap();
+        }
+        drop(store);
+        let mut reopened = Store::open(&path).unwrap();
+        let db = reopened.test_db();
+        let stored: String = db
+            .query_row(
+                "SELECT incarnation FROM managed_bindings WHERE member='member'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, encoded(&incarnation).unwrap());
+        assert_eq!(
+            rebind(
+                db,
+                &run,
+                &binding,
+                &binding,
+                &incarnation,
+                "receipt-1",
+                "ingress"
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn v8_upgrade_refuses_inconsistent_seal_without_discarding_recovery() {
+        let (directory, mut store, binding, incarnation, run) = fixture();
+        let path = directory.path().join("pool.db");
+        let digest;
+        {
+            let db = store.test_db();
+            digest = prepare(
+                db,
+                &run,
+                &binding,
+                &incarnation,
+                "old-context",
+                "old-intent",
+                "old-inv",
+                1,
+            );
+            assert_eq!(
+                reserve(
+                    db,
+                    &run,
+                    &binding,
+                    &incarnation,
+                    "old-context",
+                    "old-inv",
+                    "old-intent",
+                    &command(1),
+                    &digest
+                )
+                .unwrap(),
+                IntentReservation::Created
+            );
+            db.execute(
+                "UPDATE managed_namespaces SET state='sealed' WHERE id='namespace'",
+                [],
+            )
+            .unwrap();
+            db.execute_batch("DROP TABLE managed_invalidated_ballots; DROP INDEX managed_current_state_owner; ALTER TABLE managed_current_requests DROP COLUMN owner_intent; ALTER TABLE managed_bindings DROP COLUMN incarnation; DROP INDEX managed_bootstrap_state; DROP INDEX managed_intent_state; PRAGMA user_version=8;").unwrap();
+        }
+        drop(store);
+        assert!(Store::open(&path).is_err());
+        let db = Connection::open(&path).unwrap();
+        assert_eq!(
+            db.query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap(),
+            8
+        );
+        let stored:(String,String,Option<String>)=db.query_row("SELECT state,security_digest,consumed_receipt FROM managed_intents WHERE id='old-intent'",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+        assert_eq!(stored.0, "admitting");
+        assert_eq!(stored.1, digest);
+        assert!(stored.2.is_some());
     }
     #[test]
     fn stale_epoch_refresh_requires_definitive_first_response() {
@@ -5516,16 +6928,19 @@ fn bind_initial_inner(
     {
         return Err(Fault::Forbidden);
     }
-    let existing: Option<(Vec<u8>, String)> = tx
+    let existing: Option<(Vec<u8>, String, Option<String>)> = tx
         .query_row(
-            "SELECT generation,binding FROM managed_bindings WHERE member=?1",
+            "SELECT generation,binding,incarnation FROM managed_bindings WHERE member=?1",
             [&binding.member_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
-    if let Some((generation, stored)) = existing {
+    if let Some((generation, stored, prior_incarnation)) = existing {
         if read_generation(&generation)? != 1 || stored != encoded(binding)? {
             return Err(Fault::Conflict);
+        }
+        if prior_incarnation.as_deref() != Some(encoded(incarnation)?.as_str()) {
+            return Err(Fault::Stale);
         }
         if let Some(authority) = authority {
             require_staged_current(&tx, authority, &receipt, &binding.run_route, true)?;
@@ -5549,12 +6964,13 @@ fn bind_initial_inner(
         return Err(Fault::Forbidden);
     }
     tx.execute(
-        "INSERT INTO managed_bindings(member,pool,generation,binding) VALUES(?1,?2,?3,?4)",
+        "INSERT INTO managed_bindings(member,pool,generation,binding,incarnation) VALUES(?1,?2,?3,?4,?5)",
         params![
             binding.member_id,
             binding.pool_id,
             sqlite_generation(1),
-            encoded(binding)?
+            encoded(binding)?,
+            encoded(incarnation)?
         ],
     )?;
     tx.execute("INSERT INTO managed_pool_epochs(pool,epoch) VALUES(?1,1) ON CONFLICT(pool) DO UPDATE SET epoch=epoch+1",[&binding.pool_id])?;
@@ -5760,6 +7176,9 @@ pub(crate) fn recover_bootstrap_ref(
         Option<String>,
     );
     let (namespace,invocation,old_command,old_proof,state,old_ref,ns_state,stored_route,stored_producer,stored_epoch,stored_pin):BootstrapRecoveryRow=tx.query_row("SELECT b.namespace_id,b.invocation_key,b.command,b.proof_hash,b.state,b.bridge_context_ref,n.state,n.bridge_route,n.producer,n.issuer_epoch,n.bridge_pin FROM managed_bootstrap b JOIN managed_namespaces n ON n.id=b.namespace_id WHERE b.id=?1",[bootstrap_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?)))?;
+    if state != "submitted" || ns_state != "open" {
+        return Err(Fault::Stale);
+    }
     if namespace != namespace_id
         || invocation != invocation_key
         || old_command != command_json
@@ -5773,9 +7192,6 @@ pub(crate) fn recover_bootstrap_ref(
         || prepared.bridge_context_ref.expose().is_empty()
     {
         return Err(Fault::Conflict);
-    }
-    if state != "submitted" || ns_state != "open" {
-        return Err(Fault::Stale);
     }
     if let Some(old) = old_ref {
         return if old == prepared.bridge_context_ref.expose() {
@@ -6220,10 +7636,7 @@ pub(crate) fn prepare_current_request(
             Err(Fault::Conflict)
         };
     }
-    let count: i64 = tx.query_row("SELECT count(*) FROM managed_current_requests", [], |r| {
-        r.get(0)
-    })?;
-    if count >= 100_000 {
+    if managed_capacity_inner(&tx, false)?.current_requests.active >= MANAGED_CAPACITY {
         return Err(Fault::Unavailable);
     }
     tx.execute("INSERT INTO managed_current_requests(id,namespace_id,run_pin,request,digest,after_consume,state) VALUES(?1,?2,?3,?4,?5,?6,'prepared')",params![request_id,namespace_id,pin_json,request_json,digest,after_consume])?;
@@ -6463,6 +7876,18 @@ pub(crate) struct ConsensusFence {
 /// Unverified snapshot. Its voter identities can be queried without holding SQLite.
 pub(crate) struct PendingConsensus(ConsensusFence);
 impl PendingConsensus {
+    pub(crate) fn intent_id(&self) -> &str {
+        &self.0.intent_id
+    }
+    /// Re-snapshot after another voter's verified rebind; never reuse old
+    /// observations to authorize acceptance under the new binding epoch.
+    pub(crate) fn refresh_after_rebind(self, db: &Connection) -> Result<Self, Fault> {
+        let refreshed = snapshot_consensus(db, &self.0.intent_id, &self.0.security_digest)?;
+        if !refreshed.voters().is_empty() {
+            return Err(Fault::Stale);
+        }
+        Ok(refreshed)
+    }
     pub(crate) fn voters(&self) -> &[VerifiedBallot] {
         &self.0.voters
     }
@@ -6587,7 +8012,9 @@ pub(crate) fn snapshot_consensus(
     {
         return Err(Fault::Stale);
     }
-    let can_accept = could_accept(&pool, proposal, &vote, &admission.binding.member_id);
+    let invalidated: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM managed_invalidated_ballots WHERE pool=?1 AND proposal=?2 AND member!=?3)",params![pool.pool_id,proposal.proposal_id,admission.binding.member_id],|row|row.get(0))?;
+    let mut can_accept =
+        !invalidated && could_accept(&pool, proposal, &vote, &admission.binding.member_id);
     let mut voters = Vec::new();
     for member_id in proposal.voters.iter().filter(|_| can_accept) {
         let raw: String = tx
@@ -6627,21 +8054,31 @@ pub(crate) fn snapshot_consensus(
         } else {
             let ballot = proposal.votes.get(member_id).ok_or(Fault::Unavailable)?;
             if ballot.validity == Some(crate::domain::VoteValidity::Unknown) {
-                return Err(Fault::Unavailable);
+                can_accept = false;
+                break;
             }
             let prefix = format!("Proposal {}: ", proposal.proposal_id);
             let latest:Option<i64>=tx.query_row("SELECT max(id) FROM events WHERE pool=?1 AND json_extract(data,'$.author.kind')='member' AND json_extract(data,'$.author.member_id')=?2 AND json_extract(data,'$.kind') IN ('vote_recorded','proposal_accepted') AND substr(json_extract(data,'$.body'),1,length(?3))=?3",params![pool.pool_id,member_id,prefix],|r|r.get(0))?;
-            let event_id = latest.ok_or(Fault::Unavailable)?;
+            let Some(event_id) = latest else {
+                can_accept = false;
+                break;
+            };
             if ballot
                 .vote_event_id
                 .as_ref()
                 .is_some_and(|id| id != &event_id.to_string())
             {
-                return Err(Fault::Stale);
+                can_accept = false;
+                break;
             }
-            let (stored_gen,attempt_json,incarnation_json):(Vec<u8>,String,String)=tx.query_row("SELECT generation,attempt,incarnation FROM managed_ballot_provenance WHERE pool=?1 AND proposal=?2 AND member=?3 AND event_id=?4",params![pool.pool_id,proposal.proposal_id,member_id,event_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(|_|Fault::Unavailable)?;
+            let prior:Option<(Vec<u8>,String,String)>=tx.query_row("SELECT generation,attempt,incarnation FROM managed_ballot_provenance WHERE pool=?1 AND proposal=?2 AND member=?3 AND event_id=?4",params![pool.pool_id,proposal.proposal_id,member_id,event_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+            let Some((stored_gen, attempt_json, incarnation_json)) = prior else {
+                can_accept = false;
+                break;
+            };
             if read_generation(&stored_gen)? != generation {
-                return Err(Fault::Stale);
+                can_accept = false;
+                break;
             }
             (decoded(&attempt_json)?, decoded(&incarnation_json)?)
         };
@@ -6651,6 +8088,9 @@ pub(crate) fn snapshot_consensus(
             attempt,
             incarnation,
         });
+    }
+    if !can_accept {
+        voters.clear();
     }
     if can_accept
         && !voters
@@ -6752,6 +8192,10 @@ where
     let before: crate::domain::Pool = decoded(&before)?;
     let (receipt, event_id) = apply(&tx, &command)?;
     record_ballot_provenance(&tx, intent_id, event_id)?;
+    tx.execute(
+        "DELETE FROM managed_invalidated_ballots WHERE pool=?1 AND proposal=?2 AND member=?3",
+        params![fence.pool_id, fence.proposal_id, fence.member_id],
+    )?;
     let raw: String = tx.query_row(
         "SELECT data FROM pools WHERE id=?1",
         [&fence.pool_id],

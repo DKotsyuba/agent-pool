@@ -78,11 +78,14 @@ enum Commands {
         #[arg(long)]
         config: PathBuf,
     },
-    /// Check local resources, without credentials, network or mutation.
+    /// Check local resources; an optional owner grant reads resident capacity.
     Doctor {
         /// Request JSON diagnostics (the current output is always JSON).
         #[arg(long)]
         json: bool,
+        /// Explicit config with the separate owner observer grant for managed headroom.
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
     /// Export the actual registry or inspect unimplemented tool stubs.
     Contract {
@@ -307,13 +310,38 @@ async fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Commands::Doctor { json: _ } => {
+        Commands::Doctor { json: _, config } => {
             let ready = Handler::new(None).is_ok();
-            let output = print_json(
-                serde_json::json!({"product":env!("CARGO_PKG_NAME"),"version":env!("CARGO_PKG_VERSION"),
-                "local_ready":ready,"release_qualification":qualification(),"incomplete_tools":tools::incomplete()}),
-            );
-            if ready { output } else { ExitCode::from(2) }
+            let mut report = serde_json::json!({"product":env!("CARGO_PKG_NAME"),"version":env!("CARGO_PKG_VERSION"),
+                "local_ready":ready,"release_qualification":qualification(),"incomplete_tools":tools::incomplete()});
+            let mut capacity_ready = true;
+            if let Some(path) = config {
+                let request = observer::Request {
+                    schema_version: 1,
+                    operation: observer::Operation::ManagedCapacity(observer::IdentityParams {}),
+                };
+                match observer::frontend(request, &path).await {
+                    Ok(observer::Envelope {
+                        data: Some(observer::Data::ManagedCapacity(capacity)),
+                        error: None,
+                        ..
+                    }) => {
+                        report["managed_capacity"] =
+                            serde_json::to_value(capacity).unwrap_or(serde_json::Value::Null);
+                        capacity_ready = !report["managed_capacity"].is_null();
+                    }
+                    _ => {
+                        report["managed_capacity"] = serde_json::json!({"state":"unavailable"});
+                        capacity_ready = false;
+                    }
+                }
+            }
+            let output = print_json(report);
+            if ready && capacity_ready {
+                output
+            } else {
+                ExitCode::from(2)
+            }
         }
         Commands::Contract {
             command: ContractCommand::Export,

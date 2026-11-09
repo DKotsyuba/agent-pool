@@ -129,6 +129,28 @@ CREATE TABLE managed_ballot_provenance(pool TEXT NOT NULL REFERENCES pools(id), 
     )
 }
 
+/// Version 9 retains open-ballot invalidations without changing the pool revision.
+fn migrate_managed_review_fixes(db: &Connection) -> Result<(), Fault> {
+    db.execute_batch("\
+CREATE TABLE managed_invalidated_ballots(pool TEXT NOT NULL REFERENCES pools(id), proposal TEXT NOT NULL REFERENCES proposals(id), member TEXT NOT NULL REFERENCES members(id), PRIMARY KEY(pool,proposal,member));\
+ALTER TABLE managed_bindings ADD COLUMN incarnation TEXT;\
+ALTER TABLE managed_current_requests ADD COLUMN owner_intent TEXT REFERENCES managed_intents(id);\
+UPDATE managed_bindings AS b SET incarnation=(SELECT json_extract(r.receipt,'$.incarnation') FROM managed_rebinds x JOIN managed_current_requests r ON r.receipt_id=x.receipt_id WHERE x.member=b.member AND x.generation_after=b.generation AND r.receipt IS NOT NULL ORDER BY x.rowid DESC LIMIT 1);\
+UPDATE managed_current_requests SET state='aborted' WHERE namespace_id IS NULL AND state IN ('prepared','received');\
+CREATE INDEX managed_bootstrap_state ON managed_bootstrap(state);\
+CREATE INDEX managed_current_state_owner ON managed_current_requests(state,owner_intent,namespace_id);\
+CREATE INDEX managed_intent_state ON managed_intents(state,bridge_resolved,run_resolved);")?;
+    inventory_revision_triggers(db, &["managed_invalidated_ballots"])?;
+    let mut after = String::new();
+    loop {
+        let next: Option<String> = db.query_row("SELECT id FROM managed_namespaces WHERE state='sealed' AND id>?1 ORDER BY id LIMIT 1",[&after],|row|row.get(0)).optional()?;
+        let Some(id) = next else { break };
+        crate::managed_state::compact_sealed(db, &id)?;
+        after = id;
+    }
+    Ok(())
+}
+
 /// Read totals, page, roster and its revision from one SQLite snapshot.
 fn inventory_snapshot(
     db: &Connection,
@@ -582,6 +604,12 @@ impl Store {
     ) -> Result<crate::managed_state::PendingConsensus, Fault> {
         crate::managed_state::snapshot_consensus(&self.db, id, digest)
     }
+    pub(crate) fn managed_refresh_consensus(
+        &self,
+        pending: crate::managed_state::PendingConsensus,
+    ) -> Result<crate::managed_state::PendingConsensus, Fault> {
+        pending.refresh_after_rebind(&self.db)
+    }
     pub(crate) fn managed_commit_vote(
         &mut self,
         id: &str,
@@ -602,8 +630,17 @@ impl Store {
         voter: &crate::managed_state::VerifiedBallot,
         request_id: &str,
         transport_id: &str,
+        owner_intent: &str,
     ) -> Result<crate::managed_run::VoterQuery, Fault> {
-        crate::managed_run::VoterQuery::stage(&mut self.db, pin, voter, request_id, transport_id)
+        let query = crate::managed_run::VoterQuery::stage(
+            &mut self.db,
+            pin,
+            voter,
+            request_id,
+            transport_id,
+        )?;
+        self.managed_own_current(request_id, owner_intent)?;
+        Ok(query)
     }
     pub(crate) fn managed_stage_egress(
         &mut self,
@@ -611,8 +648,25 @@ impl Store {
         bound: &crate::managed_state::AttemptRef,
         request_id: &str,
         transport_id: &str,
+        owner_intent: &str,
     ) -> Result<crate::managed_run::EgressQuery, Fault> {
-        crate::managed_run::EgressQuery::stage(&mut self.db, pin, bound, request_id, transport_id)
+        let query = crate::managed_run::EgressQuery::stage(
+            &mut self.db,
+            pin,
+            bound,
+            request_id,
+            transport_id,
+        )?;
+        self.managed_own_current(request_id, owner_intent)?;
+        Ok(query)
+    }
+    fn managed_own_current(&mut self, request_id: &str, owner_intent: &str) -> Result<(), Fault> {
+        let changed = self.db.execute("UPDATE managed_current_requests SET owner_intent=?2 WHERE id=?1 AND namespace_id IS NULL AND state='prepared' AND (owner_intent IS NULL OR owner_intent=?2) AND EXISTS(SELECT 1 FROM managed_intents WHERE id=?2 AND state='admitted')",params![request_id,owner_intent])?;
+        if changed != 1 {
+            self.db.execute("UPDATE managed_current_requests SET state='aborted' WHERE id=?1 AND namespace_id IS NULL AND owner_intent IS NULL AND state='prepared'",[request_id])?;
+            return Err(Fault::Stale);
+        }
+        Ok(())
     }
     pub(crate) fn managed_terminal_abort(&mut self, id: &str, digest: &str) -> Result<(), Fault> {
         crate::managed_state::terminal_abort(&mut self.db, id, digest, "managed_aborted")
@@ -763,6 +817,9 @@ impl Store {
         request.validate()?;
         match &request.operation {
             Operation::Identity(_) => Envelope::identity(),
+            Operation::ManagedCapacity(_) => Ok(Data::ManagedCapacity(Box::new(
+                crate::managed_state::managed_capacity(&self.db)?,
+            ))),
             Operation::InventorySnapshot(args) => {
                 inventory_snapshot(&self.db, &self.read_epoch, args)
             }
@@ -879,7 +936,7 @@ impl Store {
             }
         }
     }
-    /// Opens one private database, takes a nonblocking writer lease and migrates to schema v8.
+    /// Opens one private database, takes a nonblocking writer lease and migrates to schema v9.
     /// The existing parent must be a real 0700 directory; future schemas and second writers refuse.
     pub fn open(path: &Path) -> Result<Self, Fault> {
         let parent = path.parent().ok_or(Fault::Invalid)?;
@@ -915,13 +972,13 @@ impl Store {
         let db = Connection::open(path)?;
         db.busy_timeout(Duration::from_secs(2))?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if !(0..=8).contains(&version) {
+        if !(0..=9).contains(&version) {
             return Err(Fault::Conflict);
         }
         db.execute_batch(
             "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;",
         )?;
-        if version < 8 {
+        if version < 9 {
             db.execute_batch("BEGIN IMMEDIATE;")?;
         }
         if version == 0 {
@@ -957,8 +1014,14 @@ PRAGMA user_version=5;")?;
         if version < 8 {
             migrate_managed_intents(&db)?;
             db.execute_batch("PRAGMA user_version=8;")?;
+        }
+        if version < 9 {
+            migrate_managed_review_fixes(&db)?;
+            db.execute_batch("PRAGMA user_version=9;")?;
             db.execute_batch("COMMIT;")?;
         }
+        // No detached egress/consensus read can survive a resident process restart.
+        db.execute("UPDATE managed_current_requests SET state='aborted' WHERE namespace_id IS NULL AND state IN ('prepared','received')", [])?;
         // A crash may have happened after a provider accepted the work. Never turn these back into queued.
         db.execute(
             "UPDATE effects SET state='unknown' WHERE state='inflight'",
@@ -8562,7 +8625,7 @@ mod tests {
                 .unwrap();
             let frozen = encode(&legacy.work).unwrap();
             // Remove newer objects to construct the corresponding old-schema fixture.
-            store.db.execute_batch("DROP TABLE managed_ballot_provenance; DROP TABLE managed_domain_keys; DROP TABLE managed_intents; DROP TABLE managed_current_requests; DROP TABLE managed_context_epochs; DROP TABLE managed_context_bindings; DROP TABLE managed_contexts; DROP TABLE managed_bootstrap; DROP TABLE managed_namespaces; DROP TABLE managed_run_routes; DROP TABLE managed_bridge_routes; DROP TABLE managed_rebinds; DROP TABLE managed_bindings; DROP TABLE managed_pool_epochs;").unwrap();
+            store.db.execute_batch("DROP TABLE managed_invalidated_ballots; DROP TABLE managed_ballot_provenance; DROP TABLE managed_domain_keys; DROP TABLE managed_intents; DROP TABLE managed_current_requests; DROP TABLE managed_context_epochs; DROP TABLE managed_context_bindings; DROP TABLE managed_contexts; DROP TABLE managed_bootstrap; DROP TABLE managed_namespaces; DROP TABLE managed_run_routes; DROP TABLE managed_bridge_routes; DROP TABLE managed_rebinds; DROP TABLE managed_bindings; DROP TABLE managed_pool_epochs;").unwrap();
             let mut stmt = store.db.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'inventory_rev_%'").unwrap();
             let triggers: Vec<String> = stmt
                 .query_map([], |row| row.get(0))
@@ -8593,7 +8656,7 @@ mod tests {
                 .db
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 8);
+            assert_eq!(version, 9);
             assert_eq!(
                 encode(&before).unwrap(),
                 encode(&upgraded.execute(&owner, &command).unwrap()).unwrap()
@@ -8624,7 +8687,7 @@ mod tests {
                     row.get(0)
                 })
                 .unwrap();
-            store.db.execute_batch("DROP TABLE managed_ballot_provenance; DROP TABLE managed_domain_keys; DROP TABLE managed_intents;").unwrap();
+            store.db.execute_batch("DROP TABLE managed_invalidated_ballots; DROP INDEX managed_current_state_owner; ALTER TABLE managed_current_requests DROP COLUMN owner_intent; ALTER TABLE managed_bindings DROP COLUMN incarnation; DROP INDEX managed_bootstrap_state; DROP INDEX managed_intent_state; DROP TABLE managed_ballot_provenance; DROP TABLE managed_domain_keys; DROP TABLE managed_intents;").unwrap();
             if prior == 6 {
                 store.db.execute_batch("DROP TABLE managed_current_requests; DROP TABLE managed_context_epochs; DROP TABLE managed_context_bindings; DROP TABLE managed_contexts; DROP TABLE managed_bootstrap; DROP TABLE managed_namespaces; DROP TABLE managed_run_routes; DROP TABLE managed_bridge_routes; DROP TABLE managed_rebinds; DROP TABLE managed_bindings; DROP TABLE managed_pool_epochs;").unwrap();
             }
@@ -8638,7 +8701,7 @@ mod tests {
                 .db
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 8);
+            assert_eq!(version, 9);
             let retained: String = upgraded
                 .db
                 .query_row("SELECT store_id FROM inventory_source", [], |row| {
@@ -8665,7 +8728,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        store.db.execute_batch("DROP TABLE managed_ballot_provenance; DROP TABLE managed_domain_keys; DROP TABLE managed_intents; DROP TABLE managed_current_requests; DROP TABLE managed_context_epochs; DROP TABLE managed_context_bindings; DROP TABLE managed_contexts; DROP TABLE managed_bootstrap; DROP TABLE managed_namespaces; DROP TABLE managed_run_routes; DROP TABLE managed_bridge_routes; DROP TABLE managed_rebinds; DROP TABLE managed_bindings; DROP TABLE managed_pool_epochs; CREATE TABLE managed_contexts(sentinel TEXT); INSERT INTO managed_contexts VALUES('retained'); PRAGMA user_version=6;").unwrap();
+        store.db.execute_batch("DROP TABLE managed_invalidated_ballots; DROP TABLE managed_ballot_provenance; DROP TABLE managed_domain_keys; DROP TABLE managed_intents; DROP TABLE managed_current_requests; DROP TABLE managed_context_epochs; DROP TABLE managed_context_bindings; DROP TABLE managed_contexts; DROP TABLE managed_bootstrap; DROP TABLE managed_namespaces; DROP TABLE managed_run_routes; DROP TABLE managed_bridge_routes; DROP TABLE managed_rebinds; DROP TABLE managed_bindings; DROP TABLE managed_pool_epochs; CREATE TABLE managed_contexts(sentinel TEXT); INSERT INTO managed_contexts VALUES('retained'); PRAGMA user_version=6;").unwrap();
         drop(store);
         assert!(Store::open(&directory.path().join("pool.sqlite")).is_err());
         let db = Connection::open(directory.path().join("pool.sqlite")).unwrap();
@@ -8689,6 +8752,64 @@ mod tests {
         assert_eq!(
             (version, retained, sentinel, intermediate, pools),
             (6, source, "retained".into(), 0, 1)
+        );
+    }
+    /// A v7-to-v8 failure rolls back the newly created intent table and preserves old data.
+    #[test]
+    fn managed_migration_failure_rolls_back_v7() {
+        let (directory, mut store) = fixture();
+        let owner = actor("migration-v7");
+        make(&mut store, &owner, "retained");
+        store.db.execute_batch("DROP TABLE managed_invalidated_ballots; DROP INDEX managed_current_state_owner; ALTER TABLE managed_current_requests DROP COLUMN owner_intent; ALTER TABLE managed_bindings DROP COLUMN incarnation; DROP INDEX managed_bootstrap_state; DROP INDEX managed_intent_state; DROP TABLE managed_ballot_provenance; DROP TABLE managed_domain_keys; DROP TABLE managed_intents; CREATE TABLE managed_domain_keys(sentinel TEXT); INSERT INTO managed_domain_keys VALUES('retained'); PRAGMA user_version=7;").unwrap();
+        drop(store);
+        assert!(Store::open(&directory.path().join("pool.sqlite")).is_err());
+        let db = Connection::open(directory.path().join("pool.sqlite")).unwrap();
+        let version: i64 = db
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        let sentinel: String = db
+            .query_row("SELECT sentinel FROM managed_domain_keys", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let intents: i64 = db
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='managed_intents'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let pools: i64 = db
+            .query_row("SELECT count(*) FROM pools", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            (version, sentinel.as_str(), intents, pools),
+            (7, "retained", 0, 1)
+        );
+    }
+
+    /// A failed v8-to-v9 migration preserves the v8 version and all terminal state.
+    #[test]
+    fn managed_migration_failure_rolls_back_v8() {
+        let (directory, store) = fixture();
+        store.db.execute_batch("DROP TABLE managed_invalidated_ballots; DROP INDEX managed_current_state_owner; ALTER TABLE managed_current_requests DROP COLUMN owner_intent; ALTER TABLE managed_bindings DROP COLUMN incarnation; DROP INDEX managed_bootstrap_state; DROP INDEX managed_intent_state; CREATE TABLE managed_invalidated_ballots(sentinel TEXT); INSERT INTO managed_invalidated_ballots VALUES('retained'); PRAGMA user_version=8;").unwrap();
+        drop(store);
+        assert!(Store::open(&directory.path().join("pool.sqlite")).is_err());
+        let db = Connection::open(directory.path().join("pool.sqlite")).unwrap();
+        let version: i64 = db
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        let sentinel: String = db
+            .query_row(
+                "SELECT sentinel FROM managed_invalidated_ballots",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let owner_column: i64 = db.query_row("SELECT count(*) FROM pragma_table_info('managed_current_requests') WHERE name='owner_intent'", [], |row| row.get(0)).unwrap();
+        assert_eq!(
+            (version, sentinel.as_str(), owner_column),
+            (8, "retained", 0)
         );
     }
     /// A confirmed lost execution wakes the owner without closing the pool or removing membership.

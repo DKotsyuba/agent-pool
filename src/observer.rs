@@ -33,6 +33,8 @@ pub enum Operation {
     List(domain::List),
     /// Source-fenced retained inventory with a complete current roster per row.
     InventorySnapshot(InventoryRequest),
+    /// Owner-only managed capacity and retained-fence diagnostics.
+    ManagedCapacity(IdentityParams),
     /// One independently paged section; mappings require an explicit opt-in.
     Get(Get),
 }
@@ -250,7 +252,7 @@ impl Request {
             }
         }
         match &self.operation {
-            Operation::Identity(_) => Ok(()),
+            Operation::Identity(_) | Operation::ManagedCapacity(_) => Ok(()),
             Operation::List(args) => domain::Command::List(args.clone()).validate(),
             Operation::InventorySnapshot(args) => {
                 if !(1..=10).contains(&args.limit) {
@@ -298,6 +300,7 @@ impl Request {
             Operation::Identity(_) => "identity",
             Operation::List(_) => "pool_page",
             Operation::InventorySnapshot(_) => "inventory_snapshot",
+            Operation::ManagedCapacity(_) => "managed_capacity",
             Operation::Get(ref args) if args.section == "run_proof" => "run_proof",
             Operation::Get(_) => "pool_detail",
         }
@@ -346,6 +349,8 @@ pub enum Data {
     Identity(Identity),
     /// Fenced inventory and source-wide totals.
     Inventory(Box<InventorySnapshot>),
+    /// Active headroom and durable retained fence counts.
+    ManagedCapacity(Box<crate::managed_state::ManagedCapacity>),
     /// Complete metadata rows for one pool inventory page.
     Pools(PoolPage),
     /// Existing safe section projection plus explicit owner-only mappings when requested.
@@ -476,7 +481,7 @@ pub struct Page {
     pub returned: usize,
     /// Source snapshot observation time, in Unix milliseconds.
     pub observed_at_unix_ms: u64,
-    /// Historical timestamps are absent from Store schema v8, explicitly null.
+    /// Historical timestamps are absent from Store schema v9, explicitly null.
     pub source_timestamp: Option<u64>,
     /// Explicit paging/snapshot and missing timestamp limitations.
     pub coverage: String,
@@ -562,7 +567,7 @@ impl Page {
     /// Constructs truthful metadata; each request is a current resident snapshot, not a cross-page snapshot.
     pub fn new(cursor: Option<String>, has_more: bool, returned: usize) -> Result<Self, Fault> {
         Ok(Self { cursor, has_more, returned, observed_at_unix_ms: now()?, source_timestamp:None,
-            coverage:"Selected section only; follow cursor while has_more. Pages observe current state independently. Historical source timestamps are not recorded in Store schema v8.".into() })
+            coverage:"Selected section only; follow cursor while has_more. Pages observe current state independently. Historical source timestamps are not recorded in Store schema v9.".into() })
     }
 }
 /// Returns current Unix milliseconds, refusing clocks before the epoch or unrepresentable values.
@@ -605,6 +610,7 @@ impl Envelope {
                 "content_pages_v1".into(),
                 "run_proof_v1".into(),
                 "inventory_snapshot_v1".into(),
+                "managed_capacity_v1".into(),
             ],
             observed_at_unix_ms: now()?,
         }))
@@ -695,10 +701,14 @@ pub async fn frontend(request: Request, path: &Path) -> Result<Envelope, Fault> 
                 ("identity", Data::Identity(_))
                     | ("pool_page", Data::Pools(_))
                     | ("inventory_snapshot", Data::Inventory(_))
+                    | ("managed_capacity", Data::ManagedCapacity(_))
                     | ("pool_detail", Data::Detail(_))
                     | ("run_proof", Data::RunProof(_))
             )
         }) {
+            return Err(Fault::Unavailable);
+        }
+        if matches!(&envelope.data, Some(Data::ManagedCapacity(capacity)) if !capacity.valid()) {
             return Err(Fault::Unavailable);
         }
         if let Some(Data::RunProof(proof)) = &envelope.data {

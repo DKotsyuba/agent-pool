@@ -910,3 +910,50 @@ async fn observer_cli_uses_separate_credential_and_resident() {
     }).await.expect("observer resident fixture deadline");
     assert!(!path.join("must-not-open.db").exists());
 }
+
+/// Doctor uses only an explicitly configured owner grant for the resident headroom snapshot.
+#[tokio::test]
+async fn doctor_reports_owner_capacity_without_opening_database() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let directory =
+        tempfile::tempdir_in(std::env::var_os("TMPDIR").expect("task TMPDIR required")).unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = directory.path();
+    let socket = path.join("pool.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let token = path.join("observer.token");
+    std::fs::write(&token, "fixture-only-observer").unwrap();
+    std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let config = path.join("config.toml");
+    std::fs::write(&config,format!("socket_path={socket:?}\ndatabase_path={:?}\nexpected_uid={}\nbridge_registration_socket={:?}\nbridge_core_socket={:?}\nbridge_credential_file={:?}\nbridge_producer_id=\"fixture\"\nbridge_audience=\"fixture\"\nbridge_server_executable=\"/fixture/bridge\"\nbridge_server_sha256=\"{}\"\nowner_observer_credential_file={token:?}\n",path.join("must-not-open.db"),std::fs::metadata(path).unwrap().uid(),path.join("absent-register.sock"),path.join("absent-core.sock"),path.join("absent-bridge.token"),"0".repeat(64))).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let resident = async {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["observer_credential"], "fixture-only-observer");
+            assert_eq!(request["observe"]["operation"], "managed_capacity");
+            let gauge = serde_json::json!({"active":0,"retained":3,"reserved":0,"limit":100000,"headroom":100000});
+            let data = serde_json::json!({"namespaces":gauge,"bootstraps":gauge,"contexts":gauge,"intents":gauge,"current_requests":gauge,"bootstrap_reservations":0,"contexts_without_intent":0});
+            let response = serde_json::json!({"schema_version":1,"kind":"managed_capacity","data":data});
+            stream.write_all(format!("{response}\n").as_bytes()).await.unwrap();
+        };
+        let run = async {
+            tokio::process::Command::new(env!("CARGO_BIN_EXE_agent-pool"))
+                .args(["doctor","--json","--config"]).arg(&config)
+                .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
+                .output().await.unwrap()
+        };
+        let (_, output) = tokio::join!(resident, run);
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["managed_capacity"]["intents"]["retained"], 3);
+        assert_eq!(report["managed_capacity"]["intents"]["headroom"], 100000);
+        assert!(!output.stdout.windows(b"fixture-only-observer".len()).any(|bytes| bytes == b"fixture-only-observer"));
+    }).await.expect("doctor fixture deadline");
+    assert!(!path.join("must-not-open.db").exists());
+}
