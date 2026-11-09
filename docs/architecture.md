@@ -11,9 +11,9 @@ its EOF never starts, stops or replaces the resident.
 - `domain.rs` defines strict flat commands, safe public views and private outbox work.
 - `store.rs` owns the single SQLite writer and synchronous transactions. A process
   lifetime file lock excludes a second writer. WAL, full synchronization, foreign
-  keys and schema version 8 are explicit. Future schema versions refuse to open.
-  Schema v1–v8 upgrades transactionally to v9 before use; older binaries must
-  refuse v9 because they cannot preserve newer durable state. The v5 replacement
+  keys and schema version 10 are explicit. Future schema versions refuse to open.
+  Schema v1–v9 upgrades transactionally to v10 before use; older binaries must
+  refuse v10 because they cannot preserve newer durable state. The v5 replacement
   and stable-slot migration and v6 inventory revision fence remain in that upgrade.
 - `runtime.rs` supervises bounded frontend connections, one serial effect worker
   and rotating observation batches. Blocking database work never spans provider I/O.
@@ -42,7 +42,7 @@ Run retention can remove a lineage tail and a later resume can reuse its sequenc
 a sampled address also does not identify the current attempt. Managed calls need
 the original Bridge observation and the pinned Run proof described below. Managed
 join remains closed, admission is not proof that onboarding succeeded, and fresh
-managed delivery is unavailable. Unverified historical mappings are not authority
+managed delivery requires the separately enabled egress path below. Unverified historical mappings are not authority
 and their runtime projection is unknown. Old Run-managed ballots remain
 `validity:unknown` and cannot count toward a new acceptance; already accepted
 historical decisions remain unchanged. Bridge-only participants remain available.
@@ -484,6 +484,56 @@ endpoints, installed providers and managed-harness role qualification have not
 been qualified together. The grant installs no service, endpoint, credential or
 release.
 
+### Managed owner delivery
+
+Managed egress is explicitly opt-in with `managed_run_transport.egress_enabled`,
+which defaults to false. `producer_scope_prefix` must be exactly
+`pool/<Pool store UUID>/`. Bridge's producer grant and Run's custody grant must
+authorize this prefix. A member uses `pool/<store>/<pool>/<member>`; membership
+IDs cannot be `final-notice`. Independent final notices use the shared
+`pool/<store>/<pool>/final-notice` scope. Legacy delivery keeps its existing
+scope and is never the fallback for a managed delivery.
+
+Schema v10 commits an immutable seed with the originating event and payload
+hash/length. Before any publish, a fresh capability-gated Run egress observation
+attests the lineage, launch, actor and kernel incarnation. Pool applies any
+same-lineage rebind and freezes the complete target and digest under a binding
+generation CAS. No ingress context is needed. A pending observation retains and
+retries its original request ID, including across restart. When Run reports the
+old launch stale after relaunch, Pool fences that probe and uses a new request
+ID; the old key cannot be retargeted. A reply recovered after an uncertain
+currentness exchange is not fresh authority: Pool resolves the old key, then
+obtains a new observation before freezing. A frozen effect is never retargeted.
+The owner-facing delivery record
+can expose typed, nonsecret attention such as `awaiting_root_hook`,
+`relaunch_required` or `actor_unavailable`; it does not assert delivery. For
+`relaunch_required`, `attention_subject` distinguishes the member process
+(`member`) from the Pool resident (`resident`).
+
+An exact known-unsent effect may be sent again only with its frozen target and
+digest. Unknown effects are looked up or aborted under their original identity;
+they never resend automatically or lock the member against unrelated effects.
+Removal or replacement before freezing makes an ordinary seed not delivered.
+A final notice is the exception: it may be frozen for the exact removed
+membership's previously bound lineage, with a fresh Run receipt and a same-lineage
+rebind, and grants no participant access. A different lineage is not delivered.
+These rules implement `contracts/attempt-binding-v1-errata.md` E8–E10.
+
+On removal, Pool drains the exact member scope, resolves all its effects, then
+records a pinned Bridge retirement receipt before requesting bounded compaction.
+The final-notice scope drains when the pool closes. Uncertain effects and fences
+survive restart; scope retirement never claims that an accepted or unknown effect
+was recalled. Each of the active outbox and active scope sets is bounded at
+100,000; terminal records and rejecting fences remain retained. Scope retirement
+uses the SDK's same-connection pinned Bridge method, retaining the original key
+after an uncertain reply. Synthetic fakes do not qualify the Run/Bridge endpoints
+or native provider delivery.
+
+The B1 issuer namespace seal covers P1 ingress contexts, consumes and admissions.
+It neither fences nor waits for P2 egress. Managed egress derives its authority
+from a Run egress receipt and uses its separate B2 effect ledger and producer
+scope retirement lifecycle.
+
 The owner observer capability `managed_capacity_v1` accepts
 `{"schema_version":1,"operation":"managed_capacity","params":{}}` through
 the existing separately authorized owner grant. It returns a single SQLite
@@ -573,7 +623,7 @@ delivery are separate facts. Inventory orders by pool ID; archive orders by
 retained proposal insertion sequence; other sections preserve existing cursor
 semantics. Pages observe current state independently; mutable offset sections
 require the revision fence on continuation.
-Store schema v9 has no historical timestamps: `source_timestamp:null` and
+Store schema v10 has no historical timestamps: `source_timestamp:null` and
 coverage text disclose that absence. Complete encoded envelopes including the
 newline are capped at 1 MiB; oversized results fail explicitly without partial
 publication or silently advancing a cursor. Resident exchanges use the existing

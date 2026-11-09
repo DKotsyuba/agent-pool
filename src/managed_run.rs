@@ -109,6 +109,7 @@ pub(crate) struct EgressQuery {
     transport_id: String,
     request_id: String,
     bound: AttemptRef,
+    actor_recovery: bool,
 }
 
 /// The original protected Bridge reference, never a later process observation.
@@ -181,12 +182,36 @@ impl IngressQuery {
     }
 }
 impl EgressQuery {
+    #[cfg(test)]
+    pub(crate) fn fixture_request_id(&self) -> &str {
+        &self.request_id
+    }
     pub(crate) fn stage(
         db: &mut rusqlite::Connection,
         pin: &RunPin,
         bound: &AttemptRef,
         request_id: &str,
         transport_id: &str,
+    ) -> Result<Self, crate::domain::Fault> {
+        Self::stage_inner(db, pin, bound, request_id, transport_id, false)
+    }
+    /// Stage an opt-in egress read only after Run advertises actor recovery.
+    pub(crate) fn stage_recovery(
+        db: &mut rusqlite::Connection,
+        pin: &RunPin,
+        bound: &AttemptRef,
+        request_id: &str,
+        transport_id: &str,
+    ) -> Result<Self, crate::domain::Fault> {
+        Self::stage_inner(db, pin, bound, request_id, transport_id, true)
+    }
+    fn stage_inner(
+        db: &mut rusqlite::Connection,
+        pin: &RunPin,
+        bound: &AttemptRef,
+        request_id: &str,
+        transport_id: &str,
+        actor_recovery: bool,
     ) -> Result<Self, crate::domain::Fault> {
         if !wire_text(request_id)
             || !wire_text(transport_id)
@@ -200,6 +225,7 @@ impl EgressQuery {
             request_id: request_id.into(),
             lineage_root_id: bound.lineage_root_id.clone(),
             bound_execution_id: bound.execution_id.clone(),
+            actor_recovery_version: actor_recovery.then_some(1),
         };
         crate::managed_state::prepare_current_request(db, pin, &intent)?;
         Ok(Self {
@@ -207,7 +233,28 @@ impl EgressQuery {
             transport_id: transport_id.into(),
             request_id: request_id.into(),
             bound: bound.clone(),
+            actor_recovery,
         })
+    }
+    #[cfg(test)]
+    pub(crate) fn fixture_authority(
+        &self,
+        receipt: CurrentReceipt,
+    ) -> Result<CurrentAuthority, crate::domain::Fault> {
+        let intent = CurrentIntent::Egress {
+            version: 1,
+            expected_store_id: self.pin.route.component_store_id.clone(),
+            request_id: self.request_id.clone(),
+            lineage_root_id: self.bound.lineage_root_id.clone(),
+            bound_execution_id: self.bound.execution_id.clone(),
+            actor_recovery_version: self.actor_recovery.then_some(1),
+        };
+        Ok(CurrentAuthority::egress_fixture(
+            self.pin.endpoint(),
+            receipt,
+            &self.request_id,
+            serde_json::to_value(intent).map_err(|_| crate::domain::Fault::Internal)?,
+        ))
     }
 }
 impl VoterQuery {
@@ -367,6 +414,24 @@ struct WireError {
     store_id: String,
     code: String,
     recovery: String,
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    actor_recovery_version: Option<u8>,
+    #[serde(default)]
+    actor_recovery: Option<ActorRecovery>,
+    #[serde(default)]
+    incarnation: Option<Incarnation>,
+    #[serde(default)]
+    launch_id: Option<String>,
+}
+/// Authenticated Run classification for the exact candidate launch; never write authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ActorRecovery {
+    AwaitingRootHook,
+    RelaunchRequired,
+    Unavailable,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -384,6 +449,11 @@ pub(crate) enum RunError {
     Refused,
     /// Run definitively has not bound or qualified this original observation yet.
     NotReady,
+    /// The original currentness key is pinned to a launch that is no longer current.
+    BindingStale,
+    ActorRecovery(ActorRecovery),
+    /// The authenticated Run source returned a durable receipt for another lineage.
+    DifferentLineage,
     Unknown,
 }
 #[derive(Deserialize)]
@@ -486,6 +556,66 @@ fn classify_error(error: &WireError, expected_store_id: &str) -> RunError {
     } else {
         RunError::Unknown
     }
+}
+
+fn classify_egress_error(
+    error: &WireError,
+    expected_store_id: &str,
+    request: &Value,
+    uid: u32,
+) -> RunError {
+    let has_detail = error.request_id.is_some()
+        || error.actor_recovery_version.is_some()
+        || error.actor_recovery.is_some()
+        || error.incarnation.is_some()
+        || error.launch_id.is_some();
+    if !has_detail {
+        if error.version == 1
+            && error.store_id == expected_store_id
+            && error.code == "binding_stale"
+            && error.recovery == "fresh_invocation"
+            && request.get("purpose").and_then(Value::as_str) == Some("egress")
+        {
+            return RunError::BindingStale;
+        }
+        return classify_error(error, expected_store_id);
+    }
+    let Some(state) = error.actor_recovery else {
+        return RunError::Unknown;
+    };
+    let Some(incarnation) = error.incarnation.as_ref() else {
+        return RunError::Unknown;
+    };
+    let Some(launch) = error.launch_id.as_deref() else {
+        return RunError::Unknown;
+    };
+    let expected_recovery = match state {
+        ActorRecovery::AwaitingRootHook => "same_key_lookup",
+        ActorRecovery::RelaunchRequired | ActorRecovery::Unavailable => "operator",
+    };
+    if request.get("purpose").and_then(Value::as_str) != Some("egress")
+        || request
+            .get("actor_recovery_version")
+            .and_then(Value::as_u64)
+            != Some(1)
+        || error.version != 1
+        || error.store_id != expected_store_id
+        || error.code != "binding_unavailable"
+        || error.recovery != expected_recovery
+        || error.actor_recovery_version != Some(1)
+        || error.request_id.as_deref() != request.get("request_id").and_then(Value::as_str)
+        || incarnation.uid != uid
+        || incarnation.pid <= 1
+        || incarnation.pid_namespace_inode == 0
+        || incarnation.start_ticks == 0
+        || !wire_text(&incarnation.host_id)
+        || !uuid::Uuid::parse_str(&incarnation.boot_id)
+            .is_ok_and(|id| id.to_string() == incarnation.boot_id)
+        || !uuid::Uuid::parse_str(launch).is_ok_and(|id| id.to_string() == launch)
+    {
+        return RunError::Unknown;
+    }
+    RunError::ActorRecovery(state)
 }
 
 /// Kernel start ticks, read twice to reject a changed process during executable inspection.
@@ -882,7 +1012,12 @@ impl RunPeer {
                 return Err(RunError::Unknown);
             }
             if let Some(error) = reply.error {
-                return Err(classify_error(&error, &self.route.component_store_id));
+                return Err(classify_egress_error(
+                    &error,
+                    &self.route.component_store_id,
+                    &params,
+                    self.expected_uid,
+                ));
             }
             let result = reply.result.ok_or(RunError::Unknown)?;
             let fields = result.as_object().ok_or(RunError::Unknown)?;
@@ -1064,15 +1199,32 @@ impl RunPeer {
             return Err(RunError::Invalid);
         }
         self.require_current("attempt_current_egress_v1").await?;
-        let params = serde_json::json!({"version":1,"expected_store_id":self.route.component_store_id,"request_id":query.request_id,"lineage_root_id":query.bound.lineage_root_id,"bound_execution_id":query.bound.execution_id,"purpose":"egress"});
+        if query.actor_recovery {
+            self.require_current("attempt_egress_actor_recovery_v1")
+                .await?;
+        }
+        let params = serde_json::to_value(CurrentIntent::Egress {
+            version: 1,
+            expected_store_id: self.route.component_store_id.clone(),
+            request_id: query.request_id.clone(),
+            lineage_root_id: query.bound.lineage_root_id.clone(),
+            bound_execution_id: query.bound.execution_id.clone(),
+            actor_recovery_version: query.actor_recovery.then_some(1),
+        })
+        .map_err(|_| RunError::Invalid)?;
         let result: Current = self
             .exchange(&query.transport_id, "_attempt_current_v1", params.clone())
             .await?;
-        if result.state != "current"
-            || result.receipt.purpose != "egress"
-            || result.receipt.lineage_root_id != query.bound.lineage_root_id
-            || result.receipt.bound_execution_id != query.bound.execution_id
-        {
+        if result.state != "current" || result.receipt.purpose != "egress" {
+            return Err(RunError::Unknown);
+        }
+        if result.receipt.lineage_root_id != query.bound.lineage_root_id {
+            let _ = self
+                .verify_current_receipt(&crate::domain::id(), result.receipt)
+                .await?;
+            return Err(RunError::DifferentLineage);
+        }
+        if result.receipt.bound_execution_id != query.bound.execution_id {
             return Err(RunError::Unknown);
         }
         let mut authority = self
@@ -1271,6 +1423,11 @@ mod tests {
             store_id: "store".into(),
             code: "attempt_not_ready".into(),
             recovery: "same_key_lookup".into(),
+            request_id: None,
+            actor_recovery_version: None,
+            actor_recovery: None,
+            incarnation: None,
+            launch_id: None,
         };
         assert_eq!(classify_error(&error, "store"), RunError::NotReady);
         assert_eq!(classify_error(&error, "other-store"), RunError::Unknown);
@@ -1281,6 +1438,163 @@ mod tests {
         assert_eq!(classify_error(&error, "store"), RunError::Unknown);
         error.code = "role_unqualified".into();
         assert_eq!(classify_error(&error, "store"), RunError::Refused);
+    }
+    #[test]
+    fn egress_binding_stale_rotates_only_on_correlated_fresh_invocation() {
+        let mut error = WireError {
+            version: 1,
+            store_id: "store".into(),
+            code: "binding_stale".into(),
+            recovery: "fresh_invocation".into(),
+            request_id: None,
+            actor_recovery_version: None,
+            actor_recovery: None,
+            incarnation: None,
+            launch_id: None,
+        };
+        let request = serde_json::json!({"purpose":"egress","request_id":"original","actor_recovery_version":1});
+        assert_eq!(
+            classify_egress_error(&error, "store", &request, 1000),
+            RunError::BindingStale
+        );
+        assert_eq!(
+            classify_egress_error(&error, "other", &request, 1000),
+            RunError::Unknown
+        );
+        error.recovery = "same_key_lookup".into();
+        assert_eq!(
+            classify_egress_error(&error, "store", &request, 1000),
+            RunError::Unknown
+        );
+    }
+    #[test]
+    fn egress_actor_recovery_requires_capability_and_exact_correlation() {
+        let mut error = WireError {
+            version: 1,
+            store_id: "store".into(),
+            code: "binding_unavailable".into(),
+            recovery: "operator".into(),
+            request_id: Some("request".into()),
+            actor_recovery_version: Some(1),
+            actor_recovery: Some(ActorRecovery::RelaunchRequired),
+            incarnation: Some(Incarnation {
+                host_id: "host".into(),
+                boot_id: "00000000-0000-4000-8000-000000000001".into(),
+                pid_namespace_inode: 1,
+                uid: 1000,
+                pid: 123,
+                start_ticks: 1,
+            }),
+            launch_id: Some("00000000-0000-4000-8000-000000000002".into()),
+        };
+        let request = serde_json::json!({"purpose":"egress","request_id":"request","actor_recovery_version":1});
+        assert_eq!(
+            classify_egress_error(&error, "store", &request, 1000),
+            RunError::ActorRecovery(ActorRecovery::RelaunchRequired)
+        );
+        assert_eq!(
+            classify_egress_error(&error, "other", &request, 1000),
+            RunError::Unknown
+        );
+        assert_eq!(
+            classify_egress_error(&error, "store", &request, 1001),
+            RunError::Unknown
+        );
+        assert_eq!(
+            classify_egress_error(
+                &error,
+                "store",
+                &serde_json::json!({"purpose":"egress","request_id":"other","actor_recovery_version":1}),
+                1000
+            ),
+            RunError::Unknown
+        );
+        assert_eq!(
+            classify_egress_error(
+                &error,
+                "store",
+                &serde_json::json!({"purpose":"egress","request_id":"request"}),
+                1000
+            ),
+            RunError::Unknown
+        );
+        error.actor_recovery = Some(ActorRecovery::AwaitingRootHook);
+        error.recovery = "same_key_lookup".into();
+        assert_eq!(
+            classify_egress_error(&error, "store", &request, 1000),
+            RunError::ActorRecovery(ActorRecovery::AwaitingRootHook)
+        );
+        error.recovery = "operator".into();
+        assert_eq!(
+            classify_egress_error(&error, "store", &request, 1000),
+            RunError::Unknown
+        );
+        error.actor_recovery = Some(ActorRecovery::Unavailable);
+        assert_eq!(
+            classify_egress_error(&error, "store", &request, 1000),
+            RunError::ActorRecovery(ActorRecovery::Unavailable)
+        );
+    }
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn egress_actor_recovery_wire_is_opted_in_and_correlated() {
+        let _hash_guard = crate::TEST_EXEC_HASH_LOCK.lock().await;
+        let root = std::env::var_os("TMPDIR").unwrap();
+        let dir = tempfile::tempdir_in(root).unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = dir.path().join("attempt.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let sha256 = format!("{:x}", Sha256::digest(fs::read(&executable).unwrap()));
+        let uid = fs::metadata(dir.path()).unwrap().uid();
+        let peer = local_peer(socket, uid, executable, sha256);
+        let (_db_dir, mut store, binding, incarnation, _run) =
+            crate::managed_state::tests::fixture_with_uid(uid);
+        let db = store.test_db();
+        db.execute("DELETE FROM managed_run_routes", []).unwrap();
+        crate::managed_state::persist_run_route(db, &peer.endpoint_pin()).unwrap();
+        let mut pin = RunPin {
+            route: peer.route.clone(),
+            socket: peer.socket.clone(),
+            executable: peer.executable.clone(),
+            executable_sha256: peer.sha256.clone(),
+            capabilities: vec!["attempt_current_egress_v1".into()],
+        };
+        assert!(matches!(
+            EgressQuery::stage_recovery(db, &pin, &binding.attempt, "current-key", "rpc"),
+            Err(crate::domain::Fault::Invalid)
+        ));
+        pin.capabilities
+            .push("attempt_egress_actor_recovery_v1".into());
+        let query =
+            EgressQuery::stage_recovery(db, &pin, &binding.attempt, "current-key", "rpc").unwrap();
+        let store_id = peer.route.component_store_id.clone();
+        let server = tokio::spawn(async move {
+            for index in 0..3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request: Value =
+                    serde_json::from_slice(&read_frame(&mut stream).await.unwrap()).unwrap();
+                let response = if index < 2 {
+                    assert_eq!(request["method"], "_attempt_capabilities_v1");
+                    serde_json::json!({"id":request["id"],"result":{"version":1,"store_id":store_id,"capabilities":["attempt_current_egress_v1","attempt_egress_actor_recovery_v1"],"policy":"admission_snapshot"}})
+                } else {
+                    assert_eq!(request["method"], "_attempt_current_v1");
+                    assert_eq!(request["params"]["actor_recovery_version"], 1);
+                    assert_eq!(request["params"]["request_id"], "current-key");
+                    serde_json::json!({"id":request["id"],"error":{"version":1,"store_id":store_id,"code":"binding_unavailable","recovery":"operator","request_id":"current-key","actor_recovery_version":1,"actor_recovery":"relaunch_required","incarnation":incarnation,"launch_id":"00000000-0000-4000-8000-000000000004"}})
+                };
+                stream
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        assert!(matches!(
+            peer.current_egress(&query).await,
+            Err(RunError::ActorRecovery(ActorRecovery::RelaunchRequired))
+        ));
+        server.await.unwrap();
     }
     #[test]
     fn admission_lookup_never_treats_absence_as_abort_fence() {
@@ -1503,6 +1817,7 @@ mod tests {
             transport_id: "egress".into(),
             request_id: "egress-request".into(),
             bound: attempt,
+            actor_recovery: false,
         };
         assert_eq!(
             peer.current_egress(&egress).await.err(),
@@ -1689,6 +2004,7 @@ mod tests {
             transport_id: "egress-rpc".into(),
             request_id: "egress-request".into(),
             bound: attempt,
+            actor_recovery: false,
         };
         let authority = peer.current_egress(&query).await.unwrap();
         assert_eq!(authority.receipt(), &expected);

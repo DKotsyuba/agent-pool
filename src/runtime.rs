@@ -35,6 +35,8 @@ type SharedStore = Arc<Mutex<Store>>;
 enum ManagedWork {
     Bootstrap(String),
     Intent(String),
+    Egress(String),
+    EgressScope(String),
 }
 #[derive(Default)]
 struct ManagedActivity {
@@ -660,6 +662,700 @@ mod managed_dispatch {
             }
         }
     }
+}
+
+/// Egress performs Run reads and Bridge calls outside the Store mutex.
+mod managed_egress_dispatch {
+    use super::*;
+    use crate::managed_egress::{Frozen, OwnerClient, OwnerFailure, State, Target};
+    use crate::managed_run::{ActorRecovery, CurrentAuthority, EgressQuery, RunError, RunPeer};
+    use crate::managed_state::{RunEndpointPin, RunPin};
+    use std::{future::Future, pin::Pin};
+
+    type Response<'a, T> = Pin<Box<dyn Future<Output = Result<T, RunError>> + Send + 'a>>;
+    pub(super) trait CurrentClient {
+        fn endpoint(&self) -> RunEndpointPin;
+        fn current_pin(&self) -> Response<'_, RunPin>;
+        fn current<'a>(&'a self, query: &'a EgressQuery) -> Response<'a, CurrentAuthority>;
+    }
+    impl CurrentClient for RunPeer {
+        fn endpoint(&self) -> RunEndpointPin {
+            self.endpoint_pin()
+        }
+        fn current_pin(&self) -> Response<'_, RunPin> {
+            Box::pin(async move { RunPeer::current_pin(self, "attempt_current_egress_v1").await })
+        }
+        fn current<'a>(&'a self, query: &'a EgressQuery) -> Response<'a, CurrentAuthority> {
+            Box::pin(async move { self.current_egress(query).await })
+        }
+    }
+
+    async fn note(
+        store: &SharedStore,
+        lease: &ManagedLease,
+        id: &str,
+        reason: &'static str,
+    ) -> Result<(), Fault> {
+        let id = id.to_owned();
+        stored_managed(store, lease, move |store| {
+            store.egress_attention(&id, reason)
+        })
+        .await
+    }
+    fn require_effect_lease(lease: &ManagedLease, id: &str) -> Result<(), Fault> {
+        if lease._inner.work != ManagedWork::Egress(id.into()) {
+            return Err(Fault::Unauthorized);
+        }
+        Ok(())
+    }
+    fn actor_reason(error: RunError) -> &'static str {
+        match error {
+            RunError::ActorRecovery(ActorRecovery::AwaitingRootHook) => "awaiting_root_hook",
+            RunError::ActorRecovery(ActorRecovery::RelaunchRequired) => "actor_relaunch_required",
+            RunError::ActorRecovery(ActorRecovery::Unavailable) => "actor_unavailable",
+            RunError::NotReady => "attempt_not_ready",
+            _ => "binding_unavailable",
+        }
+    }
+    fn bridge_reason(error: OwnerFailure) -> &'static str {
+        match error {
+            OwnerFailure::RelaunchRequired => "relaunch_required",
+            OwnerFailure::NotSent(reason) => reason,
+            OwnerFailure::Unknown => "outcome_unknown",
+        }
+    }
+
+    /// Retry a pinned currentness key until Run fences it as stale after relaunch.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "The pre-I/O pins and original event seed remain distinct"
+    )]
+    pub(super) async fn freeze_target<R: CurrentClient>(
+        store: &SharedStore,
+        lease: &ManagedLease,
+        target: Target,
+        prefix: String,
+        run: &R,
+        bridge_pin: crate::managed_bridge::BridgePin,
+        audience: String,
+    ) -> Result<Option<Frozen>, Fault> {
+        let id = target.seed.effect_id.clone();
+        require_effect_lease(lease, &id)?;
+        let bridge = bridge_pin.clone();
+        let endpoint = run.endpoint();
+        stored_managed(store, lease, move |store| {
+            store.managed_pin_routes(&bridge, &endpoint)
+        })
+        .await?;
+        let run_pin = match run.current_pin().await {
+            Ok(pin) => pin,
+            Err(error) => {
+                note(store, lease, &id, actor_reason(error)).await?;
+                return Ok(None);
+            }
+        };
+        let probing = target.clone();
+        let discovered = run_pin.clone();
+        let (request_id, run_pin, was_uncertain) =
+            match stored_managed(store, lease, move |store| {
+                store.egress_probe(&probing, &discovered)
+            })
+            .await
+            {
+                Ok(probe) => probe,
+                Err(_) => {
+                    note(store, lease, &id, "binding_unavailable").await?;
+                    return Ok(None);
+                }
+            };
+        let stage_id = request_id.clone();
+        let stage_effect = id.clone();
+        let bound = target.binding.attempt.clone();
+        let pinned = run_pin.clone();
+        let query = match stored_managed(store, lease, move |store| {
+            store.egress_stage(
+                &stage_effect,
+                &pinned,
+                &bound,
+                &stage_id,
+                &crate::domain::id(),
+            )
+        })
+        .await
+        {
+            Ok(query) => query,
+            Err(_) => {
+                note(store, lease, &id, "capability_missing").await?;
+                return Ok(None);
+            }
+        };
+        let marked_effect = id.clone();
+        let marked_request = request_id.clone();
+        match stored_managed(store, lease, move |store| {
+            store.egress_probe_inflight(&marked_effect, &marked_request, true)
+        })
+        .await
+        {
+            Ok(()) => {}
+            Err(Fault::Stale) => return Ok(None),
+            Err(error) => return Err(error),
+        }
+        let authority = match run.current(&query).await {
+            Ok(_) if was_uncertain => {
+                // This may be a replay of a receipt issued before the lost
+                // response or restart; only a new Run observation is fresh.
+                let key = id.clone();
+                let old = request_id.clone();
+                match stored_managed(store, lease, move |store| {
+                    store.egress_reset_probe(&key, &old)
+                })
+                .await
+                {
+                    Ok(()) | Err(Fault::Stale) => {}
+                    Err(fault) => return Err(fault),
+                }
+                note(store, lease, &id, "binding_unavailable").await?;
+                return Ok(None);
+            }
+            Ok(authority) => authority,
+            Err(error) => {
+                if error == RunError::DifferentLineage {
+                    let key = id.clone();
+                    stored_managed(store, lease, move |store| {
+                        store.egress_not_delivered(&key, "different_lineage")
+                    })
+                    .await?;
+                    return Ok(None);
+                }
+                if error == RunError::BindingStale {
+                    let key = id.clone();
+                    let old = request_id.clone();
+                    match stored_managed(store, lease, move |store| {
+                        store.egress_reset_probe(&key, &old)
+                    })
+                    .await
+                    {
+                        Ok(()) | Err(Fault::Stale) => {}
+                        Err(fault) => return Err(fault),
+                    }
+                } else if matches!(error, RunError::NotReady | RunError::ActorRecovery(_)) {
+                    // A correlated refusal proves this key has no receipt yet.
+                    let key = id.clone();
+                    let same = request_id.clone();
+                    match stored_managed(store, lease, move |store| {
+                        store.egress_probe_inflight(&key, &same, false)
+                    })
+                    .await
+                    {
+                        Ok(()) | Err(Fault::Stale) => {}
+                        Err(fault) => return Err(fault),
+                    }
+                }
+                note(store, lease, &id, actor_reason(error)).await?;
+                return Ok(None);
+            }
+        };
+        let different_lineage =
+            authority.receipt().lineage_root_id != target.binding.attempt.lineage_root_id;
+        let frozen_target = target.clone();
+        let frozen_pin = run_pin.clone();
+        let frozen_bridge = bridge_pin.clone();
+        let result = stored_managed(store, lease, move |store| {
+            store.egress_freeze(
+                &frozen_target,
+                &authority,
+                &frozen_pin,
+                &frozen_bridge,
+                &audience,
+            )
+        })
+        .await;
+        match result {
+            Ok(frozen) => Ok(Some(frozen)),
+            Err(error) => {
+                let key = id.clone();
+                let close = request_id.clone();
+                let _ = stored_managed(store, lease, move |store| {
+                    store.egress_reset_probe(&key, &close)
+                })
+                .await;
+                if error == Fault::Forbidden && different_lineage {
+                    let key = id.clone();
+                    stored_managed(store, lease, move |store| {
+                        store.egress_not_delivered(&key, "different_lineage")
+                    })
+                    .await?;
+                } else if error == Fault::Forbidden {
+                    note(store, lease, &id, "binding_unavailable").await?;
+                } else if error == Fault::Stale {
+                    let key = id.clone();
+                    let check_prefix = prefix.clone();
+                    let latest = stored_managed(store, lease, move |store| {
+                        store.egress_target(&key, &check_prefix)
+                    })
+                    .await;
+                    if matches!(latest, Err(Fault::Stale)) {
+                        let key = id.clone();
+                        stored_managed(store, lease, move |store| {
+                            store.egress_not_delivered(&key, "member_removed")
+                        })
+                        .await?;
+                    } else {
+                        note(store, lease, &id, "binding_unavailable").await?;
+                    }
+                } else {
+                    note(store, lease, &id, "route_unavailable").await?;
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    /// The only repeatable send is a positively known-unsent original target.
+    pub(super) async fn publish<C: OwnerClient + Clone + 'static>(
+        store: &SharedStore,
+        lease: &ManagedLease,
+        frozen: Frozen,
+        client: C,
+    ) -> Result<(), Fault> {
+        let id = frozen.seed.effect_id.clone();
+        require_effect_lease(lease, &id)?;
+        let check = client.clone();
+        let expected = frozen.bridge_pin.route.component_store_id.clone();
+        let capability_lease = lease.clone();
+        let caps = tokio::task::spawn_blocking(move || {
+            let _lease = capability_lease;
+            check.capabilities(&expected)
+        })
+        .await
+        .map_err(|_| Fault::Unavailable)?;
+        if let Err(error) = caps {
+            return note(
+                store,
+                lease,
+                &id,
+                if error == OwnerFailure::Unknown {
+                    "route_unavailable"
+                } else {
+                    bridge_reason(error)
+                },
+            )
+            .await;
+        }
+        let key = id.clone();
+        let (frozen, dispatch) =
+            match stored_managed(store, lease, move |store| store.egress_begin_publish(&key)).await
+            {
+                Ok(value) => value,
+                Err(Fault::Stale) => return Ok(()),
+                Err(error) => return Err(error),
+            };
+        let worker = client.clone();
+        let sent = frozen.clone();
+        let correlation = dispatch.clone();
+        let bridge_lease = lease.clone();
+        let result = match tokio::task::spawn_blocking(move || {
+            let _lease = bridge_lease;
+            worker.publish(&correlation, &sent)
+        })
+        .await
+        {
+            Ok(value) => value,
+            Err(_) => {
+                note(store, lease, &id, "outcome_unknown").await?;
+                return Ok(());
+            }
+        };
+        match result {
+            Ok(result) => {
+                let key = id.clone();
+                let correlation = dispatch.clone();
+                let recorded = stored_managed(store, lease, move |store| {
+                    store
+                        .egress_result(&key, Some(&correlation), &result, false)
+                        .map(|_| ())
+                })
+                .await;
+                match recorded {
+                    Ok(()) | Err(Fault::Stale) => {}
+                    Err(Fault::Conflict | Fault::Invalid) => {
+                        note(store, lease, &id, "outcome_unknown").await?
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(OwnerFailure::RelaunchRequired) => {
+                let key = id.clone();
+                stored_managed(store, lease, move |store| {
+                    store.egress_not_sent(&key, &dispatch, "relaunch_required")
+                })
+                .await?;
+            }
+            Err(OwnerFailure::NotSent(reason)) => {
+                let key = id.clone();
+                stored_managed(store, lease, move |store| {
+                    store.egress_not_sent(&key, &dispatch, reason)
+                })
+                .await?;
+            }
+            Err(OwnerFailure::Unknown) => note(store, lease, &id, "outcome_unknown").await?,
+        }
+        Ok(())
+    }
+
+    /// Unknown custody is looked up or fenced, never automatically republished.
+    pub(super) async fn reconcile<C: OwnerClient + Clone + 'static>(
+        store: &SharedStore,
+        lease: &ManagedLease,
+        frozen: Frozen,
+        client: C,
+        abort: bool,
+    ) -> Result<(), Fault> {
+        let id = frozen.seed.effect_id.clone();
+        require_effect_lease(lease, &id)?;
+        let (request, original) = if abort {
+            let key = id.clone();
+            let (frozen, request) =
+                stored_managed(store, lease, move |store| store.egress_begin_abort(&key)).await?;
+            (request, frozen)
+        } else {
+            (crate::domain::id(), frozen)
+        };
+        let worker = client.clone();
+        let call = original.clone();
+        let bridge_lease = lease.clone();
+        let result = match tokio::task::spawn_blocking(move || {
+            let _lease = bridge_lease;
+            if abort {
+                worker.abort(&request, &call)
+            } else {
+                worker.lookup(&request, &call)
+            }
+        })
+        .await
+        {
+            Ok(value) => value,
+            Err(_) => {
+                note(store, lease, &id, "outcome_unknown").await?;
+                return Ok(());
+            }
+        };
+        match result {
+            Ok(result) => {
+                let key = id.clone();
+                let recorded = stored_managed(store, lease, move |store| {
+                    store.egress_result(&key, None, &result, abort)
+                })
+                .await;
+                match recorded {
+                    Ok(_) | Err(Fault::Stale) => {}
+                    Err(Fault::Conflict | Fault::Invalid) => {
+                        note(store, lease, &id, "outcome_unknown").await?
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(OwnerFailure::RelaunchRequired) => {
+                note(store, lease, &id, "relaunch_required").await?
+            }
+            Err(_) => note(store, lease, &id, "outcome_unknown").await?,
+        }
+        Ok(())
+    }
+
+    /// A retired scope is compacted only after all local effects are terminal.
+    pub(super) async fn scope<C: OwnerClient + Clone + 'static>(
+        store: &SharedStore,
+        lease: &ManagedLease,
+        plan: crate::managed_egress::ScopePlan,
+        client: C,
+    ) -> Result<(), Fault> {
+        if lease._inner.work != ManagedWork::EgressScope(plan.producer_scope.clone()) {
+            return Err(Fault::Unauthorized);
+        }
+        let expected = plan.bridge_pin.route.component_store_id.clone();
+        let check = client.clone();
+        let check_lease = lease.clone();
+        if !matches!(
+            tokio::task::spawn_blocking(move || {
+                let _lease = check_lease;
+                check.capabilities(&expected)
+            })
+            .await,
+            Ok(Ok(()))
+        ) {
+            return Ok(());
+        }
+        let work = client.clone();
+        let scoped = plan.clone();
+        let scoped_lease = lease.clone();
+        if plan.needs_retire {
+            let result = tokio::task::spawn_blocking(move || {
+                let _lease = scoped_lease;
+                work.retire(&scoped.retire_request_id, &scoped)
+            })
+            .await;
+            if let Ok(Ok(receipt)) = result {
+                match stored_managed(store, lease, move |store| {
+                    store.egress_scope_retired(&plan, &receipt)
+                })
+                .await
+                {
+                    Ok(()) | Err(Fault::Stale | Fault::Conflict | Fault::Invalid) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        } else {
+            let result = tokio::task::spawn_blocking(move || {
+                let _lease = scoped_lease;
+                work.compact(&crate::domain::id(), &scoped)
+            })
+            .await;
+            if let Ok(Ok(receipt)) = result {
+                match stored_managed(store, lease, move |store| {
+                    store.egress_scope_compacted(&plan, &receipt)
+                })
+                .await
+                {
+                    Ok(()) | Err(Fault::Stale | Fault::Conflict | Fault::Invalid) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// One managed effect; disabling new egress never turns uncertain recovery into a resend.
+    pub(super) async fn drive(
+        store: &SharedStore,
+        config: &Config,
+        effect: &Effect,
+        activity: &Arc<ManagedActivity>,
+    ) -> Result<(), Fault> {
+        let id = effect.effect_id.clone();
+        let Some(lease) = activity.acquire(ManagedWork::Egress(id.clone()))? else {
+            return Ok(());
+        };
+        let key = id.clone();
+        let state = stored_managed(store, &lease, move |store| store.egress_state(&key)).await?;
+        let Some(mut state) = state else {
+            // Pre-v10 unknown work has no event-bound seed and is never published on the new route.
+            return settle(
+                store,
+                id,
+                if effect.state == "inflight" {
+                    "refused"
+                } else {
+                    "unknown"
+                },
+            )
+            .await;
+        };
+        let transport = config.managed_run_transport.as_ref();
+        if state == State::Pending {
+            let Some(transport) = transport.filter(|value| value.egress_enabled) else {
+                return note(store, &lease, &id, "route_unavailable").await;
+            };
+            let prefix = transport
+                .producer_scope_prefix
+                .clone()
+                .ok_or(Fault::Invalid)?;
+            let key = id.clone();
+            let check_prefix = prefix.clone();
+            let target = match stored_managed(store, &lease, move |store| {
+                store.egress_target(&key, &check_prefix)
+            })
+            .await
+            {
+                Ok(target) => target,
+                Err(Fault::Stale) => {
+                    let key = id.clone();
+                    return stored_managed(store, &lease, move |store| {
+                        store.egress_not_delivered(&key, "member_removed")
+                    })
+                    .await;
+                }
+                Err(_) => return note(store, &lease, &id, "binding_unavailable").await,
+            };
+            let run = match RunPeer::from_config(config, &target.binding.pool_store_id) {
+                Ok(run) => run,
+                Err(_) => return note(store, &lease, &id, "route_unavailable").await,
+            };
+            if run.route != target.binding.run_route
+                || run.bridge_route != target.binding.bridge_route
+            {
+                return note(store, &lease, &id, "route_unavailable").await;
+            }
+            let cfg = config.clone();
+            let route = target.binding.bridge_route.clone();
+            let (bridge, bridge_pin) = match tokio::task::spawn_blocking(move || {
+                crate::managed_bridge::SdkBridge::capture(&cfg, route)
+            })
+            .await
+            .map_err(|_| Fault::Unavailable)?
+            {
+                Ok(value) => value,
+                Err(_) => return note(store, &lease, &id, "route_unavailable").await,
+            };
+            if let Some(frozen) = freeze_target(
+                store,
+                &lease,
+                target,
+                prefix,
+                &run,
+                bridge_pin,
+                config.bridge_audience.clone(),
+            )
+            .await?
+            {
+                return publish(store, &lease, frozen, bridge).await;
+            }
+            return Ok(());
+        }
+        if state == State::Publishing {
+            note(store, &lease, &id, "outcome_unknown").await?;
+            state = State::Unknown;
+        }
+        if matches!(
+            state,
+            State::Accepted | State::Aborted | State::NotDelivered
+        ) {
+            return Ok(());
+        }
+        let key = id.clone();
+        let frozen = stored_managed(store, &lease, move |store| store.egress_frozen(&key)).await?;
+        let cfg = config.clone();
+        let pin = frozen.bridge_pin.clone();
+        let bridge = match tokio::task::spawn_blocking(move || {
+            crate::managed_bridge::SdkBridge::recover(&cfg, &pin)
+        })
+        .await
+        .map_err(|_| Fault::Unavailable)?
+        {
+            Ok(value) => value,
+            Err(_) => return note(store, &lease, &id, "route_unavailable").await,
+        };
+        let key = id.clone();
+        let draining = stored_managed(store, &lease, move |store| {
+            store.egress_scope_draining(&key)
+        })
+        .await?;
+        if matches!(state, State::Unknown | State::AbortPending)
+            || (state == State::KnownUnsent && draining && !frozen.seed.final_notice)
+        {
+            return reconcile(
+                store,
+                &lease,
+                frozen,
+                bridge,
+                state == State::AbortPending || draining,
+            )
+            .await;
+        }
+        if !transport.is_some_and(|value| {
+            value.egress_enabled
+                && value
+                    .producer_scope_prefix
+                    .as_deref()
+                    .is_some_and(|prefix| frozen.seed.producer_scope.starts_with(prefix))
+        }) {
+            return note(store, &lease, &id, "route_unavailable").await;
+        }
+        let configured =
+            match RunPeer::from_config(config, &frozen.intent.target_binding.pool_store_id) {
+                Ok(value) => value,
+                Err(_) => return note(store, &lease, &id, "route_unavailable").await,
+            };
+        if configured.endpoint_pin() != frozen.run_pin.endpoint() {
+            return note(store, &lease, &id, "route_unavailable").await;
+        }
+        publish(store, &lease, frozen, bridge).await
+    }
+}
+
+/// Retire one settled scope per cycle; unresolved effects never block other scopes.
+async fn recover_egress_scope(
+    config: &Config,
+    store: &SharedStore,
+    activity: &Arc<ManagedActivity>,
+) -> Result<(), Fault> {
+    let Some(transport) = config.managed_run_transport.as_ref() else {
+        return Ok(());
+    };
+    let Some((scope, state)) = stored(store, |store| store.egress_next_scope()).await? else {
+        return Ok(());
+    };
+    if state == "draining" && !transport.egress_enabled {
+        return Ok(());
+    }
+    let Some(lease) = activity.acquire(ManagedWork::EgressScope(scope.clone()))? else {
+        return Ok(());
+    };
+    let source = stored_managed(store, &lease, |store| store.managed_store_id()).await?;
+    if transport.egress_enabled
+        && transport.producer_scope_prefix.as_deref() != Some(format!("pool/{source}/").as_str())
+    {
+        return Ok(());
+    }
+    let run = match crate::managed_run::RunPeer::from_config(config, &source) {
+        Ok(value) => value,
+        Err(_) => return Ok(()),
+    };
+    let cfg = config.clone();
+    let route = run.bridge_route.clone();
+    let (client, pin) = match tokio::task::spawn_blocking(move || {
+        crate::managed_bridge::SdkBridge::capture(&cfg, route)
+    })
+    .await
+    {
+        Ok(Ok(value)) => value,
+        _ => return Ok(()),
+    };
+    let pin_for_store = pin.clone();
+    let endpoint = run.endpoint_pin();
+    if stored_managed(store, &lease, move |store| {
+        store.managed_pin_routes(&pin_for_store, &endpoint)
+    })
+    .await
+    .is_err()
+    {
+        return Ok(());
+    }
+    let scope_id = scope.clone();
+    let pin_for_store = pin.clone();
+    let audience = config.bridge_audience.clone();
+    let plan = match stored_managed(store, &lease, move |store| {
+        store.egress_prepare_scope(&scope_id, &pin_for_store, &audience)
+    })
+    .await
+    {
+        Ok(value) => value,
+        Err(_) => return Ok(()),
+    };
+    managed_egress_dispatch::scope(store, &lease, plan, client).await
+}
+
+/// Native Run deliveries never fall through to the legacy Bridge route.
+async fn dispatch_effect(
+    store: &SharedStore,
+    config: &Config,
+    effect_value: Effect,
+    reconcile: bool,
+    activity: &Arc<ManagedActivity>,
+) -> Result<(), Fault> {
+    if matches!(effect_value.work, Work::Deliver { .. }) && effect_value.member_id.is_some() {
+        let id = effect_value.effect_id.clone();
+        let managed = stored(store, move |store| {
+            Ok(store
+                .effect_binding(&id)?
+                .is_some_and(|(binding, _)| binding.run_id.is_some()))
+        })
+        .await?;
+        if managed {
+            return managed_egress_dispatch::drive(store, config, &effect_value, activity).await;
+        }
+    }
+    effect(store, config, effect_value, reconcile).await
 }
 
 /// Executes one actual MCP invocation against an already running resident.
@@ -1725,7 +2421,7 @@ async fn effect(
     let single_batch = effect.is_single_batch()?;
     let state = match &effect.work {
         Work::Deliver { .. } => {
-            if !reconcile && effect.member_id.is_some() {
+            if effect.member_id.is_some() {
                 let effect_id = effect.effect_id.clone();
                 let binding = stored(store, move |store| store.effect_binding(&effect_id)).await?;
                 if binding.is_some_and(|(binding, _)| binding.run_id.is_some()) {
@@ -2406,22 +3102,35 @@ async fn work(
             _ = interval.tick() => (),
         }
         recover_managed(&config, &store, &stopped, &activity).await?;
+        recover_egress_scope(&config, &store, &activity).await?;
         for _ in 0..32 {
             if *stopped.borrow() {
                 return Ok(());
             }
-            let next = stored(&store, |store| store.next_effect()).await?;
+            let managed_enabled = config
+                .managed_run_transport
+                .as_ref()
+                .is_some_and(|transport| transport.egress_enabled);
+            let next = if managed_enabled {
+                stored(&store, |store| store.next_bound_managed_egress()).await?
+            } else {
+                None
+            };
+            let next = match next {
+                Some(value) => Some(value),
+                None => stored(&store, |store| store.next_effect()).await?,
+            };
             let Some(next) = next else {
                 break;
             };
-            effect(&store, &config, next, false).await?;
+            dispatch_effect(&store, &config, next, false, &activity).await?;
         }
         let pending = stored(&store, |store| store.pending_unknown()).await?;
         for pending in pending {
             if *stopped.borrow() {
                 return Ok(());
             }
-            effect(&store, &config, pending, true).await?;
+            dispatch_effect(&store, &config, pending, true, &activity).await?;
         }
         let targets = stored(&store, |store| store.observation_targets()).await?;
         for offset in 0..targets.len().min(20) {
@@ -6668,6 +7377,502 @@ mod tests {
         assert_eq!(generation, 2u64.to_be_bytes());
         assert_eq!(context, "invalidated");
         assert_eq!(revision, 1);
+        Ok(())
+    }
+
+    /// Synthetic Run and Bridge exercise relaunch, exact-target retry, unknown and retirement.
+    #[tokio::test]
+    async fn managed_egress_fake_run_bridge_recovery_never_resends_unknown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::managed_egress::tests::{add_seed, pin, receipt, result};
+        use crate::managed_egress::{Frozen, OwnerClient, OwnerFailure, ScopePlan, State};
+        use crate::managed_state::tests::{
+            fake_bridge_pin, fake_run_endpoint, fixture, index_managed_member,
+        };
+        use bridge_sdk::bridge_protocol::{
+            RetireReceipt, RetireResult, RetirementAction,
+            managed_owner::{
+                CompactManagedOwnerScopeResultV1, ManagedOwnerResultV1, ManagedOwnerStateV1,
+            },
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Clone)]
+        struct FakeRun {
+            binding: crate::managed_state::ManagedBinding,
+            incarnation: crate::managed_state::Incarnation,
+            requests: Arc<Mutex<Vec<String>>>,
+        }
+        impl managed_egress_dispatch::CurrentClient for FakeRun {
+            fn endpoint(&self) -> crate::managed_state::RunEndpointPin {
+                fake_run_endpoint(&self.binding)
+            }
+            fn current_pin(
+                &self,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                crate::managed_state::RunPin,
+                                crate::managed_run::RunError,
+                            >,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async move { Ok(pin(&self.binding)) })
+            }
+            fn current<'a>(
+                &'a self,
+                query: &'a crate::managed_run::EgressQuery,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                crate::managed_run::CurrentAuthority,
+                                crate::managed_run::RunError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move {
+                    let call = {
+                        let mut requests = self
+                            .requests
+                            .lock()
+                            .map_err(|_| crate::managed_run::RunError::Unknown)?;
+                        requests.push(query.fixture_request_id().into());
+                        requests.len()
+                    };
+                    if call <= 2 {
+                        return Err(crate::managed_run::RunError::ActorRecovery(
+                            crate::managed_run::ActorRecovery::AwaitingRootHook,
+                        ));
+                    }
+                    if call == 3 {
+                        return Err(crate::managed_run::RunError::ActorRecovery(
+                            crate::managed_run::ActorRecovery::RelaunchRequired,
+                        ));
+                    }
+                    if call == 4 {
+                        return Err(crate::managed_run::RunError::BindingStale);
+                    }
+                    if call == 5 {
+                        return Err(crate::managed_run::RunError::Unknown);
+                    }
+                    let current = receipt(
+                        &self.binding,
+                        &self.incarnation,
+                        "next",
+                        2,
+                        &format!("receipt-{call}"),
+                    );
+                    query
+                        .fixture_authority(current)
+                        .map_err(|_| crate::managed_run::RunError::Unknown)
+                })
+            }
+        }
+        #[derive(Clone, Default)]
+        struct FakeOwner {
+            publishes: Arc<AtomicUsize>,
+            lookups: Arc<AtomicUsize>,
+            aborts: Arc<AtomicUsize>,
+            retires: Arc<AtomicUsize>,
+            compacts: Arc<AtomicUsize>,
+            digests: Arc<Mutex<Vec<String>>>,
+            retire_keys: Arc<Mutex<Vec<String>>>,
+        }
+        impl OwnerClient for FakeOwner {
+            fn capabilities(&self, _: &str) -> Result<(), OwnerFailure> {
+                Ok(())
+            }
+            fn publish(
+                &self,
+                _: &str,
+                frozen: &Frozen,
+            ) -> Result<ManagedOwnerResultV1, OwnerFailure> {
+                self.digests
+                    .lock()
+                    .map_err(|_| OwnerFailure::Unknown)?
+                    .push(frozen.digest.clone());
+                if self.publishes.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(result(
+                        frozen,
+                        ManagedOwnerStateV1::KnownUnsent,
+                        Some("qualification_pending"),
+                    ))
+                } else {
+                    Err(OwnerFailure::Unknown)
+                }
+            }
+            fn lookup(
+                &self,
+                _: &str,
+                frozen: &Frozen,
+            ) -> Result<ManagedOwnerResultV1, OwnerFailure> {
+                self.lookups.fetch_add(1, Ordering::SeqCst);
+                Ok(result(
+                    frozen,
+                    ManagedOwnerStateV1::Unknown,
+                    Some("native_uncertain"),
+                ))
+            }
+            fn abort(
+                &self,
+                _: &str,
+                frozen: &Frozen,
+            ) -> Result<ManagedOwnerResultV1, OwnerFailure> {
+                if self.aborts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(OwnerFailure::Unknown)
+                } else {
+                    Ok(result(frozen, ManagedOwnerStateV1::Aborted, None))
+                }
+            }
+            fn retire(
+                &self,
+                request: &str,
+                scope: &ScopePlan,
+            ) -> Result<RetireResult, OwnerFailure> {
+                self.retire_keys
+                    .lock()
+                    .map_err(|_| OwnerFailure::Unknown)?
+                    .push(request.into());
+                if self.retires.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(OwnerFailure::Unknown);
+                }
+                Ok(RetireResult {
+                    receipt: RetireReceipt {
+                        producer: scope.bridge_pin.producer.clone(),
+                        request_id: scope.retire_request_id.clone(),
+                        scope_key: scope.producer_scope.clone(),
+                        action: RetirementAction::RetireUnhanded,
+                        retired_at_ms: 1,
+                        disposed: 0,
+                        already_terminal: 1,
+                        preserved_possible_effect: 0,
+                        preserved_unhanded: 0,
+                    },
+                    replayed: false,
+                })
+            }
+            fn compact(
+                &self,
+                _: &str,
+                scope: &ScopePlan,
+            ) -> Result<CompactManagedOwnerScopeResultV1, OwnerFailure> {
+                self.compacts.fetch_add(1, Ordering::SeqCst);
+                Ok(CompactManagedOwnerScopeResultV1 {
+                    version: 1,
+                    store_id: scope.bridge_pin.route.component_store_id.clone(),
+                    producer: scope.bridge_pin.producer.clone(),
+                    producer_scope: scope.producer_scope.clone(),
+                    compacted: 1,
+                    remaining: 0,
+                })
+            }
+        }
+        let (_dir, mut initial, binding, incarnation, _run) = fixture();
+        index_managed_member(initial.test_db(), &binding);
+        add_seed(&mut initial, &binding, "fake-effect", "payload", false);
+        let store = Arc::new(Mutex::new(initial));
+        let activity = Arc::new(ManagedActivity::default());
+        let lease = activity
+            .acquire(ManagedWork::Egress("fake-effect".into()))?
+            .ok_or("effect lease")?;
+        let prefix = format!("pool/{}/", binding.pool_store_id);
+        let target = stored_managed(&store, &lease, {
+            let prefix = prefix.clone();
+            move |store| store.egress_target("fake-effect", &prefix)
+        })
+        .await?;
+        let run = FakeRun {
+            binding: binding.clone(),
+            incarnation,
+            requests: Arc::new(Mutex::new(Vec::new())),
+        };
+        let bridge_pin = fake_bridge_pin(&binding);
+        assert!(
+            managed_egress_dispatch::freeze_target(
+                &store,
+                &lease,
+                target.clone(),
+                prefix.clone(),
+                &run,
+                bridge_pin.clone(),
+                "pool".into()
+            )
+            .await?
+            .is_none()
+        );
+        for _ in 0..2 {
+            assert!(
+                managed_egress_dispatch::freeze_target(
+                    &store,
+                    &lease,
+                    target.clone(),
+                    prefix.clone(),
+                    &run,
+                    bridge_pin.clone(),
+                    "pool".into(),
+                )
+                .await?
+                .is_none()
+            );
+        }
+        let attention = stored_managed(&store, &lease, |store| {
+            Ok(store.test_db().query_row::<String, _, _>(
+                "SELECT attention FROM managed_delivery_outbox WHERE effect_id='fake-effect'",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .await?;
+        assert_eq!(attention, "actor_relaunch_required");
+        let observed = stored_managed(&store,&lease,|store| {
+            let request:crate::observer::Request=serde_json::from_value(serde_json::json!({"schema_version":1,"operation":"get","params":{"pool_id":"pool","section":"deliveries"}})).map_err(|_|Fault::Invalid)?;
+            let crate::observer::Data::Detail(detail)=store.observe(&request)? else{return Err(Fault::Internal)};
+            Ok(detail.view.and_then(|view|view.deliveries.into_iter().find(|delivery|delivery.operation_id=="fake-effect")).map(|delivery|(delivery.attention,delivery.attention_subject)))
+        }).await?;
+        assert_eq!(
+            observed,
+            Some((Some("relaunch_required".into()), Some("member".into())))
+        );
+        let resident_attention = stored_managed(&store, &lease, |store| {
+            store.egress_attention("fake-effect", "relaunch_required")?;
+            crate::managed_egress::owner_attention(store.test_db(), "fake-effect")
+        })
+        .await?;
+        assert_eq!(
+            resident_attention,
+            (Some("relaunch_required".into()), Some("resident".into()))
+        );
+        // Run reports the old launch stale after relaunch. That call must use
+        // the old key; only the following observation gets a fresh key.
+        assert!(
+            managed_egress_dispatch::freeze_target(
+                &store,
+                &lease,
+                target.clone(),
+                prefix.clone(),
+                &run,
+                bridge_pin.clone(),
+                "pool".into(),
+            )
+            .await?
+            .is_none()
+        );
+        // Lost currentness ACK: look up the original key, but discard a
+        // possibly historical receipt and obtain fresh evidence under a new key.
+        for _ in 0..2 {
+            assert!(
+                managed_egress_dispatch::freeze_target(
+                    &store,
+                    &lease,
+                    target.clone(),
+                    prefix.clone(),
+                    &run,
+                    bridge_pin.clone(),
+                    "pool".into(),
+                )
+                .await?
+                .is_none()
+            );
+        }
+        let frozen = managed_egress_dispatch::freeze_target(
+            &store,
+            &lease,
+            target,
+            prefix,
+            &run,
+            bridge_pin.clone(),
+            "pool".into(),
+        )
+        .await?
+        .ok_or("fresh target")?;
+        let requests = run.requests.lock().map_err(|_| "requests")?.clone();
+        assert_eq!(requests.len(), 7);
+        assert!(requests[..4].iter().all(|id| id == &requests[0]));
+        assert_ne!(requests[0], requests[4]);
+        assert_eq!(requests[4], requests[5]);
+        assert_ne!(requests[5], requests[6]);
+        let bridge = FakeOwner::default();
+        managed_egress_dispatch::publish(&store, &lease, frozen.clone(), bridge.clone()).await?;
+        assert_eq!(
+            stored_managed(&store, &lease, |store| store.egress_state("fake-effect")).await?,
+            Some(State::KnownUnsent)
+        );
+        managed_egress_dispatch::publish(&store, &lease, frozen.clone(), bridge.clone()).await?;
+        assert_eq!(
+            stored_managed(&store, &lease, |store| store.egress_state("fake-effect")).await?,
+            Some(State::Unknown)
+        );
+        managed_egress_dispatch::reconcile(&store, &lease, frozen.clone(), bridge.clone(), false)
+            .await?;
+        assert_eq!(bridge.publishes.load(Ordering::SeqCst), 2);
+        assert_eq!(bridge.lookups.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            bridge.digests.lock().map_err(|_| "digests")?.as_slice(),
+            [frozen.digest.clone(), frozen.digest.clone()]
+        );
+        stored_managed(&store, &lease, |store| {
+            crate::managed_egress::retire_member_scope(store.test_db(), "pool", "member")
+        })
+        .await?;
+        managed_egress_dispatch::reconcile(&store, &lease, frozen.clone(), bridge.clone(), true)
+            .await?;
+        assert_eq!(
+            stored_managed(&store, &lease, |store| store.egress_state("fake-effect")).await?,
+            Some(State::AbortPending)
+        );
+        managed_egress_dispatch::reconcile(&store, &lease, frozen.clone(), bridge.clone(), true)
+            .await?;
+        assert_eq!(
+            stored_managed(&store, &lease, |store| store.egress_state("fake-effect")).await?,
+            Some(State::Aborted)
+        );
+        assert_eq!(bridge.publishes.load(Ordering::SeqCst), 2);
+        drop(lease);
+        let scope_id = frozen.seed.producer_scope.clone();
+        let scope_lease = activity
+            .acquire(ManagedWork::EgressScope(scope_id.clone()))?
+            .ok_or("scope lease")?;
+        let plan = stored_managed(&store, &scope_lease, {
+            let scope_id = scope_id.clone();
+            let bridge_pin = bridge_pin.clone();
+            move |store| store.egress_prepare_scope(&scope_id, &bridge_pin, "pool")
+        })
+        .await?;
+        managed_egress_dispatch::scope(&store, &scope_lease, plan, bridge.clone()).await?;
+        let retiring = stored_managed(&store, &scope_lease, {
+            let scope_id = scope_id.clone();
+            move |store| {
+                Ok(store.test_db().query_row::<String, _, _>(
+                    "SELECT state FROM managed_delivery_scopes WHERE producer_scope=?1",
+                    [scope_id],
+                    |row| row.get(0),
+                )?)
+            }
+        })
+        .await?;
+        assert_eq!(retiring, "retiring");
+        let plan = stored_managed(&store, &scope_lease, {
+            let scope_id = scope_id.clone();
+            let bridge_pin = bridge_pin.clone();
+            move |store| store.egress_prepare_scope(&scope_id, &bridge_pin, "pool")
+        })
+        .await?;
+        managed_egress_dispatch::scope(&store, &scope_lease, plan, bridge.clone()).await?;
+        let plan = stored_managed(&store, &scope_lease, {
+            let scope_id = scope_id.clone();
+            move |store| store.egress_prepare_scope(&scope_id, &bridge_pin, "pool")
+        })
+        .await?;
+        managed_egress_dispatch::scope(&store, &scope_lease, plan, bridge.clone()).await?;
+        assert_eq!(bridge.retires.load(Ordering::SeqCst), 2);
+        {
+            let retire_keys = bridge.retire_keys.lock().map_err(|_| "retire keys")?;
+            assert_eq!(retire_keys.len(), 2);
+            assert_eq!(retire_keys[0], retire_keys[1]);
+        }
+        assert_eq!(bridge.compacts.load(Ordering::SeqCst), 1);
+        let scope_state = stored_managed(&store, &scope_lease, move |store| {
+            Ok(store.test_db().query_row::<String, _, _>(
+                "SELECT state FROM managed_delivery_scopes WHERE producer_scope=?1",
+                [scope_id],
+                |row| row.get(0),
+            )?)
+        })
+        .await?;
+        assert_eq!(scope_state, "compacted");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn final_notice_foreign_lineage_is_definitively_not_delivered()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::managed_egress::tests::{add_seed, pin};
+        use crate::managed_state::tests::{
+            fake_bridge_pin, fake_run_endpoint, fixture, index_managed_member,
+        };
+        struct Foreign {
+            binding: crate::managed_state::ManagedBinding,
+        }
+        impl managed_egress_dispatch::CurrentClient for Foreign {
+            fn endpoint(&self) -> crate::managed_state::RunEndpointPin {
+                fake_run_endpoint(&self.binding)
+            }
+            fn current_pin(
+                &self,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                crate::managed_state::RunPin,
+                                crate::managed_run::RunError,
+                            >,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async move { Ok(pin(&self.binding)) })
+            }
+            fn current<'a>(
+                &'a self,
+                _: &'a crate::managed_run::EgressQuery,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                crate::managed_run::CurrentAuthority,
+                                crate::managed_run::RunError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move { Err(crate::managed_run::RunError::DifferentLineage) })
+            }
+        }
+        let (_dir, mut initial, binding, _incarnation, _run) = fixture();
+        index_managed_member(initial.test_db(), &binding);
+        initial
+            .test_db()
+            .execute("UPDATE members SET current=0 WHERE id='member'", [])?;
+        add_seed(
+            &mut initial,
+            &binding,
+            "final-foreign",
+            "final notice",
+            true,
+        );
+        let store = Arc::new(Mutex::new(initial));
+        let activity = Arc::new(ManagedActivity::default());
+        let lease = activity
+            .acquire(ManagedWork::Egress("final-foreign".into()))?
+            .ok_or("lease")?;
+        let prefix = format!("pool/{}/", binding.pool_store_id);
+        let target = stored_managed(&store, &lease, {
+            let prefix = prefix.clone();
+            move |store| store.egress_target("final-foreign", &prefix)
+        })
+        .await?;
+        let bridge = fake_bridge_pin(&binding);
+        assert!(
+            managed_egress_dispatch::freeze_target(
+                &store,
+                &lease,
+                target,
+                prefix,
+                &Foreign { binding },
+                bridge,
+                "pool".into()
+            )
+            .await?
+            .is_none()
+        );
+        let result=stored_managed(&store,&lease,|store|Ok(store.test_db().query_row::<(String,String),_,_>("SELECT state,attention FROM managed_delivery_outbox WHERE effect_id='final-foreign'",[],|row|Ok((row.get(0)?,row.get(1)?)))?)).await?;
+        assert_eq!(result, ("not_delivered".into(), "different_lineage".into()));
         Ok(())
     }
 

@@ -8,7 +8,7 @@ Confirmed={{ active }} pending={{ pending }}; leader excluded. Section={{ sectio
 Name: {{ member.name|quote }}; role: {{ member.role|quote }}
 Task: {{ member.task|quote }}
 {% endfor %}
-{% for delivery in deliveries %}Operation {{ delivery.operation_id }} {{ delivery.operation }} state={{ delivery.state }}{% if delivery.member_id %} member={{ delivery.member_id }}{% endif %}
+{% for delivery in deliveries %}Operation {{ delivery.operation_id }} {{ delivery.operation }} state={{ delivery.state }}{% if delivery.member_id %} member={{ delivery.member_id }}{% endif %}{% if delivery.attention is defined and delivery.attention %} attention={{ delivery.attention }}{% endif %}{% if delivery.attention_subject is defined and delivery.attention_subject %} attention_subject={{ delivery.attention_subject }}{% endif %}
 {% endfor %}
 {% if section == 'criteria' and pool.acceptance is defined %}{% for criterion in pool.acceptance %}Criterion {{ criterion.id }}: {{ criterion.text|quote }}
 {% endfor %}{% endif %}

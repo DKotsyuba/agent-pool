@@ -959,6 +959,12 @@ pub struct Delivery {
     pub operation: String,
     /// Durable state including awaiting_binding, custody and unknown.
     pub state: String,
+    /// Owner-only bounded managed-egress attention, absent when not applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention: Option<String>,
+    /// Whether a relaunch applies to the removed/current member or the Pool resident.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_subject: Option<String>,
 }
 /// Mutation receipt remains safe for all participants and exact retries.
 #[derive(Clone, Debug, Serialize, Deserialize)]

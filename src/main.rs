@@ -16,6 +16,7 @@ mod managed_bridge;
     reason = "The managed codec also defines shared protocol fingerprints"
 )]
 mod managed_codec;
+mod managed_egress;
 mod managed_ingress;
 #[allow(
     dead_code,

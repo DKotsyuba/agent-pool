@@ -20,7 +20,7 @@ serde_json = { version = "=1.0.154", features = ["float_roundtrip"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "net", "sync", "signal", "time", "process"] }
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
 uuid = { version = "=1.26.1", features = ["v4"] }
-bridge-sdk = { path = "/home/pluto/projects/tmp/codex-agent-codex/agent-mcp/bridge/sdk-snapshots/38b4f655a0711b59/crates/bridge-sdk" }
+bridge-sdk = { path = "/home/pluto/projects/tmp/codex-agent-codex/agent-mcp/bridge/sdk-snapshots/ace211d8d2e68854/crates/bridge-sdk" }
 sha2 = "0.10"
 fs2 = "0.4"
 toml = "0.8"

@@ -44,6 +44,10 @@ bridge_server_sha256 = "00000000000000000000000000000000000000000000000000000000
 # [managed_run_transport]
 # frontend_enabled = false
 # mcp_server = "pool"
+# egress_enabled = false
+# When egress is enabled, explicitly provision this exact Pool store prefix in
+# Bridge and Run. Do not set it while egress is disabled.
+# producer_scope_prefix = "pool/00000000-0000-4000-8000-000000000001/"
 # socket = "/absolute/private/agent-run/attempt.sock"
 # executable = "/absolute/path/to/agent-run"
 # sha256 = "0000000000000000000000000000000000000000000000000000000000000000"

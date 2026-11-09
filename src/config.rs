@@ -78,6 +78,11 @@ pub struct ManagedRunTransport {
     pub frontend_enabled: bool,
     /// Exact MCP server name registered in Bridge's managed tool mapping.
     pub mcp_server: Option<String>,
+    /// Explicitly enable managed owner egress; omission keeps it disabled.
+    #[serde(default)]
+    pub egress_enabled: bool,
+    /// Exact `pool/<pool-store-uuid>/` prefix provisioned in Bridge and Run.
+    pub producer_scope_prefix: Option<String>,
     /// Absolute Run `attempt.sock`, distinct from the legacy Run socket.
     pub socket: PathBuf,
     /// Absolute canonical Run broker executable.
@@ -171,6 +176,21 @@ impl Config {
             }
         }
         if let Some(transport) = &config.managed_run_transport {
+            if transport.egress_enabled {
+                let prefix = transport
+                    .producer_scope_prefix
+                    .as_deref()
+                    .ok_or(Fault::Invalid)?;
+                let store = prefix
+                    .strip_prefix("pool/")
+                    .and_then(|value| value.strip_suffix('/'))
+                    .ok_or(Fault::Invalid)?;
+                if !uuid::Uuid::parse_str(store).is_ok_and(|id| id.to_string() == store) {
+                    return Err(Fault::Invalid);
+                }
+            } else if transport.producer_scope_prefix.is_some() {
+                return Err(Fault::Invalid);
+            }
             if transport.frontend_enabled
                 && (config.managed_run_reader.is_none()
                     || transport.mcp_server.as_ref().is_none_or(|server| {
@@ -489,6 +509,29 @@ producer = "fixture"
         } else {
             assert!(matches!(Config::load(&path), Err(Fault::Invalid)));
         }
+        let missing_prefix = managed.replace(
+            "[managed_run_transport]",
+            "[managed_run_transport]\negress_enabled = true",
+        );
+        fs::write(&path, format!("{base}\n{missing_prefix}"))?;
+        assert!(matches!(Config::load(&path), Err(Fault::Invalid)));
+        let with_prefix=managed.replace("[managed_run_transport]","[managed_run_transport]\negress_enabled = true\nproducer_scope_prefix = \"pool/00000000-0000-4000-8000-000000000001/\"");
+        fs::write(&path, format!("{base}\n{with_prefix}"))?;
+        if cfg!(target_os = "linux") {
+            assert!(
+                Config::load(&path)?
+                    .managed_run_transport
+                    .is_some_and(|value| value.egress_enabled)
+            );
+        }
+        fs::write(
+            &path,
+            format!(
+                "{base}\n{}",
+                with_prefix.replace("000000000001/\"", "000000000001//\"")
+            ),
+        )?;
+        assert!(matches!(Config::load(&path), Err(Fault::Invalid)));
         let enabled = managed.replace(
             "[managed_run_transport]",
             "[managed_run_transport]\nfrontend_enabled = true\nmcp_server = \"pool\"",

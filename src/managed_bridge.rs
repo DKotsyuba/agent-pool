@@ -658,6 +658,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn typed_sdk_adapter_exchanges_with_isolated_b1_peer() {
+        use crate::managed_egress::{OwnerFailure, ScopePlan};
         use sha2::Digest;
         use std::io::{BufRead, BufReader, Write};
         use std::os::unix::{fs::PermissionsExt, net::UnixListener};
@@ -668,21 +669,35 @@ mod tests {
             let listener = UnixListener::bind(socket).unwrap();
             let issuer = "epoch:opaque";
             let digest = "a".repeat(64);
-            for index in 0..8 {
+            for index in 0..11 {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut line = String::new();
                 let count = BufReader::new(stream.try_clone().unwrap())
                     .read_line(&mut line)
                     .unwrap();
-                if index == 0 {
+                if index < 2 {
                     assert_eq!(count, 0);
                     continue;
                 }
                 let request: serde_json::Value = serde_json::from_str(&line).unwrap();
                 let op = request["op"].as_str().unwrap();
-                if index == 7 {
+                if index == 8 {
                     assert_eq!(op, "consume_launch_assertion_v1");
                     let response = serde_json::json!({"api_version":1,"request_id":request["request_id"],"success":true,"result":{"op":op,"value":{"status":"error","error":{"version":1,"store_id":BRIDGE_ID,"code":"relaunch_required","recovery":"none"}}}});
+                    writeln!(stream, "{response}").unwrap();
+                    continue;
+                }
+                if index >= 9 {
+                    assert_eq!(op, "retire_delivery_scope");
+                    assert_eq!(request["request_id"], "retire");
+                    assert_eq!(request["params"]["action"], "retire_unhanded");
+                    let scope = request["params"]["scope_key"].as_str().unwrap();
+                    assert!(scope.starts_with("pool/"));
+                    if index == 9 {
+                        // The retirement may have committed, but its ACK was lost.
+                        continue;
+                    }
+                    let response = serde_json::json!({"api_version":1,"request_id":"retire","success":true,"result":{"op":op,"value":{"receipt":{"producer":"pool","request_id":"retire","scope_key":scope,"action":"retire_unhanded","retired_at_ms":1,"disposed":0,"already_terminal":1,"preserved_possible_effect":0,"preserved_unhanded":0},"replayed":index==10}}});
                     writeln!(stream, "{response}").unwrap();
                     continue;
                 }
@@ -740,7 +755,7 @@ mod tests {
             .env_clear()
             .env("POOL_B1_SYNTHETIC_SOCKET", &socket)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
             .spawn()
             .unwrap();
         let mut process = ChildGuard(process);
@@ -784,6 +799,29 @@ mod tests {
         assert!(matches!(
             wrong_peer.capabilities(),
             Err(BridgeFailure::Unknown)
+        ));
+        let (_fixture_dir, _fixture_store, binding, _incarnation, _run) =
+            crate::managed_state::tests::fixture();
+        let scope = ScopePlan {
+            producer_scope: crate::managed_egress::producer_scope(
+                &binding.pool_store_id,
+                "pool",
+                "member",
+                false,
+            )
+            .unwrap(),
+            bridge_pin: crate::managed_state::tests::fake_bridge_pin(&binding),
+            audience: "pool".into(),
+            retire_request_id: "retire".into(),
+            needs_retire: true,
+        };
+        assert!(matches!(
+            crate::managed_egress::OwnerClient::retire(&wrong_peer, "retire", &scope),
+            Err(OwnerFailure::NotSent(_))
+        ));
+        assert!(matches!(
+            crate::managed_egress::OwnerClient::retire(&bridge, "different", &scope),
+            Err(OwnerFailure::NotSent(_))
         ));
         let issuer = "epoch:opaque";
         let digest = "a".repeat(64);
@@ -859,6 +897,15 @@ mod tests {
             ),
             Err(BridgeFailure::RelaunchRequired)
         ));
+        assert!(matches!(
+            crate::managed_egress::OwnerClient::retire(&bridge, "retire", &scope),
+            Err(OwnerFailure::Unknown)
+        ));
+        let replayed =
+            crate::managed_egress::OwnerClient::retire(&bridge, "retire", &scope).unwrap();
+        assert_eq!(replayed.receipt.scope_key, scope.producer_scope);
+        assert_eq!(replayed.receipt.request_id, "retire");
+        assert!(replayed.replayed);
         assert!(process.0.wait().unwrap().success());
     }
 }
@@ -866,8 +913,8 @@ mod tests {
 /// Adapter to the typed Bridge SDK; deployment still must enable the managed path separately.
 #[derive(Clone)]
 pub(crate) struct SdkBridge {
-    client: bridge_sdk::Client,
-    server_pin: bridge_sdk::attempt::AttemptServerPin,
+    pub(crate) client: bridge_sdk::Client,
+    pub(crate) server_pin: bridge_sdk::attempt::AttemptServerPin,
 }
 impl SdkBridge {
     /// Capture the exact endpoint, build and credential identity without making a network call.

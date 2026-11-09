@@ -497,7 +497,7 @@ pub(crate) fn receipt_matches(
 }
 
 /// A current receipt is useful only with its previously staged exact Run endpoint.
-fn require_staged_current(
+pub(crate) fn require_staged_current(
     db: &Connection,
     authority: &crate::managed_run::CurrentAuthority,
     receipt: &CurrentReceipt,
@@ -538,6 +538,7 @@ fn rebind_inner(
     receipt_id: &str,
     purpose: &str,
     authority: Option<&crate::managed_run::CurrentAuthority>,
+    final_effect_id: Option<&str>,
 ) -> Result<u64, Fault> {
     if !matches!(purpose, "ingress" | "egress")
         || old.binding_generation == 0
@@ -583,7 +584,12 @@ fn rebind_inner(
         params![old.member_id, old.pool_id],
         |r| r.get(0),
     )?;
-    if !is_current {
+    let final_target = if let Some(effect_id) = final_effect_id {
+        purpose == "egress" && tx.query_row("SELECT EXISTS(SELECT 1 FROM managed_delivery_seeds s JOIN managed_delivery_outbox o ON o.effect_id=s.effect_id JOIN members m ON m.id=s.member_id WHERE s.effect_id=?1 AND s.pool_id=?2 AND s.member_id=?3 AND s.final_notice=1 AND m.current=0 AND o.state='pending')",params![effect_id,old.pool_id,old.member_id],|row|row.get(0))?
+    } else {
+        false
+    };
+    if !is_current && !final_target {
         return Err(Fault::Stale);
     }
     let incarnation_json = encoded(incarnation)?;
@@ -661,6 +667,29 @@ pub(crate) fn rebind_authenticated(
         &authority.receipt().receipt_id,
         purpose,
         Some(authority),
+        None,
+    )
+}
+
+/// E10 permits only a final-notice seed to refresh its exact removed lineage.
+pub(crate) fn rebind_final_authenticated(
+    db: &mut Connection,
+    authority: &crate::managed_run::CurrentAuthority,
+    old: &ManagedBinding,
+    new: &ManagedBinding,
+    incarnation: &Incarnation,
+    effect_id: &str,
+) -> Result<u64, Fault> {
+    rebind_inner(
+        db,
+        authority,
+        old,
+        new,
+        incarnation,
+        &authority.receipt().receipt_id,
+        "egress",
+        Some(authority),
+        Some(effect_id),
     )
 }
 
@@ -674,7 +703,17 @@ fn rebind(
     receipt_id: &str,
     purpose: &str,
 ) -> Result<u64, Fault> {
-    rebind_inner(db, run, old, new, incarnation, receipt_id, purpose, None)
+    rebind_inner(
+        db,
+        run,
+        old,
+        new,
+        incarnation,
+        receipt_id,
+        purpose,
+        None,
+        None,
+    )
 }
 
 /// An authenticated observation preserves a verified ballot only for the exact incarnation.
@@ -2387,6 +2426,8 @@ pub(crate) mod tests {
             managed_run_transport: Some(crate::config::ManagedRunTransport {
                 frontend_enabled: false,
                 mcp_server: None,
+                egress_enabled: false,
+                producer_scope_prefix: None,
                 socket: "/fixture/attempt.sock".into(),
                 executable: "/fixture/run".into(),
                 sha256: "a".repeat(64),
@@ -6182,6 +6223,7 @@ pub(crate) mod tests {
             )
             .unwrap();
             db.execute("INSERT INTO managed_contexts(id,namespace_id,intent_id,invocation_key,command,context,digest,snapshot,state) VALUES('old-context','namespace','old-intent','old-inv','legacy-command','{}','digest','legacy-snapshot','invalidated')",[]).unwrap();
+            crate::managed_egress::drop_test_schema(db).unwrap();
             db.execute_batch("DROP TABLE managed_invalidated_ballots; DROP INDEX managed_current_state_owner; ALTER TABLE managed_current_requests DROP COLUMN owner_intent; ALTER TABLE managed_bindings DROP COLUMN incarnation; DROP INDEX managed_bootstrap_state; DROP INDEX managed_intent_state; PRAGMA user_version=8;").unwrap();
         }
         drop(store);
@@ -6190,7 +6232,7 @@ pub(crate) mod tests {
         assert_eq!(
             db.query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap(),
-            9
+            10
         );
         let payloads:(String,String,String)=db.query_row("SELECT b.command,c.command,c.snapshot FROM managed_bootstrap b JOIN managed_contexts c ON c.invocation_key=b.invocation_key WHERE b.id='old'",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
         assert_eq!(payloads, ("{}".into(), "{}".into(), "{}".into()));
@@ -6236,6 +6278,7 @@ pub(crate) mod tests {
                 1,
             );
             db.execute("INSERT INTO managed_rebinds(receipt_id,member,old_binding,new_binding,generation_before,generation_after) VALUES('fixture-initial-old-context','member',?1,?1,?2,?2)",params![encoded(&binding).unwrap(),sqlite_generation(1)]).unwrap();
+            crate::managed_egress::drop_test_schema(db).unwrap();
             db.execute_batch("DROP TABLE managed_invalidated_ballots; DROP INDEX managed_current_state_owner; ALTER TABLE managed_current_requests DROP COLUMN owner_intent; ALTER TABLE managed_bindings DROP COLUMN incarnation; DROP INDEX managed_bootstrap_state; DROP INDEX managed_intent_state; PRAGMA user_version=8;").unwrap();
         }
         drop(store);
@@ -6301,6 +6344,7 @@ pub(crate) mod tests {
                 [],
             )
             .unwrap();
+            crate::managed_egress::drop_test_schema(db).unwrap();
             db.execute_batch("DROP TABLE managed_invalidated_ballots; DROP INDEX managed_current_state_owner; ALTER TABLE managed_current_requests DROP COLUMN owner_intent; ALTER TABLE managed_bindings DROP COLUMN incarnation; DROP INDEX managed_bootstrap_state; DROP INDEX managed_intent_state; PRAGMA user_version=8;").unwrap();
         }
         drop(store);
@@ -7463,7 +7507,7 @@ pub(crate) struct RunPin {
     pub capabilities: Vec<String>,
 }
 impl RunPin {
-    fn endpoint(&self) -> RunEndpointPin {
+    pub(crate) fn endpoint(&self) -> RunEndpointPin {
         RunEndpointPin {
             route: self.route.clone(),
             socket: self.socket.clone(),
@@ -7489,6 +7533,8 @@ pub(crate) enum CurrentIntent {
         request_id: String,
         lineage_root_id: String,
         bound_execution_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor_recovery_version: Option<u8>,
     },
     Consensus {
         version: u8,
@@ -7526,6 +7572,7 @@ pub(crate) fn prepare_current_request(
             request_id,
             lineage_root_id,
             bound_execution_id,
+            ..
         } => (
             *version,
             expected_store_id,
@@ -7565,6 +7612,18 @@ pub(crate) fn prepare_current_request(
             .executable_sha256
             .bytes()
             .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+    {
+        return Err(Fault::Invalid);
+    }
+    if let CurrentIntent::Egress {
+        actor_recovery_version: Some(version),
+        ..
+    } = intent
+        && (*version != 1
+            || !pin
+                .capabilities
+                .iter()
+                .any(|cap| cap == "attempt_egress_actor_recovery_v1"))
     {
         return Err(Fault::Invalid);
     }

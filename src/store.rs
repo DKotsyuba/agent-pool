@@ -24,6 +24,8 @@ pub struct Store {
     managed_recovery_cursor: i64,
     /// Independent cursor for bootstrap recovery.
     managed_bootstrap_cursor: i64,
+    /// Round-robin retirement cursor for managed egress scopes.
+    managed_scope_cursor: i64,
     /// Changes on every store open, invalidating cursors across resident restarts.
     read_epoch: String,
 }
@@ -149,6 +151,28 @@ CREATE INDEX managed_intent_state ON managed_intents(state,bridge_resolved,run_r
         after = id;
     }
     Ok(())
+}
+
+/// Version 10 separates immutable event seeds from receipt-bound owner outbox work.
+fn migrate_managed_egress(db: &Connection) -> Result<(), Fault> {
+    db.execute_batch("\
+CREATE TABLE managed_delivery_seeds(effect_id TEXT PRIMARY KEY REFERENCES effects(id),pool_id TEXT NOT NULL REFERENCES pools(id),member_id TEXT NOT NULL REFERENCES members(id),event_key TEXT NOT NULL,payload_sha256 TEXT NOT NULL,payload_length INTEGER NOT NULL CHECK(payload_length>=0),producer_scope TEXT NOT NULL,final_notice INTEGER NOT NULL CHECK(final_notice IN (0,1)));\
+CREATE TRIGGER managed_delivery_seeds_immutable BEFORE UPDATE ON managed_delivery_seeds BEGIN SELECT RAISE(ABORT,'immutable managed delivery seed'); END;\
+CREATE TABLE managed_delivery_outbox(effect_id TEXT PRIMARY KEY REFERENCES managed_delivery_seeds(effect_id),state TEXT NOT NULL CHECK(state IN ('pending','frozen','publishing','known_unsent','unknown','accepted','abort_pending','aborted','not_delivered')),probe_request_id TEXT,probe_pin TEXT,probe_binding TEXT,probe_uncertain INTEGER NOT NULL DEFAULT 0 CHECK(probe_uncertain IN (0,1)),run_pin TEXT,bridge_pin TEXT,audience TEXT,run_receipt_id TEXT,target_binding TEXT,incarnation TEXT,intent TEXT,effect_digest TEXT,dispatch_id TEXT,abort_request_id TEXT,result TEXT,attention TEXT);\
+CREATE TRIGGER managed_delivery_target_immutable BEFORE UPDATE OF run_pin,bridge_pin,audience,run_receipt_id,target_binding,incarnation,intent,effect_digest ON managed_delivery_outbox WHEN OLD.state!='pending' AND (OLD.run_pin IS NOT NEW.run_pin OR OLD.bridge_pin IS NOT NEW.bridge_pin OR OLD.audience IS NOT NEW.audience OR OLD.run_receipt_id IS NOT NEW.run_receipt_id OR OLD.target_binding IS NOT NEW.target_binding OR OLD.incarnation IS NOT NEW.incarnation OR OLD.intent IS NOT NEW.intent OR OLD.effect_digest IS NOT NEW.effect_digest) BEGIN SELECT RAISE(ABORT,'immutable managed delivery target'); END;\
+CREATE TRIGGER managed_delivery_abort_key_immutable BEFORE UPDATE OF abort_request_id ON managed_delivery_outbox WHEN OLD.abort_request_id IS NOT NULL AND OLD.abort_request_id IS NOT NEW.abort_request_id BEGIN SELECT RAISE(ABORT,'immutable managed abort key'); END;\
+CREATE INDEX managed_delivery_outbox_state ON managed_delivery_outbox(state);\
+CREATE TABLE managed_delivery_scopes(producer_scope TEXT PRIMARY KEY,pool_id TEXT NOT NULL REFERENCES pools(id),member_id TEXT REFERENCES members(id),state TEXT NOT NULL CHECK(state IN ('open','draining','retiring','retired','compacting','compacted')),retire_request_id TEXT NOT NULL,bridge_pin TEXT,audience TEXT,retire_receipt TEXT,compact_result TEXT,compact_remaining INTEGER);\
+CREATE TRIGGER managed_delivery_scope_immutable BEFORE UPDATE OF producer_scope,pool_id,member_id,retire_request_id,bridge_pin,audience ON managed_delivery_scopes WHEN OLD.producer_scope IS NOT NEW.producer_scope OR OLD.pool_id IS NOT NEW.pool_id OR OLD.member_id IS NOT NEW.member_id OR OLD.retire_request_id IS NOT NEW.retire_request_id OR (OLD.bridge_pin IS NOT NULL AND OLD.bridge_pin IS NOT NEW.bridge_pin) OR (OLD.audience IS NOT NULL AND OLD.audience IS NOT NEW.audience) BEGIN SELECT RAISE(ABORT,'immutable managed delivery scope'); END;\
+CREATE INDEX managed_delivery_scopes_state ON managed_delivery_scopes(state);")?;
+    inventory_revision_triggers(
+        db,
+        &[
+            "managed_delivery_seeds",
+            "managed_delivery_outbox",
+            "managed_delivery_scopes",
+        ],
+    )
 }
 
 /// Read totals, page, roster and its revision from one SQLite snapshot.
@@ -287,6 +311,172 @@ fn inventory_snapshot_inner(
     Ok(Data::Inventory(Box::new(InventorySnapshot { source, totals, coverage: "Retained Pool rows only; completion classification unsupported, all retained pools unknown. Closed is independent of completion. Pages and totals share one Pool SQLite snapshot; no cross-service or clone/restore anti-rollback guarantee.".into(), pools, returned, has_more, next_cursor, observed_at_unix_ms: crate::observer::now()? })))
 }
 impl Store {
+    pub(crate) fn egress_state(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::managed_egress::State>, Fault> {
+        crate::managed_egress::state(&self.db, id)
+    }
+    pub(crate) fn egress_scope_draining(&self, id: &str) -> Result<bool, Fault> {
+        crate::managed_egress::scope_draining(&self.db, id)
+    }
+    pub(crate) fn egress_target(
+        &self,
+        id: &str,
+        prefix: &str,
+    ) -> Result<crate::managed_egress::Target, Fault> {
+        crate::managed_egress::target(&self.db, id, prefix)
+    }
+    pub(crate) fn egress_attention(&mut self, id: &str, reason: &str) -> Result<(), Fault> {
+        crate::managed_egress::attention(&mut self.db, id, reason)
+    }
+    pub(crate) fn egress_not_delivered(&mut self, id: &str, reason: &str) -> Result<(), Fault> {
+        crate::managed_egress::mark_not_delivered(&mut self.db, id, reason)
+    }
+    pub(crate) fn egress_frozen(&self, id: &str) -> Result<crate::managed_egress::Frozen, Fault> {
+        crate::managed_egress::frozen(&self.db, id)
+    }
+    pub(crate) fn egress_begin_publish(
+        &mut self,
+        id: &str,
+    ) -> Result<(crate::managed_egress::Frozen, String), Fault> {
+        crate::managed_egress::begin_publish(&mut self.db, id)
+    }
+    pub(crate) fn egress_begin_abort(
+        &mut self,
+        id: &str,
+    ) -> Result<(crate::managed_egress::Frozen, String), Fault> {
+        crate::managed_egress::begin_abort(&mut self.db, id)
+    }
+    pub(crate) fn egress_not_sent(
+        &mut self,
+        id: &str,
+        dispatch: &str,
+        reason: &str,
+    ) -> Result<(), Fault> {
+        crate::managed_egress::record_not_sent(&mut self.db, id, dispatch, reason)
+    }
+    pub(crate) fn egress_result(
+        &mut self,
+        id: &str,
+        dispatch: Option<&str>,
+        result: &bridge_sdk::bridge_protocol::managed_owner::ManagedOwnerResultV1,
+        aborting: bool,
+    ) -> Result<crate::managed_egress::State, Fault> {
+        crate::managed_egress::record_result(&mut self.db, id, dispatch, result, aborting)
+    }
+    pub(crate) fn egress_probe(
+        &mut self,
+        target: &crate::managed_egress::Target,
+        pin: &crate::managed_state::RunPin,
+    ) -> Result<(String, crate::managed_state::RunPin, bool), Fault> {
+        crate::managed_egress::prepare_probe(&mut self.db, target, pin)
+    }
+    pub(crate) fn egress_probe_inflight(
+        &mut self,
+        id: &str,
+        request: &str,
+        uncertain: bool,
+    ) -> Result<(), Fault> {
+        crate::managed_egress::probe_inflight(&mut self.db, id, request, uncertain)
+    }
+    pub(crate) fn egress_reset_probe(&mut self, id: &str, request: &str) -> Result<(), Fault> {
+        crate::managed_egress::reset_probe(&mut self.db, id, request)
+    }
+    pub(crate) fn egress_stage(
+        &mut self,
+        effect: &str,
+        pin: &crate::managed_state::RunPin,
+        bound: &crate::managed_state::AttemptRef,
+        request: &str,
+        transport: &str,
+    ) -> Result<crate::managed_run::EgressQuery, Fault> {
+        let matches: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM managed_delivery_outbox WHERE effect_id=?1 AND state='pending' AND probe_request_id=?2)",
+            params![effect, request],
+            |row| row.get(0),
+        )?;
+        if !matches {
+            return Err(Fault::Stale);
+        }
+        crate::managed_run::EgressQuery::stage_recovery(
+            &mut self.db,
+            pin,
+            bound,
+            request,
+            transport,
+        )
+    }
+    pub(crate) fn egress_freeze(
+        &mut self,
+        target: &crate::managed_egress::Target,
+        authority: &crate::managed_run::CurrentAuthority,
+        pin: &crate::managed_state::RunPin,
+        bridge: &crate::managed_bridge::BridgePin,
+        audience: &str,
+    ) -> Result<crate::managed_egress::Frozen, Fault> {
+        let request = authority.request_id().ok_or(Fault::Unauthorized)?;
+        crate::managed_state::record_current_receipt(&mut self.db, request, authority)?;
+        let receipt = authority.receipt();
+        let mut successor = target.binding.clone();
+        successor.attempt = receipt.attempt.clone();
+        successor.actor = receipt.actor.clone();
+        let generation = if target.seed.final_notice {
+            crate::managed_state::rebind_final_authenticated(
+                &mut self.db,
+                authority,
+                &target.binding,
+                &successor,
+                &receipt.incarnation,
+                &target.seed.effect_id,
+            )?
+        } else {
+            crate::managed_state::rebind_authenticated(
+                &mut self.db,
+                authority,
+                &target.binding,
+                &successor,
+                &receipt.incarnation,
+                "egress",
+            )?
+        };
+        crate::managed_egress::freeze(
+            &mut self.db,
+            target,
+            authority,
+            pin,
+            bridge,
+            audience,
+            generation,
+        )
+    }
+    pub(crate) fn egress_next_scope(&mut self) -> Result<Option<(String, String)>, Fault> {
+        let rows = crate::managed_egress::pending_scopes(&self.db, self.managed_scope_cursor)?;
+        self.managed_scope_cursor = rows.last().map_or(0, |row| row.0);
+        Ok(rows.into_iter().next().map(|row| (row.1, row.2)))
+    }
+    pub(crate) fn egress_prepare_scope(
+        &mut self,
+        scope: &str,
+        pin: &crate::managed_bridge::BridgePin,
+        audience: &str,
+    ) -> Result<crate::managed_egress::ScopePlan, Fault> {
+        crate::managed_egress::prepare_scope(&mut self.db, scope, pin, audience)
+    }
+    pub(crate) fn egress_scope_retired(
+        &mut self,
+        plan: &crate::managed_egress::ScopePlan,
+        result: &bridge_sdk::bridge_protocol::RetireResult,
+    ) -> Result<(), Fault> {
+        crate::managed_egress::record_scope_retired(&mut self.db, plan, result)
+    }
+    pub(crate) fn egress_scope_compacted(
+        &mut self,
+        plan: &crate::managed_egress::ScopePlan,
+        result: &bridge_sdk::bridge_protocol::managed_owner::CompactManagedOwnerScopeResultV1,
+    ) -> Result<(), Fault> {
+        crate::managed_egress::record_scope_compaction(&mut self.db, plan, result)
+    }
     pub(crate) fn managed_pin_routes(
         &mut self,
         bridge: &crate::managed_bridge::BridgePin,
@@ -909,11 +1099,20 @@ impl Store {
                     &get,
                     mappings,
                 )?;
-                let (view, private) = match reply {
+                let (mut view, private) = match reply {
                     Reply::View(view) => (view, None),
                     Reply::OwnerView { view, bindings } => (view, Some(bindings)),
                     _ => return Err(Fault::Internal),
                 };
+                if !mappings && get.section == Section::Deliveries {
+                    for delivery in &mut view.deliveries {
+                        (delivery.attention, delivery.attention_subject) =
+                            crate::managed_egress::owner_attention(
+                                &self.db,
+                                &delivery.operation_id,
+                            )?;
+                    }
+                }
                 let returned = match get.section {
                     Section::Overview | Section::Members | Section::Binding => view.members.len(),
                     Section::History => view.events.len(),
@@ -936,7 +1135,7 @@ impl Store {
             }
         }
     }
-    /// Opens one private database, takes a nonblocking writer lease and migrates to schema v9.
+    /// Opens one private database, takes a nonblocking writer lease and migrates to schema v10.
     /// The existing parent must be a real 0700 directory; future schemas and second writers refuse.
     pub fn open(path: &Path) -> Result<Self, Fault> {
         let parent = path.parent().ok_or(Fault::Invalid)?;
@@ -972,13 +1171,13 @@ impl Store {
         let db = Connection::open(path)?;
         db.busy_timeout(Duration::from_secs(2))?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if !(0..=9).contains(&version) {
+        if !(0..=10).contains(&version) {
             return Err(Fault::Conflict);
         }
         db.execute_batch(
             "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;",
         )?;
-        if version < 9 {
+        if version < 10 {
             db.execute_batch("BEGIN IMMEDIATE;")?;
         }
         if version == 0 {
@@ -1018,21 +1217,27 @@ PRAGMA user_version=5;")?;
         if version < 9 {
             migrate_managed_review_fixes(&db)?;
             db.execute_batch("PRAGMA user_version=9;")?;
+        }
+        if version < 10 {
+            migrate_managed_egress(&db)?;
+            db.execute_batch("PRAGMA user_version=10;")?;
             db.execute_batch("COMMIT;")?;
         }
-        // No detached egress/consensus read can survive a resident process restart.
-        db.execute("UPDATE managed_current_requests SET state='aborted' WHERE namespace_id IS NULL AND state IN ('prepared','received')", [])?;
+        // Only a pending, event-bound egress probe can resume its original Run key.
+        db.execute("UPDATE managed_current_requests SET state='aborted' WHERE namespace_id IS NULL AND state IN ('prepared','received') AND NOT EXISTS(SELECT 1 FROM managed_delivery_outbox o WHERE o.state='pending' AND o.probe_request_id=managed_current_requests.id)", [])?;
         // A crash may have happened after a provider accepted the work. Never turn these back into queued.
         db.execute(
             "UPDATE effects SET state='unknown' WHERE state='inflight'",
             [],
         )?;
+        db.execute("UPDATE managed_delivery_outbox SET state='unknown',attention='outcome_unknown' WHERE state='publishing'",[])?;
         Ok(Self {
             db,
             _lease: lease,
             unknown_cursor: 0,
             managed_recovery_cursor: 0,
             managed_bootstrap_cursor: 0,
+            managed_scope_cursor: 0,
             read_epoch: id(),
         })
     }
@@ -1105,6 +1310,27 @@ PRAGMA user_version=5;")?;
             "UPDATE effects SET state='inflight',data=?2 WHERE id=?1 AND state='queued'",
             params![effect.effect_id, encode(&effect)?],
         )?;
+        tx.commit()?;
+        Ok(Some(effect))
+    }
+    /// A proven managed binding can route a pending effect without a legacy address lookup.
+    pub(crate) fn next_bound_managed_egress(&mut self) -> Result<Option<Effect>, Fault> {
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row:Option<(String,String)>=tx.query_row("SELECT e.id,e.data FROM effects e JOIN managed_delivery_seeds s ON s.effect_id=e.id JOIN managed_delivery_outbox o ON o.effect_id=e.id JOIN managed_bindings b ON b.member=s.member_id AND b.pool=s.pool_id WHERE e.state='awaiting_binding' AND o.state='pending' ORDER BY e.sequence LIMIT 1",[],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
+        let Some((id, raw)) = row else {
+            return Ok(None);
+        };
+        let mut effect: Effect = decode(&raw)?;
+        effect.state = "inflight".into();
+        if tx.execute(
+            "UPDATE effects SET state='inflight',data=?2 WHERE id=?1 AND state='awaiting_binding'",
+            params![id, encode(&effect)?],
+        )? != 1
+        {
+            return Err(Fault::Stale);
+        }
         tx.commit()?;
         Ok(Some(effect))
     }
@@ -1867,7 +2093,7 @@ PRAGMA user_version=5;")?;
             Some(installed.member.member_id.clone()),
         )?;
         system_deliveries(&tx, &pool, &event, &bindings(&tx, &effect.pool_id)?, None)?;
-        final_notice(&tx, &pool, &previous)?;
+        final_notice(&tx, &pool, &previous, event.event_id)?;
         queue(
             &tx,
             &effect.pool_id,
@@ -1925,6 +2151,7 @@ PRAGMA user_version=5;")?;
                     address,
                     &scope(&b.member.member_id),
                     onboarding(&pool, &members, &b.member)?,
+                    None,
                 )?;
             }
             let mut stmt=tx.prepare("SELECT id,data FROM effects WHERE member=?1 AND state='awaiting_binding' ORDER BY sequence")?;
@@ -2022,6 +2249,7 @@ PRAGMA user_version=5;")?;
                 &addr,
                 &format!("owner:{pool_id}"),
                 notification(&p, &bindings(&tx, pool_id)?, &ev)?,
+                Some(ev.event_id),
             )?;
         }
         tx.commit()?;
@@ -2331,6 +2559,7 @@ fn execute_authorized(
     let mut direct_scope = None;
     let mut start_spec = None;
     let mut removed = None;
+    let mut closed_members = Vec::new();
     let mut message_parts = Vec::new();
     let mut release_pin = None;
     let mut replacement = None;
@@ -2348,6 +2577,7 @@ fn execute_authorized(
         Command::Close(_) => {
             p.closed = true;
             stale(&mut p);
+            closed_members = roster.clone();
             for b in &roster {
                 remove_binding(db, b, &p)?;
             }
@@ -2781,6 +3011,7 @@ fn execute_authorized(
                 &address,
                 direct_scope.as_deref().ok_or(Fault::Internal)?,
                 notification(&p, &roster, &event)?,
+                Some(event.event_id),
             )?;
         }
     } else {
@@ -2802,7 +3033,15 @@ fn execute_authorized(
             .ok_or(Fault::Internal)?;
         let intro = onboarding(&p, &roster, &b.member)?;
         if let Some(address) = &b.address {
-            queue_delivery(db, pid, Some(member_id), address, &scope(member_id), intro)?;
+            queue_delivery(
+                db,
+                pid,
+                Some(member_id),
+                address,
+                &scope(member_id),
+                intro,
+                Some(event.event_id),
+            )?;
         } else if let Some(spec) = start_spec {
             let request_key = format!("agent-pool.{pid}.{member_id}");
             let jobs = vec![BatchJob {
@@ -2885,7 +3124,13 @@ fn execute_authorized(
     }
     // A removed member receives only the independent final service notice, never the remaining roster.
     if let Some(b) = removed {
-        final_notice(db, &p, &b)?;
+        final_notice(db, &p, &b, event.event_id)?;
+    }
+    for b in &closed_members {
+        final_notice(db, &p, b, event.event_id)?;
+    }
+    if p.closed {
+        crate::managed_egress::retire_final_scope(db, &p.pool_id)?;
     }
     let reply = Reply::Receipt(Box::new(Receipt {
         pool_id: pid.into(),
@@ -3328,7 +3573,14 @@ fn view(
                     Work::Replace { .. } => "replace",
                     Work::ReleasePin { .. } => "release_pin",
                 };
+                let (attention, attention_subject) = if owner {
+                    crate::managed_egress::owner_attention(db, &id)?
+                } else {
+                    (None, None)
+                };
                 deliveries.push(Delivery {
+                    attention,
+                    attention_subject,
                     operation_id: id,
                     member_id,
                     operation: operation.into(),
@@ -3890,21 +4142,28 @@ fn remove_binding(db: &Connection, b: &Binding, p: &Pool) -> Result<(), Fault> {
         "UPDATE effects SET state='cancelled' WHERE member=?1 AND state IN ('queued','awaiting_binding')",
         [&b.member.member_id],
     )?;
-    queue(
-        db,
-        &p.pool_id,
-        Some(&b.member.member_id),
-        Work::Retire {
-            scope: scope(&b.member.member_id),
-        },
+    // Managed scopes use the B2 namespace. A legacy fence is needed only for
+    // legacy members or when this member actually has a frozen legacy send.
+    let has_legacy_publication: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM publications p JOIN effects e ON e.id=p.effect WHERE e.member=?1)",
+        [&b.member.member_id],
+        |row| row.get(0),
     )?;
-    if p.closed {
-        final_notice(db, p, b)?;
+    if b.run_id.is_none() || has_legacy_publication {
+        queue(
+            db,
+            &p.pool_id,
+            Some(&b.member.member_id),
+            Work::Retire {
+                scope: scope(&b.member.member_id),
+            },
+        )?;
     }
+    crate::managed_egress::retire_member_scope(db, &p.pool_id, &b.member.member_id)?;
     Ok(())
 }
 /// Sends exactly one independent membership-ending notice, with no remaining roster or private data.
-fn final_notice(db: &Connection, p: &Pool, b: &Binding) -> Result<(), Fault> {
+fn final_notice(db: &Connection, p: &Pool, b: &Binding, event_id: u64) -> Result<(), Fault> {
     let possible_start:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM effects WHERE member=?1 AND state IN ('inflight','unknown','custody'))",[&b.member.member_id],|r|r.get(0))?;
     if b.address.is_some() || b.run_id.is_some() || possible_start {
         let address = b.address.as_deref().unwrap_or("");
@@ -3918,6 +4177,7 @@ fn final_notice(db: &Connection, p: &Pool, b: &Binding) -> Result<(), Fault> {
                 "Membership ended. Pool {}. Member {}. Access revoked; process not stopped.",
                 p.pool_id, b.member.member_id
             ),
+            Some(event_id),
         )?;
     }
     Ok(())
@@ -4082,11 +4342,12 @@ fn queue_delivery(
     address: &str,
     scope: &str,
     text: String,
+    event_id: Option<u64>,
 ) -> Result<(), Fault> {
     if text.len() > 16384 {
         return Err(Fault::Invalid);
     }
-    queue(
+    let effect_id = queue(
         db,
         pool,
         member,
@@ -4095,8 +4356,21 @@ fn queue_delivery(
             scope: scope.into(),
             text,
         },
-    )
-    .map(|_| ())
+    )?;
+    if let (Some(member), Some(event_id)) = (member, event_id) {
+        let binding = binding_any(db, member)?.0;
+        if binding.run_id.is_some() || binding.address.is_none() {
+            crate::managed_egress::insert_seed(
+                db,
+                &effect_id,
+                pool,
+                member,
+                event_id,
+                scope.starts_with("final:"),
+            )?;
+        }
+    }
+    Ok(())
 }
 /// Sends safe system/message events to current members, excluding the caller's redundant wakeup.
 fn system_deliveries(
@@ -4120,6 +4394,7 @@ fn system_deliveries(
                 address,
                 &scope(&b.member.member_id),
                 text.clone(),
+                Some(e.event_id),
             )?;
         }
     }
@@ -4248,6 +4523,7 @@ fn failure_event(
             &address,
             &format!("owner:{pool_id}"),
             notification(&p, &roster, &e)?,
+            Some(e.event_id),
         )?;
     }
     db.execute(
@@ -5893,6 +6169,140 @@ mod tests {
             "unknown"
         );
     }
+    #[test]
+    fn managed_seed_is_atomic_with_event_and_removed_before_freeze_is_not_delivered() {
+        let (_directory, mut store) = fixture();
+        let owner = actor("seed-owner");
+        let participant = actor("seed-member");
+        let pool_id = make(&mut store, &owner, "seed-pool");
+        let member_id = add(&mut store, &owner, &pool_id, &participant);
+        join(&mut store, &participant, &pool_id);
+        let (mut binding, current) = binding_any(&store.db, &member_id).unwrap();
+        binding.run_id = Some("execution".into());
+        binding.run_sequence = Some(1);
+        binding.run_store_id = Some(format!("store_{}", "a".repeat(32)));
+        save_binding(&store.db, &binding, current).unwrap();
+        let post = Command::Post(Message {
+            change: change(&store, &pool_id),
+            body: "immutable seed".into(),
+        });
+        let before = (
+            pool(&store.db, &pool_id).unwrap().0.revision,
+            count(&store, "events"),
+            count(&store, "effects"),
+        );
+        store.db.execute_batch("CREATE TRIGGER test_seed_failure BEFORE INSERT ON managed_delivery_seeds BEGIN SELECT RAISE(ABORT,'fixture'); END;").unwrap();
+        assert!(store.execute(&owner, &post).is_err());
+        store
+            .db
+            .execute_batch("DROP TRIGGER test_seed_failure;")
+            .unwrap();
+        assert_eq!(
+            (
+                pool(&store.db, &pool_id).unwrap().0.revision,
+                count(&store, "events"),
+                count(&store, "effects")
+            ),
+            before
+        );
+        let Reply::Receipt(receipt) = store.execute(&owner, &post).unwrap() else {
+            panic!("post receipt")
+        };
+        let source: String = store
+            .db
+            .query_row("SELECT store_id FROM inventory_source", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let (effect_id,event_key,scope,hash,length):(String,String,String,String,i64)=store.db.query_row("SELECT effect_id,event_key,producer_scope,payload_sha256,payload_length FROM managed_delivery_seeds WHERE member_id=?1 AND final_notice=0 ORDER BY rowid DESC LIMIT 1",[&member_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).unwrap();
+        assert_eq!(event_key, format!("event/{}", receipt.event.event_id));
+        assert_eq!(scope, format!("pool/{source}/{pool_id}/{member_id}"));
+        let effect = effect(&store.db, &effect_id).unwrap();
+        let Work::Deliver { text, .. } = effect.work else {
+            panic!("delivery")
+        };
+        assert_eq!(hash, format!("{:x}", Sha256::digest(text.as_bytes())));
+        assert_eq!(length, i64::try_from(text.len()).unwrap());
+        assert!(
+            store
+                .db
+                .execute(
+                    "UPDATE managed_delivery_seeds SET event_key='different' WHERE effect_id=?1",
+                    [&effect_id]
+                )
+                .is_err()
+        );
+        let remove = Command::Remove(Remove {
+            change: change(&store, &pool_id),
+            member_id: member_id.clone(),
+        });
+        let Reply::Receipt(removed) = store.execute(&owner, &remove).unwrap() else {
+            panic!("remove receipt")
+        };
+        assert_eq!(
+            store
+                .db
+                .query_row::<String, _, _>(
+                    "SELECT state FROM managed_delivery_outbox WHERE effect_id=?1",
+                    [&effect_id],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+            "not_delivered"
+        );
+        let (final_key,final_scope):(String,String)=store.db.query_row("SELECT event_key,producer_scope FROM managed_delivery_seeds WHERE member_id=?1 AND final_notice=1",[&member_id],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
+        assert_eq!(final_key, format!("event/{}", removed.event.event_id));
+        assert_eq!(final_scope, format!("pool/{source}/{pool_id}/final-notice"));
+        assert_eq!(
+            crate::managed_egress::producer_scope(&source, &pool_id, "final-notice", false).err(),
+            Some(Fault::Invalid)
+        );
+    }
+
+    #[test]
+    fn managed_removal_retires_legacy_scope_only_for_a_legacy_publication() {
+        for legacy_publication in [false, true] {
+            let (_directory, mut store) = fixture();
+            let owner = actor("retirement-owner");
+            let participant = actor("retirement-member");
+            let pool_id = make(&mut store, &owner, "retirement-pool");
+            let member_id = add(&mut store, &owner, &pool_id, &participant);
+            join(&mut store, &participant, &pool_id);
+            if legacy_publication {
+                let effect_id: String = store
+                    .db
+                    .query_row(
+                        "SELECT id FROM effects WHERE member=?1 ORDER BY sequence LIMIT 1",
+                        [&member_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                store
+                    .freeze_publication(&effect_id, "legacy", &serde_json::json!({}))
+                    .unwrap();
+            }
+            let (mut binding, current) = binding_any(&store.db, &member_id).unwrap();
+            binding.run_id = Some("execution".into());
+            binding.run_sequence = Some(1);
+            save_binding(&store.db, &binding, current).unwrap();
+            store
+                .execute(
+                    &owner,
+                    &Command::Remove(Remove {
+                        change: change(&store, &pool_id),
+                        member_id: member_id.clone(),
+                    }),
+                )
+                .unwrap();
+            let retirements: i64 = store.db.query_row(
+                "SELECT count(*) FROM effects WHERE member=?1 AND json_extract(data,'$.work.kind')='retire'",
+                [&member_id],
+                |row| row.get(0),
+            ).unwrap();
+            assert_eq!(retirements, i64::from(legacy_publication));
+        }
+    }
+
     /// Managed membership cannot read, write or replay a formerly valid participant receipt.
     #[test]
     fn managed_member_cannot_replay_or_read_without_attempt_proof() {
@@ -8206,7 +8616,7 @@ mod tests {
         let lead = actor("lead");
         let p = make(&mut s, &lead, "one");
         for _ in 0..40 {
-            queue_delivery(&s.db, &p, None, &lead.address, "owner", "test".into()).unwrap();
+            queue_delivery(&s.db, &p, None, &lead.address, "owner", "test".into(), None).unwrap();
         }
         s.db.execute("UPDATE effects SET state='custody'", [])
             .unwrap();
@@ -8625,6 +9035,7 @@ mod tests {
                 .unwrap();
             let frozen = encode(&legacy.work).unwrap();
             // Remove newer objects to construct the corresponding old-schema fixture.
+            crate::managed_egress::drop_test_schema(&store.db).unwrap();
             store.db.execute_batch("DROP TABLE managed_invalidated_ballots; DROP TABLE managed_ballot_provenance; DROP TABLE managed_domain_keys; DROP TABLE managed_intents; DROP TABLE managed_current_requests; DROP TABLE managed_context_epochs; DROP TABLE managed_context_bindings; DROP TABLE managed_contexts; DROP TABLE managed_bootstrap; DROP TABLE managed_namespaces; DROP TABLE managed_run_routes; DROP TABLE managed_bridge_routes; DROP TABLE managed_rebinds; DROP TABLE managed_bindings; DROP TABLE managed_pool_epochs;").unwrap();
             let mut stmt = store.db.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'inventory_rev_%'").unwrap();
             let triggers: Vec<String> = stmt
@@ -8656,7 +9067,7 @@ mod tests {
                 .db
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 9);
+            assert_eq!(version, 10);
             assert_eq!(
                 encode(&before).unwrap(),
                 encode(&upgraded.execute(&owner, &command).unwrap()).unwrap()
@@ -8687,6 +9098,7 @@ mod tests {
                     row.get(0)
                 })
                 .unwrap();
+            crate::managed_egress::drop_test_schema(&store.db).unwrap();
             store.db.execute_batch("DROP TABLE managed_invalidated_ballots; DROP INDEX managed_current_state_owner; ALTER TABLE managed_current_requests DROP COLUMN owner_intent; ALTER TABLE managed_bindings DROP COLUMN incarnation; DROP INDEX managed_bootstrap_state; DROP INDEX managed_intent_state; DROP TABLE managed_ballot_provenance; DROP TABLE managed_domain_keys; DROP TABLE managed_intents;").unwrap();
             if prior == 6 {
                 store.db.execute_batch("DROP TABLE managed_current_requests; DROP TABLE managed_context_epochs; DROP TABLE managed_context_bindings; DROP TABLE managed_contexts; DROP TABLE managed_bootstrap; DROP TABLE managed_namespaces; DROP TABLE managed_run_routes; DROP TABLE managed_bridge_routes; DROP TABLE managed_rebinds; DROP TABLE managed_bindings; DROP TABLE managed_pool_epochs;").unwrap();
@@ -8701,7 +9113,7 @@ mod tests {
                 .db
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 9);
+            assert_eq!(version, 10);
             let retained: String = upgraded
                 .db
                 .query_row("SELECT store_id FROM inventory_source", [], |row| {
@@ -8728,6 +9140,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
+        crate::managed_egress::drop_test_schema(&store.db).unwrap();
         store.db.execute_batch("DROP TABLE managed_invalidated_ballots; DROP TABLE managed_ballot_provenance; DROP TABLE managed_domain_keys; DROP TABLE managed_intents; DROP TABLE managed_current_requests; DROP TABLE managed_context_epochs; DROP TABLE managed_context_bindings; DROP TABLE managed_contexts; DROP TABLE managed_bootstrap; DROP TABLE managed_namespaces; DROP TABLE managed_run_routes; DROP TABLE managed_bridge_routes; DROP TABLE managed_rebinds; DROP TABLE managed_bindings; DROP TABLE managed_pool_epochs; CREATE TABLE managed_contexts(sentinel TEXT); INSERT INTO managed_contexts VALUES('retained'); PRAGMA user_version=6;").unwrap();
         drop(store);
         assert!(Store::open(&directory.path().join("pool.sqlite")).is_err());
@@ -8760,6 +9173,7 @@ mod tests {
         let (directory, mut store) = fixture();
         let owner = actor("migration-v7");
         make(&mut store, &owner, "retained");
+        crate::managed_egress::drop_test_schema(&store.db).unwrap();
         store.db.execute_batch("DROP TABLE managed_invalidated_ballots; DROP INDEX managed_current_state_owner; ALTER TABLE managed_current_requests DROP COLUMN owner_intent; ALTER TABLE managed_bindings DROP COLUMN incarnation; DROP INDEX managed_bootstrap_state; DROP INDEX managed_intent_state; DROP TABLE managed_ballot_provenance; DROP TABLE managed_domain_keys; DROP TABLE managed_intents; CREATE TABLE managed_domain_keys(sentinel TEXT); INSERT INTO managed_domain_keys VALUES('retained'); PRAGMA user_version=7;").unwrap();
         drop(store);
         assert!(Store::open(&directory.path().join("pool.sqlite")).is_err());
@@ -8792,6 +9206,7 @@ mod tests {
     #[test]
     fn managed_migration_failure_rolls_back_v8() {
         let (directory, store) = fixture();
+        crate::managed_egress::drop_test_schema(&store.db).unwrap();
         store.db.execute_batch("DROP TABLE managed_invalidated_ballots; DROP INDEX managed_current_state_owner; ALTER TABLE managed_current_requests DROP COLUMN owner_intent; ALTER TABLE managed_bindings DROP COLUMN incarnation; DROP INDEX managed_bootstrap_state; DROP INDEX managed_intent_state; CREATE TABLE managed_invalidated_ballots(sentinel TEXT); INSERT INTO managed_invalidated_ballots VALUES('retained'); PRAGMA user_version=8;").unwrap();
         drop(store);
         assert!(Store::open(&directory.path().join("pool.sqlite")).is_err());
@@ -8810,6 +9225,41 @@ mod tests {
         assert_eq!(
             (version, sentinel.as_str(), owner_column),
             (8, "retained", 0)
+        );
+    }
+
+    /// A v9-to-v10 failure rolls back the seed schema and preserves retained work.
+    #[test]
+    fn managed_egress_migration_failure_rolls_back_v9() {
+        let (directory, mut store) = fixture();
+        let owner = actor("egress-migration-owner");
+        let pool_id = make(&mut store, &owner, "egress-migration");
+        crate::managed_egress::drop_test_schema(&store.db).unwrap();
+        store.db.execute_batch("CREATE TABLE managed_delivery_outbox(sentinel TEXT); INSERT INTO managed_delivery_outbox VALUES('retained'); PRAGMA user_version=9;").unwrap();
+        drop(store);
+        assert!(Store::open(&directory.path().join("pool.sqlite")).is_err());
+        let db = Connection::open(directory.path().join("pool.sqlite")).unwrap();
+        assert_eq!(
+            db.query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap(),
+            9
+        );
+        assert_eq!(
+            db.query_row::<String, _, _>(
+                "SELECT sentinel FROM managed_delivery_outbox",
+                [],
+                |row| row.get(0)
+            )
+            .unwrap(),
+            "retained"
+        );
+        assert_eq!(db.query_row::<i64,_,_>("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='managed_delivery_seeds'",[],|row|row.get(0)).unwrap(),0);
+        assert_eq!(
+            db.query_row::<i64, _, _>("SELECT count(*) FROM pools WHERE id=?1", [pool_id], |row| {
+                row.get(0)
+            })
+            .unwrap(),
+            1
         );
     }
     /// A confirmed lost execution wakes the owner without closing the pool or removing membership.
