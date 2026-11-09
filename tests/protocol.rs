@@ -165,7 +165,7 @@ async fn previous_binary_refuses_newer_state() {
             "socket_path = {socket:?}\ndatabase_path = {database:?}\nexpected_uid = {uid}\n\
              bridge_registration_socket = {:?}\nbridge_core_socket = {:?}\n\
              bridge_credential_file = {:?}\nbridge_producer_id = \"fixture\"\n\
-             bridge_audience = \"fixture\"\n",
+             bridge_audience = \"fixture\"\nbridge_server_executable = \"/fixture/bridge\"\nbridge_server_sha256 = \"0000000000000000000000000000000000000000000000000000000000000000\"\n",
             root.path().join("absent-registration"),
             root.path().join("absent-bridge"),
             root.path().join("absent-token")
@@ -395,7 +395,7 @@ async fn original_call_metadata_reaches_registration_after_rmcp_dispatch() {
     std::fs::write(&token, "fixture-not-a-live-credential").unwrap();
     std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
     let config = root.path().join("config.toml");
-    std::fs::write(&config,format!("socket_path={:?}\ndatabase_path={:?}\nexpected_uid={}\nbridge_registration_socket={:?}\nbridge_core_socket={:?}\nbridge_credential_file={:?}\nbridge_producer_id=\"pool-fixture\"\nbridge_audience=\"pool-backend-fixture\"\n",root.path().join("pool.sock"),root.path().join("pool.db"),std::fs::metadata(root.path()).unwrap().uid(),adapter_path,core_path,token)).unwrap();
+    std::fs::write(&config,format!("socket_path={:?}\ndatabase_path={:?}\nexpected_uid={}\nbridge_registration_socket={:?}\nbridge_core_socket={:?}\nbridge_credential_file={:?}\nbridge_producer_id=\"pool-fixture\"\nbridge_audience=\"pool-backend-fixture\"\nbridge_server_executable=\"/fixture/bridge\"\nbridge_server_sha256=\"0000000000000000000000000000000000000000000000000000000000000000\"\n",root.path().join("pool.sock"),root.path().join("pool.db"),std::fs::metadata(root.path()).unwrap().uid(),adapter_path,core_path,token)).unwrap();
     let capture = tokio::spawn(async move {
         let (stream, _) = adapter.accept().await.unwrap();
         let mut reader = BufReader::new(stream);
@@ -601,7 +601,7 @@ async fn frontend_resident_fixture_commits_and_publishes() {
     std::fs::write(&token, "fixture-token").unwrap();
     std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
     let config = root.path().join("config.toml");
-    std::fs::write(&config,format!("socket_path={pool_socket:?}\ndatabase_path={database:?}\nexpected_uid={}\nbridge_registration_socket={adapter_path:?}\nbridge_core_socket={core_path:?}\nbridge_credential_file={token:?}\nbridge_producer_id=\"pool-fixture\"\nbridge_audience=\"pool-backend-fixture\"\n",std::fs::metadata(root.path()).unwrap().uid())).unwrap();
+    std::fs::write(&config,format!("socket_path={pool_socket:?}\ndatabase_path={database:?}\nexpected_uid={}\nbridge_registration_socket={adapter_path:?}\nbridge_core_socket={core_path:?}\nbridge_credential_file={token:?}\nbridge_producer_id=\"pool-fixture\"\nbridge_audience=\"pool-backend-fixture\"\nbridge_server_executable=\"/fixture/bridge\"\nbridge_server_sha256=\"0000000000000000000000000000000000000000000000000000000000000000\"\n",std::fs::metadata(root.path()).unwrap().uid())).unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel();
     let (publish, mut published) = tokio::sync::mpsc::unbounded_channel();
     let bridge = tokio::spawn(fixture_bridge(adapter, core, stopped, publish));
@@ -886,7 +886,7 @@ async fn observer_cli_uses_separate_credential_and_resident() {
     std::fs::write(&token, "fixture-only-observer").unwrap();
     std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
     let config = path.join("config.toml");
-    std::fs::write(&config, format!("socket_path={socket:?}\ndatabase_path={:?}\nexpected_uid={}\nbridge_registration_socket={:?}\nbridge_core_socket={:?}\nbridge_credential_file={:?}\nbridge_producer_id=\"fixture\"\nbridge_audience=\"fixture\"\nowner_observer_credential_file={token:?}\n",path.join("must-not-open.db"),std::fs::metadata(path).unwrap().uid(),path.join("absent-register.sock"),path.join("absent-core.sock"),path.join("absent-bridge.token"))).unwrap();
+    std::fs::write(&config, format!("socket_path={socket:?}\ndatabase_path={:?}\nexpected_uid={}\nbridge_registration_socket={:?}\nbridge_core_socket={:?}\nbridge_credential_file={:?}\nbridge_producer_id=\"fixture\"\nbridge_audience=\"fixture\"\nbridge_server_executable=\"/fixture/bridge\"\nbridge_server_sha256=\"0000000000000000000000000000000000000000000000000000000000000000\"\nowner_observer_credential_file={token:?}\n",path.join("must-not-open.db"),std::fs::metadata(path).unwrap().uid(),path.join("absent-register.sock"),path.join("absent-core.sock"),path.join("absent-bridge.token"))).unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         let resident = async {
             let (stream, _) = listener.accept().await.unwrap();

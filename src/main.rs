@@ -1,9 +1,40 @@
 //! Rust MCP application; protocol, presentation and deployment have separate boundaries.
+/// Serializes fixtures that repeatedly hash the large debug test executable.
+#[cfg(test)]
+static TEST_EXEC_HASH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 mod config;
 mod domain;
 mod integrations;
+#[allow(
+    dead_code,
+    reason = "The B1 adapter retains exact-key recovery helpers"
+)]
+mod managed_bridge;
+#[allow(
+    dead_code,
+    reason = "The managed codec also defines shared protocol fingerprints"
+)]
+mod managed_codec;
+mod managed_ingress;
+#[allow(
+    dead_code,
+    reason = "The R2 client retains authenticated exact-key recovery operations"
+)]
+mod managed_run;
+mod managed_session;
+#[allow(
+    dead_code,
+    reason = "The managed state model retains explicit durable recovery transitions"
+)]
+mod managed_state;
 mod observer;
 mod response;
+#[allow(
+    dead_code,
+    reason = "The private hold client awaits a separately designed durable saga"
+)]
+mod run_hold;
 mod run_status;
 mod runtime;
 mod store;
@@ -184,9 +215,10 @@ impl ServerHandler for Handler {
         let Ok(_permit) = self.calls.try_acquire() else {
             return Ok(tools::present(Err(domain::Fault::Unavailable), &self.templates).into());
         };
-        let command = serde_json::from_value::<domain::Command>(
+        let command = managed_codec::normalize_command(
             serde_json::json!({"name":request.name,"arguments":args}),
-        );
+        )
+        .map(|(command, _)| command);
         let result = match (command, self.config.as_deref()) {
             (Ok(command), Some(path)) => runtime::frontend(&command, original_meta, path).await,
             (Err(_), _) => Err(domain::Fault::Invalid),

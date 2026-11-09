@@ -20,6 +20,12 @@ pub struct Store {
     _lease: File,
     /// Round-robin reconciliation cursor, preventing a permanently unknown head from starving later work.
     unknown_cursor: i64,
+    /// Rotating cursors prevent unresolved managed work from starving later records.
+    managed_recovery_cursor: i64,
+    /// Independent cursor for bootstrap recovery.
+    managed_bootstrap_cursor: i64,
+    /// Changes on every store open, invalidating cursors across resident restarts.
+    read_epoch: String,
 }
 /// One owner-selected binding and its original route read at a single Pool revision.
 #[derive(Clone, PartialEq, Eq)]
@@ -33,7 +39,719 @@ pub(crate) struct RunProofBinding {
     /// Proven unique admission route when the binding has one.
     pub route: Option<RunRoute>,
 }
+/// Install a durable store identity and transactional revision triggers with the v6 migration.
+fn migrate_inventory_source(db: &Connection) -> Result<(), Fault> {
+    db.execute_batch("CREATE TABLE inventory_source(singleton INTEGER PRIMARY KEY CHECK(singleton=1), store_id TEXT NOT NULL, revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision>=0));")?;
+    db.execute(
+        "INSERT INTO inventory_source(singleton,store_id,revision) VALUES(1,?1,0)",
+        [id()],
+    )?;
+    // Every durable state table participates: private/background changes also fence a continuation.
+    inventory_revision_triggers(
+        db,
+        &[
+            "leaders",
+            "pools",
+            "proposals",
+            "members",
+            "member_slots",
+            "requests",
+            "events",
+            "effects",
+            "publications",
+            "alerts",
+        ],
+    )?;
+    Ok(())
+}
+
+/// New durable tables participate in the same source-wide revision fence.
+fn inventory_revision_triggers(db: &Connection, tables: &[&str]) -> Result<(), Fault> {
+    for table in tables {
+        for action in ["INSERT", "UPDATE", "DELETE"] {
+            db.execute_batch(&format!(
+                "CREATE TRIGGER inventory_rev_{table}_{action} AFTER {action} ON {table} BEGIN UPDATE inventory_source SET revision=revision+1 WHERE singleton=1; END;"
+            ))?;
+        }
+    }
+    Ok(())
+}
+
+/// Version 7 persists binding generations, pool binding epochs, contexts and verified rebinds.
+fn migrate_managed_context(db: &Connection) -> Result<(), Fault> {
+    db.execute_batch("\
+CREATE TABLE managed_pool_epochs(pool TEXT PRIMARY KEY REFERENCES pools(id), epoch INTEGER NOT NULL CHECK(typeof(epoch)='integer' AND epoch>=0));\
+CREATE TABLE managed_bindings(member TEXT PRIMARY KEY REFERENCES members(id), pool TEXT NOT NULL REFERENCES pools(id), generation BLOB NOT NULL CHECK(typeof(generation)='blob' AND length(generation)=8), binding TEXT NOT NULL);\
+CREATE TABLE managed_rebinds(receipt_id TEXT PRIMARY KEY, member TEXT NOT NULL REFERENCES members(id), old_binding TEXT NOT NULL, new_binding TEXT NOT NULL, generation_before BLOB NOT NULL CHECK(typeof(generation_before)='blob' AND length(generation_before)=8), generation_after BLOB NOT NULL CHECK(typeof(generation_after)='blob' AND length(generation_after)=8));\
+CREATE TABLE managed_bridge_routes(route TEXT PRIMARY KEY, pin TEXT NOT NULL);\
+CREATE TABLE managed_run_routes(route TEXT PRIMARY KEY, pin TEXT NOT NULL);\
+CREATE TABLE managed_namespaces(id TEXT PRIMARY KEY, bridge_route TEXT NOT NULL, bridge_pin TEXT, producer TEXT NOT NULL, issuer_epoch TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('open','draining','sealed')), request_id TEXT UNIQUE, retirement_key TEXT UNIQUE, seal_id TEXT UNIQUE, UNIQUE(bridge_route,producer,issuer_epoch));\
+CREATE TABLE managed_bootstrap(id TEXT PRIMARY KEY, namespace_id TEXT NOT NULL REFERENCES managed_namespaces(id), invocation_key TEXT NOT NULL, command TEXT NOT NULL, proof_hash TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('prepared','submitted','terminal','stale_epoch')), bridge_context_ref TEXT, registration_request_id TEXT, registration_digest TEXT, consume_request_id TEXT, consume_submitted INTEGER NOT NULL DEFAULT 0 CHECK(consume_submitted IN (0,1)), consumed_ref TEXT, consumed_receipt TEXT, bridge_abort_request_id TEXT, abort_receipt TEXT);\
+CREATE UNIQUE INDEX managed_bootstrap_invocation ON managed_bootstrap(invocation_key) WHERE state!='stale_epoch';\
+CREATE UNIQUE INDEX managed_bootstrap_registration ON managed_bootstrap(registration_request_id) WHERE registration_request_id IS NOT NULL;\
+CREATE UNIQUE INDEX managed_bootstrap_consume ON managed_bootstrap(consume_request_id) WHERE consume_request_id IS NOT NULL;\
+CREATE UNIQUE INDEX managed_bootstrap_abort ON managed_bootstrap(bridge_abort_request_id) WHERE bridge_abort_request_id IS NOT NULL;\
+CREATE TABLE managed_contexts(id TEXT PRIMARY KEY, namespace_id TEXT NOT NULL REFERENCES managed_namespaces(id), intent_id TEXT NOT NULL UNIQUE, invocation_key TEXT NOT NULL UNIQUE, command TEXT NOT NULL, context TEXT NOT NULL, digest TEXT NOT NULL, snapshot TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('prepared','invalidated')));\
+CREATE TABLE managed_context_bindings(context_id TEXT NOT NULL REFERENCES managed_contexts(id), member TEXT NOT NULL REFERENCES members(id), generation BLOB NOT NULL CHECK(typeof(generation)='blob' AND length(generation)=8), PRIMARY KEY(context_id,member));\
+CREATE TABLE managed_context_epochs(context_id TEXT NOT NULL REFERENCES managed_contexts(id), pool TEXT NOT NULL REFERENCES pools(id), epoch INTEGER NOT NULL, PRIMARY KEY(context_id,pool));")?;
+    db.execute_batch("CREATE TABLE managed_current_requests(id TEXT PRIMARY KEY, namespace_id TEXT REFERENCES managed_namespaces(id), run_pin TEXT NOT NULL, request TEXT NOT NULL, digest TEXT NOT NULL, after_consume INTEGER NOT NULL CHECK(after_consume IN (0,1)), state TEXT NOT NULL CHECK(state IN ('prepared','received','used','aborted')), receipt_id TEXT UNIQUE, receipt TEXT);")?;
+    inventory_revision_triggers(
+        db,
+        &[
+            "managed_pool_epochs",
+            "managed_bindings",
+            "managed_rebinds",
+            "managed_bridge_routes",
+            "managed_run_routes",
+            "managed_contexts",
+            "managed_context_bindings",
+            "managed_context_epochs",
+            "managed_namespaces",
+            "managed_bootstrap",
+            "managed_current_requests",
+        ],
+    )
+}
+
+/// Version 8 adds durable intent/active-domain keys and additive verified ballot provenance.
+fn migrate_managed_intents(db: &Connection) -> Result<(), Fault> {
+    db.execute_batch("\
+CREATE TABLE managed_intents(id TEXT PRIMARY KEY, context_id TEXT NOT NULL UNIQUE REFERENCES managed_contexts(id), scope TEXT NOT NULL, request_key TEXT NOT NULL, domain_digest TEXT NOT NULL, security_digest TEXT NOT NULL, command TEXT NOT NULL, pool_route TEXT NOT NULL, run_route TEXT NOT NULL, run_pin TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('prepared','consuming','admitting','admitted','committed','aborted')), consumed_ref TEXT, consumed_receipt TEXT, admission_id TEXT, admission TEXT, admission_fingerprint TEXT, terminal_receipt TEXT, bridge_abort_receipt TEXT, run_resolution_receipt TEXT, bridge_resolved INTEGER NOT NULL DEFAULT 0 CHECK(bridge_resolved IN (0,1)), run_resolved INTEGER NOT NULL DEFAULT 0 CHECK(run_resolved IN (0,1)), effect_free INTEGER NOT NULL DEFAULT 0 CHECK(effect_free IN (0,1)));\
+CREATE TABLE managed_domain_keys(scope TEXT NOT NULL, request_key TEXT NOT NULL, domain_digest TEXT NOT NULL, intent_id TEXT NOT NULL UNIQUE REFERENCES managed_intents(id), PRIMARY KEY(scope,request_key));\
+CREATE TABLE managed_ballot_provenance(pool TEXT NOT NULL REFERENCES pools(id), proposal TEXT NOT NULL REFERENCES proposals(id), member TEXT NOT NULL REFERENCES members(id), event_id INTEGER NOT NULL REFERENCES events(id), generation BLOB NOT NULL CHECK(typeof(generation)='blob' AND length(generation)=8), attempt TEXT NOT NULL, incarnation TEXT NOT NULL, admission_id TEXT NOT NULL, security_digest TEXT NOT NULL, PRIMARY KEY(pool,proposal,member,event_id));")?;
+    inventory_revision_triggers(
+        db,
+        &[
+            "managed_intents",
+            "managed_domain_keys",
+            "managed_ballot_provenance",
+        ],
+    )
+}
+
+/// Read totals, page, roster and its revision from one SQLite snapshot.
+fn inventory_snapshot(
+    db: &Connection,
+    epoch: &str,
+    args: &crate::observer::InventoryRequest,
+) -> Result<crate::observer::Data, Fault> {
+    inventory_snapshot_inner(db, epoch, args, || Ok(()))
+}
+
+/// The hook runs after the snapshot is pinned; tests use it to interleave a separate writer.
+fn inventory_snapshot_inner(
+    db: &Connection,
+    epoch: &str,
+    args: &crate::observer::InventoryRequest,
+    after_pin: impl FnOnce() -> Result<(), Fault>,
+) -> Result<crate::observer::Data, Fault> {
+    use crate::observer::{
+        Data, InventoryCursor, InventoryFilter, InventoryRow, InventorySnapshot, InventorySource,
+        InventoryTotals,
+    };
+    let tx = db.unchecked_transaction()?;
+    let (store_id, revision): (String, i64) = tx.query_row(
+        "SELECT store_id,revision FROM inventory_source WHERE singleton=1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if revision < 0 {
+        return Err(Fault::Internal);
+    }
+    let source = InventorySource {
+        store_id,
+        read_epoch: epoch.to_owned(),
+        revision: revision.to_string(),
+    };
+    after_pin()?;
+    if let Some(cursor) = &args.cursor
+        && (cursor.source != source || cursor.filter != args.filter || cursor.limit != args.limit)
+    {
+        return Err(Fault::Stale);
+    }
+    let (total, closed, invalid): (i64, i64, i64) = tx.query_row(
+        "SELECT count(*), coalesce(sum(CASE WHEN json_type(data,'$.closed')='true' THEN 1 ELSE 0 END),0), coalesce(sum(CASE WHEN json_type(data,'$.closed') IN ('true','false') THEN 0 ELSE 1 END),0) FROM pools", [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    if total < 0 || closed < 0 || invalid != 0 {
+        return Err(Fault::Internal);
+    }
+    let predicate = match args.filter {
+        InventoryFilter::All => "1",
+        InventoryFilter::Closed => "json_type(data,'$.closed')='true'",
+        InventoryFilter::NotClosed => "json_type(data,'$.closed')='false'",
+    };
+    let after = args
+        .cursor
+        .as_ref()
+        .map_or("", |cursor| cursor.after.as_str());
+    if args.cursor.is_some() {
+        let exists: bool = tx.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM pools WHERE id=?1 AND {predicate})"),
+            [after],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(Fault::Stale);
+        }
+    }
+    let mut stmt = tx.prepare(&format!(
+        "SELECT id,data,owner FROM pools WHERE id>?1 AND {predicate} ORDER BY id LIMIT ?2"
+    ))?;
+    let rows = stmt
+        .query_map(params![after, i64::from(args.limit) + 1], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
+    let has_more = rows.len() > usize::from(args.limit);
+    let mut pools = Vec::with_capacity(rows.len().min(usize::from(args.limit)));
+    for (pool_id, data, leader_id) in rows.into_iter().take(usize::from(args.limit)) {
+        let mut pool: Pool = decode(&data)?;
+        if pool.pool_id != pool_id {
+            return Err(Fault::Internal);
+        }
+        pool.proposal = None;
+        pool.acceptance = None;
+        project_purpose(&mut pool);
+        let mut stmt = tx.prepare("SELECT m.data FROM members m LEFT JOIN member_slots s ON s.member=m.id WHERE m.pool=?1 AND m.current=1 ORDER BY COALESCE(s.slot,m.id),m.id LIMIT 21")?;
+        let roster = stmt
+            .query_map([&pool_id], |row| row.get::<_, String>(0))?
+            .map(|row| {
+                let mut binding: Binding = decode(&row?)?;
+                if binding.pool_id != pool_id {
+                    return Err(Fault::Internal);
+                }
+                if binding.run_id.is_some() {
+                    binding.member.runtime = "unknown".into();
+                }
+                Ok(binding.member)
+            })
+            .collect::<Result<Vec<_>, Fault>>()?;
+        if roster.len() > 20 {
+            return Err(Fault::Unavailable);
+        }
+        pools.push(InventoryRow {
+            pool,
+            leader_id,
+            roster,
+        });
+    }
+    let next_cursor = if has_more {
+        let last = pools.last().ok_or(Fault::Internal)?;
+        Some(InventoryCursor {
+            version: 1,
+            source: source.clone(),
+            filter: args.filter,
+            limit: args.limit,
+            after: last.pool.pool_id.clone(),
+        })
+    } else {
+        None
+    };
+    let returned = pools.len();
+    let totals = InventoryTotals {
+        total: total.to_string(),
+        open: None,
+        completed: None,
+        unknown: total.to_string(),
+        closed: closed.to_string(),
+    };
+    tx.commit()?;
+    Ok(Data::Inventory(Box::new(InventorySnapshot { source, totals, coverage: "Retained Pool rows only; completion classification unsupported, all retained pools unknown. Closed is independent of completion. Pages and totals share one Pool SQLite snapshot; no cross-service or clone/restore anti-rollback guarantee.".into(), pools, returned, has_more, next_cursor, observed_at_unix_ms: crate::observer::now()? })))
+}
 impl Store {
+    pub(crate) fn managed_pin_routes(
+        &mut self,
+        bridge: &crate::managed_bridge::BridgePin,
+        run: &crate::managed_state::RunEndpointPin,
+    ) -> Result<(), Fault> {
+        crate::managed_state::persist_bridge_route(&mut self.db, bridge)?;
+        crate::managed_state::persist_run_route(&mut self.db, run)
+    }
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "The bootstrap identities are independent wire fields"
+    )]
+    pub(crate) fn managed_begin_bootstrap(
+        &mut self,
+        bootstrap_id: &str,
+        invocation_key: &str,
+        issuer_epoch: &str,
+        command: &Command,
+        proof: &bridge_sdk::bridge_protocol::CallEvidence,
+        pin: &crate::managed_bridge::BridgePin,
+    ) -> Result<(String, crate::managed_state::BootstrapDispatch), Fault> {
+        let route = encode(&pin.route)?;
+        let namespace: Option<String> = self.db.query_row(
+            "SELECT id FROM managed_namespaces WHERE bridge_route=?1 AND producer=?2 AND issuer_epoch=?3",
+            params![route, pin.producer, issuer_epoch],
+            |row| row.get(0),
+        ).optional()?;
+        let namespace = namespace.unwrap_or_else(id);
+        crate::managed_state::reserve_bootstrap(
+            &mut self.db,
+            &crate::managed_state::BootstrapRequest {
+                namespace_id: &namespace,
+                bootstrap_id,
+                route: &pin.route,
+                bridge_pin: pin,
+                producer: &pin.producer,
+                issuer_epoch,
+                invocation_key,
+                command,
+                native_proof: proof,
+            },
+        )?;
+        let dispatch = crate::managed_state::mark_bootstrap_submitted(&mut self.db, bootstrap_id)?;
+        Ok((namespace, dispatch))
+    }
+    pub(crate) fn managed_stale_bootstrap(
+        &mut self,
+        dispatch: crate::managed_state::BootstrapDispatch,
+    ) -> Result<(), Fault> {
+        crate::managed_state::mark_bootstrap_stale_epoch(
+            &mut self.db,
+            dispatch,
+            crate::managed_bridge::BridgeFailure::StaleEpoch,
+        )
+    }
+    pub(crate) fn managed_record_bootstrap_ref(
+        &mut self,
+        dispatch: crate::managed_state::BootstrapDispatch,
+        prepared: &crate::managed_bridge::Prepared,
+        pin: &crate::managed_bridge::BridgePin,
+    ) -> Result<(), Fault> {
+        crate::managed_state::record_bootstrap_ref(&mut self.db, dispatch, prepared, pin)
+    }
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Exact staged context and registration identities"
+    )]
+    pub(crate) fn managed_prepare_context(
+        &mut self,
+        context_id: &str,
+        namespace_id: &str,
+        bootstrap_id: &str,
+        command: &Command,
+        context: &crate::managed_state::SecurityContext,
+        authority: &crate::managed_run::CurrentAuthority,
+        registration_id: &str,
+        pin: &crate::managed_bridge::BridgePin,
+    ) -> Result<String, Fault> {
+        let receipt = authority.receipt();
+        let digest = crate::managed_state::prepare_context(
+            &mut self.db,
+            authority,
+            context_id,
+            namespace_id,
+            command,
+            context,
+            &[(&receipt.receipt_id, receipt.incarnation.clone())],
+        )?;
+        crate::managed_state::mark_registration_submitted(
+            &mut self.db,
+            bootstrap_id,
+            context_id,
+            registration_id,
+            &digest,
+            pin,
+        )?;
+        Ok(digest)
+    }
+    pub(crate) fn managed_mark_consume(
+        &mut self,
+        context_id: &str,
+        intent_id: &str,
+        digest: &str,
+        pin: &crate::managed_bridge::BridgePin,
+    ) -> Result<(), Fault> {
+        crate::managed_state::mark_bootstrap_consume_submitted(
+            &mut self.db,
+            context_id,
+            intent_id,
+            digest,
+            pin,
+        )
+    }
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Exact authenticated consume association"
+    )]
+    pub(crate) fn managed_record_consumption(
+        &mut self,
+        context_id: &str,
+        key: &crate::managed_bridge::ConsumeKey<'_>,
+        consumed: &crate::managed_bridge::Consumed,
+        server: &str,
+        command: &Command,
+        epoch: &str,
+        pin: &crate::managed_bridge::BridgePin,
+    ) -> Result<(), Fault> {
+        crate::managed_state::record_bootstrap_consumption(
+            &mut self.db,
+            context_id,
+            key,
+            consumed,
+            server,
+            command,
+            epoch,
+            pin,
+        )
+    }
+    pub(crate) fn managed_stage_ingress(
+        &mut self,
+        bootstrap_id: &str,
+        pin: &crate::managed_state::RunPin,
+        input: crate::managed_run::IngressInput,
+    ) -> Result<crate::managed_run::IngressQuery, Fault> {
+        let linked: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM managed_bootstrap b JOIN managed_namespaces n ON n.id=b.namespace_id WHERE b.id=?1 AND b.invocation_key=?2 AND b.state='submitted' AND n.bridge_route=?3 AND n.producer=?4)",
+            params![bootstrap_id, input.invocation_key, encode(&input.bridge_route)?, input.producer],
+            |row| row.get(0),
+        )?;
+        if !linked {
+            return Err(Fault::Conflict);
+        }
+        crate::managed_run::IngressQuery::stage(&mut self.db, pin, input)
+    }
+    pub(crate) fn managed_record_current(
+        &mut self,
+        request_id: &str,
+        authority: &crate::managed_run::CurrentAuthority,
+    ) -> Result<(), Fault> {
+        crate::managed_state::record_current_receipt(&mut self.db, request_id, authority)
+    }
+    /// Resolve the authenticated Run lineage to exactly one current member.
+    #[allow(dead_code, reason = "Managed frontend wiring is in progress")]
+    pub(crate) fn managed_select_ingress_binding(
+        &mut self,
+        authority: &crate::managed_run::CurrentAuthority,
+        bridge_route: &crate::managed_state::Route,
+        producer: &str,
+        command: &Command,
+    ) -> Result<crate::managed_state::ManagedBinding, Fault> {
+        crate::managed_state::select_ingress_binding(
+            &mut self.db,
+            authority,
+            bridge_route,
+            producer,
+            command,
+        )
+    }
+    /// Install only a staged, pinned Run-authorized initial binding.
+    #[allow(
+        dead_code,
+        reason = "Managed stdio ingress awaits the original-observation interface"
+    )]
+    pub(crate) fn managed_bind_initial(
+        &mut self,
+        authority: &crate::managed_run::CurrentAuthority,
+        binding: &crate::managed_state::ManagedBinding,
+        incarnation: &crate::managed_state::Incarnation,
+    ) -> Result<(), Fault> {
+        crate::managed_state::bind_initial_authenticated(
+            &mut self.db,
+            authority,
+            binding,
+            incarnation,
+        )
+    }
+    /// Install a same-lineage successor under its original generation and Run pin.
+    #[allow(
+        dead_code,
+        reason = "Managed stdio ingress awaits the original-observation interface"
+    )]
+    pub(crate) fn managed_rebind(
+        &mut self,
+        authority: &crate::managed_run::CurrentAuthority,
+        old: &crate::managed_state::ManagedBinding,
+        new: &crate::managed_state::ManagedBinding,
+        incarnation: &crate::managed_state::Incarnation,
+        purpose: &str,
+    ) -> Result<u64, Fault> {
+        crate::managed_state::rebind_authenticated(
+            &mut self.db,
+            authority,
+            old,
+            new,
+            incarnation,
+            purpose,
+        )
+    }
+    /// Serve an immediate managed read only for its exact staged bootstrap.
+    pub(crate) fn managed_read(
+        &mut self,
+        bootstrap_id: &str,
+        context_id: &str,
+        command: &Command,
+        digest: &str,
+        authorities: &[crate::managed_run::CurrentAuthority],
+        consumed: &crate::managed_bridge::Consumed,
+    ) -> Result<Reply, Fault> {
+        let linked: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM managed_contexts c JOIN managed_bootstrap b ON b.invocation_key=c.invocation_key AND b.namespace_id=c.namespace_id WHERE c.id=?1 AND b.id=?2)",
+            params![context_id, bootstrap_id],
+            |row| row.get(0),
+        )?;
+        if !linked {
+            return Err(Fault::Conflict);
+        }
+        crate::managed_state::execute_read(
+            &mut self.db,
+            context_id,
+            command,
+            digest,
+            authorities,
+            consumed,
+        )
+    }
+    /// Reserve an authenticated invocation and recover its exact Run admission inputs.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "The frozen identities are distinct protocol fields"
+    )]
+    pub(crate) fn managed_reserve(
+        &mut self,
+        bootstrap_id: &str,
+        context_id: &str,
+        intent_id: &str,
+        member_id: &str,
+        command: &Command,
+        digest: &str,
+        authority: crate::managed_run::CurrentAuthority,
+        consumed: &crate::managed_bridge::Consumed,
+        pool_route: &crate::managed_state::Route,
+    ) -> Result<
+        (
+            crate::managed_state::IntentReservation,
+            Option<crate::managed_state::AdmissionPlan>,
+        ),
+        Fault,
+    > {
+        let stored: String = self.db.query_row(
+            "SELECT c.intent_id FROM managed_contexts c JOIN managed_bootstrap b ON b.invocation_key=c.invocation_key AND b.namespace_id=c.namespace_id WHERE c.id=?1 AND b.id=?2",
+            params![context_id, bootstrap_id],
+            |row| row.get(0),
+        )?;
+        if stored != intent_id {
+            return Err(Fault::Conflict);
+        }
+        let result = crate::managed_state::reserve_intent(
+            &mut self.db,
+            context_id,
+            member_id,
+            command,
+            digest,
+            authority,
+            consumed,
+            pool_route,
+        )?;
+        let plan = if result == crate::managed_state::IntentReservation::Created {
+            Some(crate::managed_state::admission_plan(
+                &self.db, intent_id, digest,
+            )?)
+        } else {
+            None
+        };
+        Ok((result, plan))
+    }
+    pub(crate) fn managed_mark_admitted(
+        &mut self,
+        id: &str,
+        digest: &str,
+        admission: &crate::managed_run::Admission,
+    ) -> Result<(), Fault> {
+        crate::managed_state::mark_admitted(&mut self.db, id, digest, admission)
+    }
+    pub(crate) fn managed_commit_domain(
+        &mut self,
+        id: &str,
+        digest: &str,
+    ) -> Result<String, Fault> {
+        crate::managed_state::commit_domain(&mut self.db, id, digest)
+    }
+    pub(crate) fn managed_snapshot_consensus(
+        &self,
+        id: &str,
+        digest: &str,
+    ) -> Result<crate::managed_state::PendingConsensus, Fault> {
+        crate::managed_state::snapshot_consensus(&self.db, id, digest)
+    }
+    pub(crate) fn managed_commit_vote(
+        &mut self,
+        id: &str,
+        digest: &str,
+        fence: crate::managed_state::ConsensusFence,
+    ) -> Result<String, Fault> {
+        crate::managed_state::commit_domain_vote(&mut self.db, id, digest, fence)
+    }
+    pub(crate) fn managed_require_run_pin(
+        &mut self,
+        pin: &crate::managed_state::RunEndpointPin,
+    ) -> Result<(), Fault> {
+        crate::managed_state::require_run_route(&self.db, pin)
+    }
+    pub(crate) fn managed_stage_voter(
+        &mut self,
+        pin: &crate::managed_state::RunPin,
+        voter: &crate::managed_state::VerifiedBallot,
+        request_id: &str,
+        transport_id: &str,
+    ) -> Result<crate::managed_run::VoterQuery, Fault> {
+        crate::managed_run::VoterQuery::stage(&mut self.db, pin, voter, request_id, transport_id)
+    }
+    pub(crate) fn managed_stage_egress(
+        &mut self,
+        pin: &crate::managed_state::RunPin,
+        bound: &crate::managed_state::AttemptRef,
+        request_id: &str,
+        transport_id: &str,
+    ) -> Result<crate::managed_run::EgressQuery, Fault> {
+        crate::managed_run::EgressQuery::stage(&mut self.db, pin, bound, request_id, transport_id)
+    }
+    pub(crate) fn managed_terminal_abort(&mut self, id: &str, digest: &str) -> Result<(), Fault> {
+        crate::managed_state::terminal_abort(&mut self.db, id, digest, "managed_aborted")
+    }
+    /// Lists a bounded batch of unresolved managed intents for exact-key recovery.
+    pub(crate) fn managed_pending(&mut self) -> Result<Vec<(String, String)>, Fault> {
+        let rows =
+            crate::managed_state::pending_recovery(&self.db, 1, self.managed_recovery_cursor)?;
+        self.managed_recovery_cursor = if rows.is_empty() {
+            0
+        } else {
+            rows.last().map_or(0, |row| row.0)
+        };
+        Ok(rows
+            .into_iter()
+            .map(|(_, id, digest)| (id, digest))
+            .collect())
+    }
+    /// Stages one managed intent recovery action without external I/O.
+    pub(crate) fn managed_stage_recovery(
+        &mut self,
+        id: &str,
+        digest: &str,
+    ) -> Result<crate::managed_state::RecoveryAction, Fault> {
+        crate::managed_state::stage_recovery(&mut self.db, id, digest)
+    }
+    /// Lists a bounded batch of unresolved bootstrap reservations.
+    pub(crate) fn managed_pending_bootstraps(&mut self) -> Result<Vec<String>, Fault> {
+        let rows =
+            crate::managed_state::pending_bootstraps(&self.db, 1, self.managed_bootstrap_cursor)?;
+        self.managed_bootstrap_cursor = if rows.is_empty() {
+            0
+        } else {
+            rows.last().map_or(0, |row| row.0)
+        };
+        Ok(rows.into_iter().map(|(_, id)| id).collect())
+    }
+    /// Stages one bootstrap recovery action without external I/O.
+    pub(crate) fn managed_stage_bootstrap(
+        &mut self,
+        id: &str,
+    ) -> Result<crate::managed_state::BootstrapRecoveryAction, Fault> {
+        crate::managed_state::stage_bootstrap_recovery(&mut self.db, id)
+    }
+    /// Records a verified Bridge abort for one exact original intent.
+    pub(crate) fn managed_record_bridge_abort(
+        &mut self,
+        id: &str,
+        digest: &str,
+        key: &crate::managed_state::RecoveryBridgeKey,
+        pin: &crate::managed_bridge::BridgePin,
+        result: &crate::managed_bridge::Abort,
+    ) -> Result<bool, Fault> {
+        crate::managed_state::record_bridge_abort(
+            &mut self.db,
+            id,
+            digest,
+            &key.borrowed(),
+            result,
+            pin,
+        )
+    }
+    /// Records a verified Bridge abort for a bootstrap with no Pool intent.
+    pub(crate) fn managed_record_bootstrap_abort(
+        &mut self,
+        context: &str,
+        key: &crate::managed_state::RecoveryBridgeKey,
+        pin: &crate::managed_bridge::BridgePin,
+        result: &crate::managed_bridge::Abort,
+    ) -> Result<(), Fault> {
+        crate::managed_state::record_bootstrap_abort(
+            &mut self.db,
+            context,
+            &key.borrowed(),
+            result,
+            pin,
+        )
+    }
+    /// Records a correlated Run abort fence for one exact original intent.
+    pub(crate) fn managed_record_run_abort(
+        &mut self,
+        id: &str,
+        digest: &str,
+        result: &crate::managed_run::Lookup,
+    ) -> Result<bool, Fault> {
+        crate::managed_state::record_run_abort(&mut self.db, id, digest, result)
+    }
+    /// Records a correlated Run settlement for one committed intent.
+    pub(crate) fn managed_record_run_settlement(
+        &mut self,
+        id: &str,
+        digest: &str,
+        result: &crate::managed_run::Lookup,
+    ) -> Result<(), Fault> {
+        crate::managed_state::record_run_settlement(&mut self.db, id, digest, result)
+    }
+    /// Returns this durable Pool source identity to a separately authenticated private reader.
+    pub(crate) fn managed_store_id(&self) -> Result<String, Fault> {
+        self.db
+            .query_row(
+                "SELECT store_id FROM inventory_source WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+    /// Reads a single local outcome without mutating the store.
+    pub(crate) fn managed_outcome(
+        &self,
+        intent: &str,
+        digest: &str,
+        route: &crate::managed_state::Route,
+    ) -> Result<crate::managed_state::ManagedOutcome, Fault> {
+        crate::managed_state::authorize_outcome_route(&self.db, intent, route)?;
+        crate::managed_state::outcome(&self.db, intent, digest)
+    }
+    /// Fences and inspects one explicitly authorized Bridge issuer namespace.
+    pub(crate) fn managed_seal(
+        &mut self,
+        route: &crate::managed_state::Route,
+        producer: &str,
+        issuer: &str,
+        request: &str,
+        retirement: &str,
+    ) -> Result<crate::managed_state::SealStatus, Fault> {
+        crate::managed_state::seal_namespace(
+            &mut self.db,
+            route,
+            producer,
+            issuer,
+            request,
+            retirement,
+        )
+    }
+    /// Grants unit fixtures direct access to the isolated SQLite connection.
+    #[cfg(test)]
+    pub(crate) fn test_db(&mut self) -> &mut Connection {
+        &mut self.db
+    }
     /// Queries the resident connection only, after the transport verified the separate owner grant.
     /// This path has no write transaction, receipt replay, claims, provider I/O or outbox changes.
     /// Pagination is section-local and uses the existing reviewed typed projections.
@@ -45,6 +763,9 @@ impl Store {
         request.validate()?;
         match &request.operation {
             Operation::Identity(_) => Envelope::identity(),
+            Operation::InventorySnapshot(args) => {
+                inventory_snapshot(&self.db, &self.read_epoch, args)
+            }
             Operation::List(args) => {
                 let mut stmt = self
                     .db
@@ -158,7 +879,7 @@ impl Store {
             }
         }
     }
-    /// Opens one private database, takes a nonblocking writer lease and migrates to schema v5.
+    /// Opens one private database, takes a nonblocking writer lease and migrates to schema v8.
     /// The existing parent must be a real 0700 directory; future schemas and second writers refuse.
     pub fn open(path: &Path) -> Result<Self, Fault> {
         let parent = path.parent().ok_or(Fault::Invalid)?;
@@ -194,14 +915,17 @@ impl Store {
         let db = Connection::open(path)?;
         db.busy_timeout(Duration::from_secs(2))?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if !(0..=5).contains(&version) {
+        if !(0..=8).contains(&version) {
             return Err(Fault::Conflict);
         }
         db.execute_batch(
             "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;",
         )?;
+        if version < 8 {
+            db.execute_batch("BEGIN IMMEDIATE;")?;
+        }
         if version == 0 {
-            db.execute_batch("BEGIN IMMEDIATE;
+            db.execute_batch("
 CREATE TABLE leaders(actor TEXT PRIMARY KEY,address TEXT NOT NULL UNIQUE);
 CREATE TABLE pools(id TEXT PRIMARY KEY,owner TEXT NOT NULL REFERENCES leaders(actor),data TEXT NOT NULL);
 CREATE TABLE proposals(id TEXT PRIMARY KEY,pool TEXT NOT NULL REFERENCES pools(id),state TEXT NOT NULL,data TEXT NOT NULL);
@@ -217,10 +941,23 @@ CREATE TABLE effects(sequence INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL
 CREATE INDEX effect_state ON effects(state,sequence);
 CREATE TABLE publications(effect TEXT PRIMARY KEY REFERENCES effects(id),producer TEXT NOT NULL,params TEXT NOT NULL);
 CREATE TABLE alerts(effect TEXT NOT NULL REFERENCES effects(id),kind TEXT NOT NULL,PRIMARY KEY(effect,kind));
-PRAGMA user_version=5; COMMIT;")?;
+PRAGMA user_version=5;")?;
         } else if version < 5 {
             // Older readers cannot safely interpret durable replacement effects.
-            db.execute_batch("BEGIN IMMEDIATE; CREATE TABLE IF NOT EXISTS member_slots(member TEXT PRIMARY KEY REFERENCES members(id),slot TEXT NOT NULL); PRAGMA user_version=5; COMMIT;")?;
+            db.execute_batch("CREATE TABLE IF NOT EXISTS member_slots(member TEXT PRIMARY KEY REFERENCES members(id),slot TEXT NOT NULL); PRAGMA user_version=5;")?;
+        }
+        if version < 6 {
+            migrate_inventory_source(&db)?;
+            db.execute_batch("PRAGMA user_version=6;")?;
+        }
+        if version < 7 {
+            migrate_managed_context(&db)?;
+            db.execute_batch("PRAGMA user_version=7;")?;
+        }
+        if version < 8 {
+            migrate_managed_intents(&db)?;
+            db.execute_batch("PRAGMA user_version=8;")?;
+            db.execute_batch("COMMIT;")?;
         }
         // A crash may have happened after a provider accepted the work. Never turn these back into queued.
         db.execute(
@@ -231,6 +968,9 @@ PRAGMA user_version=5; COMMIT;")?;
             db,
             _lease: lease,
             unknown_cursor: 0,
+            managed_recovery_cursor: 0,
+            managed_bootstrap_cursor: 0,
+            read_epoch: id(),
         })
     }
     /// Authenticates current membership before replay lookup, then executes a non-join command.
@@ -1362,6 +2102,60 @@ fn observe_history(
 }
 /// Applies a typed command inside the caller's single SQLite transaction.
 fn execute(db: &Connection, actor: &Actor, command: &Command) -> Result<Reply, Fault> {
+    execute_authorized(db, actor, command, None, false)
+}
+
+/// Apply an already admitted participant mutation under its exact frozen binding.
+/// The caller has performed the managed context, generation and admission CAS.
+pub(crate) fn apply_managed_mutation(
+    db: &Connection,
+    command: &Command,
+    context: &crate::managed_state::SecurityContext,
+    checked_consensus: bool,
+) -> Result<(String, u64), Fault> {
+    if !matches!(
+        command,
+        Command::Post(_)
+            | Command::Send(_)
+            | Command::Notify(_)
+            | Command::Propose(_)
+            | Command::Vote(_)
+            | Command::Remove(_)
+    ) {
+        return Err(Fault::Unavailable);
+    }
+    if checked_consensus && !matches!(command, Command::Vote(_)) {
+        return Err(Fault::Invalid);
+    }
+    let pool_id = &command.change().ok_or(Fault::Invalid)?.pool_id;
+    let mut matching = context
+        .bindings
+        .iter()
+        .filter(|binding| &binding.pool_id == pool_id);
+    let binding = matching.next().ok_or(Fault::Unauthorized)?;
+    if matching.next().is_some() {
+        return Err(Fault::Unauthorized);
+    }
+    let actor = Actor::verified(
+        binding.actor.address.clone(),
+        &binding.actor.native_id,
+        &binding.actor.role,
+    )?;
+    let reply = execute_authorized(db, &actor, command, Some(binding), checked_consensus)?;
+    let Reply::Receipt(receipt) = &reply else {
+        return Err(Fault::Internal);
+    };
+    Ok((encode(&reply)?, receipt.event.event_id))
+}
+
+/// Legacy callers never receive the managed authorization or consensus permit.
+fn execute_authorized(
+    db: &Connection,
+    actor: &Actor,
+    command: &Command,
+    managed: Option<&crate::managed_state::ManagedBinding>,
+    checked_consensus: bool,
+) -> Result<Reply, Fault> {
     if let Command::Create(c) = command {
         return create(db, actor, c, command);
     }
@@ -1385,7 +2179,18 @@ fn execute(db: &Connection, actor: &Actor, command: &Command) -> Result<Reply, F
     if !is_owner && caller.is_none() {
         return Err(Fault::Forbidden);
     }
-    if !is_owner
+    if let Some(binding) = managed {
+        if is_owner
+            || caller.as_ref().is_none_or(|member| {
+                member.member.member_id != binding.member_id
+                    || member.pool_id != binding.pool_id
+                    || member.run_id.is_none()
+                    || member.run_store_id.as_deref() != Some(binding.attempt.run_store_id.as_str())
+            })
+        {
+            return Err(Fault::Unauthorized);
+        }
+    } else if !is_owner
         && caller
             .as_ref()
             .is_some_and(|binding| binding.run_id.is_some())
@@ -1848,7 +2653,9 @@ fn execute(db: &Connection, actor: &Actor, command: &Command) -> Result<Reply, F
                 else {
                     return false;
                 };
-                if binding.run_id.is_some() || binding.member.state != MemberState::Active {
+                if (binding.run_id.is_some() && !checked_consensus)
+                    || binding.member.state != MemberState::Active
+                {
                     return false;
                 }
                 proposal.votes.get(m).is_some_and(|b| {
@@ -2029,7 +2836,11 @@ fn execute(db: &Connection, actor: &Actor, command: &Command) -> Result<Reply, F
     Ok(reply)
 }
 /// Enforces tool-specific owner/member roles, including pending-member read/join restrictions.
-fn authorize(command: &Command, owner: bool, caller: Option<&Binding>) -> Result<(), Fault> {
+pub(crate) fn authorize(
+    command: &Command,
+    owner: bool,
+    caller: Option<&Binding>,
+) -> Result<(), Fault> {
     let active = caller.is_some_and(|b| b.member.state == MemberState::Active);
     let allowed = match command {
         Command::Update(_)
@@ -2138,6 +2949,11 @@ fn list(db: &Connection, actor: &Actor, c: &List) -> Result<Reply, Fault> {
         }
     }
     drop(memberships);
+    list_accessible(db, actor, c)
+}
+
+/// Shared bounded projection; callers must independently authorize the actor first.
+fn list_accessible(db: &Connection, actor: &Actor, c: &List) -> Result<Reply, Fault> {
     let mut stmt=db.prepare("SELECT p.data FROM pools p WHERE p.id>?3 AND (p.owner=?1 OR EXISTS(SELECT 1 FROM members m WHERE m.pool=p.id AND m.current=1 AND (m.actor=?1 OR (m.actor IS NULL AND m.address=?2)))) ORDER BY p.id LIMIT 11")?;
     let mut pools: Vec<Pool> = stmt
         .query_map(
@@ -2160,6 +2976,83 @@ fn list(db: &Connection, actor: &Actor, c: &List) -> Result<Reply, Fault> {
         next_after: next,
         has_more: more,
     })
+}
+
+/// Project a managed participant read only for the complete verified membership set.
+pub(crate) fn managed_read_projection(
+    db: &Connection,
+    command: &Command,
+    context: &crate::managed_state::SecurityContext,
+) -> Result<Reply, Fault> {
+    let first = context.bindings.first().ok_or(Fault::Unauthorized)?;
+    if context
+        .bindings
+        .iter()
+        .any(|binding| binding.actor != first.actor)
+    {
+        return Err(Fault::Unauthorized);
+    }
+    let actor = Actor::verified(
+        first.actor.address.clone(),
+        &first.actor.native_id,
+        &first.actor.role,
+    )?;
+    let owner: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM leaders WHERE actor=?1 OR address=?2)",
+        params![actor.key, actor.address],
+        |row| row.get(0),
+    )?;
+    if owner {
+        return Err(Fault::Forbidden);
+    }
+    let mut stmt = db.prepare(
+        "SELECT data FROM members WHERE current=1 AND (actor=?1 OR (actor IS NULL AND address=?2))",
+    )?;
+    let memberships = stmt
+        .query_map(params![actor.key, actor.address], |row| {
+            row.get::<_, String>(0)
+        })?
+        .map(|row| decode::<Binding>(&row?))
+        .collect::<Result<Vec<_>, Fault>>()?;
+    if memberships.len() != context.bindings.len()
+        || memberships.iter().any(|member| {
+            let current_actor = member.actor.as_deref() == Some(actor.key.as_str())
+                || (member.actor.is_none()
+                    && member.address.as_deref() == Some(actor.address.as_str()));
+            member.run_id.is_none()
+                || !current_actor
+                || !context.bindings.iter().any(|binding| {
+                    binding.pool_id == member.pool_id
+                        && binding.member_id == member.member.member_id
+                        && member.run_store_id.as_deref()
+                            == Some(binding.attempt.run_store_id.as_str())
+                })
+        })
+    {
+        return Err(Fault::Stale);
+    }
+    match command {
+        Command::List(list) => list_accessible(db, &actor, list),
+        Command::Get(get) if get.wait_seconds == 0.0 => {
+            if !context
+                .bindings
+                .iter()
+                .any(|binding| binding.pool_id == get.pool_id)
+            {
+                return Err(Fault::Forbidden);
+            }
+            let (pool, _) = pool(db, &get.pool_id)?;
+            if get
+                .expected_revision
+                .is_some_and(|revision| revision != pool.revision)
+            {
+                return Err(Fault::Stale);
+            }
+            view(db, pool, bindings(db, &get.pool_id)?, get, false)
+        }
+        Command::Get(_) => Err(Fault::Unavailable),
+        _ => Err(Fault::Invalid),
+    }
 }
 /// Projects exactly one bounded section; cursors advance only across returned rows.
 fn view(
@@ -3364,6 +4257,221 @@ mod tests {
         std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let s = Store::open(&d.path().join("pool.sqlite")).unwrap();
         (d, s)
+    }
+    /// Decode and execute an inventory request through the public owner dispatch.
+    fn inventory(store: &Store, params: serde_json::Value) -> Result<serde_json::Value, Fault> {
+        let request: crate::observer::Request = serde_json::from_value(serde_json::json!({
+            "schema_version":1, "operation":"inventory_snapshot", "params":params
+        }))
+        .map_err(|_| Fault::Invalid)?;
+        let data = store.observe(&request)?;
+        let bytes = crate::observer::encode(&crate::observer::Envelope::success(
+            "inventory_snapshot",
+            data,
+        ))?;
+        let envelope: crate::observer::Envelope =
+            serde_json::from_slice(&bytes).map_err(|_| Fault::Internal)?;
+        serde_json::to_value(envelope).map_err(|_| Fault::Internal)
+    }
+    /// The source-wide counts, filter, complete roster, closure and empty terminal page are independent.
+    #[test]
+    fn inventory_empty_closed_and_roster() {
+        use serde_json::json;
+        let (_dir, mut store) = fixture();
+        let empty = inventory(&store, json!({"filter":"all","limit":1})).unwrap();
+        assert_eq!(
+            empty["data"]["totals"],
+            json!({"total":"0","open":null,"completed":null,"unknown":"0","closed":"0"})
+        );
+        assert_eq!(empty["data"]["returned"], 0);
+        assert_eq!(empty["data"]["has_more"], false);
+        assert!(empty["data"]["next_cursor"].is_null());
+        let owner = actor("inventory-owner");
+        let member = actor("inventory-member");
+        let closed = make(&mut store, &owner, "closed");
+        let change = change(&store, &closed);
+        store.execute(&owner, &Command::Close(change)).unwrap();
+        let other = make(&mut store, &owner, "other");
+        let member_id = add(&mut store, &owner, &other, &member);
+        let page = inventory(&store, json!({"filter":"closed","limit":10})).unwrap();
+        assert_eq!(
+            page["data"]["totals"],
+            json!({"total":"2","open":null,"completed":null,"unknown":"2","closed":"1"})
+        );
+        assert_eq!(page["data"]["returned"], 1);
+        assert_eq!(page["data"]["pools"][0]["pool"]["closed"], true);
+        assert_eq!(page["data"]["pools"][0]["roster"], json!([]));
+        let page = inventory(&store, json!({"filter":"not_closed","limit":10})).unwrap();
+        assert_eq!(
+            page["data"]["pools"][0]["roster"][0]["member_id"],
+            member_id
+        );
+        assert_eq!(page["data"]["pools"][0]["leader_id"], owner.key);
+        assert!(
+            page["data"]["pools"][0]["roster"][0]
+                .get("address")
+                .is_none()
+        );
+        assert!(page["data"]["next_cursor"].is_null());
+    }
+    /// Any source write, epoch change, selector change or invalid boundary refuses continuation.
+    #[test]
+    fn inventory_cursor_fences_source_and_selection() {
+        use serde_json::json;
+        let (dir, mut store) = fixture();
+        let owner = actor("cursor-owner");
+        make(&mut store, &owner, "one");
+        make(&mut store, &owner, "two");
+        let first = inventory(&store, json!({"filter":"all","limit":1})).unwrap();
+        let cursor = first["data"]["next_cursor"].clone();
+        assert!(cursor.is_object());
+        let second = inventory(&store, json!({"filter":"all","limit":1,"cursor":cursor})).unwrap();
+        assert_eq!(second["data"]["returned"], 1);
+        assert_eq!(second["data"]["has_more"], false);
+        assert!(second["data"]["next_cursor"].is_null());
+        for key in ["store_id", "read_epoch", "revision"] {
+            let mut changed = cursor.clone();
+            changed["source"][key] = json!("different");
+            assert_eq!(
+                inventory(&store, json!({"filter":"all","limit":1,"cursor":changed})).err(),
+                Some(Fault::Stale)
+            );
+        }
+        assert_eq!(
+            inventory(&store, json!({"filter":"closed","limit":1,"cursor":cursor})).err(),
+            Some(Fault::Stale)
+        );
+        assert_eq!(
+            inventory(&store, json!({"filter":"all","limit":2,"cursor":cursor})).err(),
+            Some(Fault::Stale)
+        );
+        let mut missing = cursor.clone();
+        missing["after"] = json!("absent");
+        assert_eq!(
+            inventory(&store, json!({"filter":"all","limit":1,"cursor":missing})).err(),
+            Some(Fault::Stale)
+        );
+        // A private table update also advances the source fence even when rows are unchanged.
+        assert_eq!(store.db.execute("UPDATE requests SET digest=digest WHERE rowid=(SELECT min(rowid) FROM requests)", []).unwrap(), 1);
+        assert_eq!(
+            inventory(&store, json!({"filter":"all","limit":1,"cursor":cursor})).err(),
+            Some(Fault::Stale)
+        );
+        let new_first = inventory(&store, json!({"filter":"all","limit":1})).unwrap();
+        let new_cursor = new_first["data"]["next_cursor"].clone();
+        drop(store);
+        let reopened = Store::open(&dir.path().join("pool.sqlite")).unwrap();
+        assert_eq!(
+            inventory(
+                &reopened,
+                json!({"filter":"all","limit":1,"cursor":new_cursor})
+            )
+            .err(),
+            Some(Fault::Stale)
+        );
+        let after = inventory(&reopened, json!({"filter":"all","limit":1})).unwrap();
+        assert_eq!(
+            new_first["data"]["source"]["store_id"],
+            after["data"]["source"]["store_id"]
+        );
+        assert_ne!(
+            new_first["data"]["source"]["read_epoch"],
+            after["data"]["source"]["read_epoch"]
+        );
+    }
+    /// A writer committing after the first SELECT cannot mix newer pool data with older totals/revision.
+    #[test]
+    fn inventory_snapshot_consistent_with_concurrent_commit() {
+        use crate::observer::{Data, InventoryFilter, InventoryRequest};
+        let (dir, mut store) = fixture();
+        let owner = actor("snapshot-owner");
+        let pool_id = make(&mut store, &owner, "one");
+        let writer = Connection::open(dir.path().join("pool.sqlite")).unwrap();
+        let args = InventoryRequest {
+            filter: InventoryFilter::All,
+            limit: 10,
+            cursor: None,
+        };
+        let result = inventory_snapshot_inner(&store.db, &store.read_epoch, &args, || {
+            let (mut changed, _) = pool(&writer, &pool_id)?;
+            changed.closed = true;
+            save_pool(&writer, &changed)?;
+            Ok(())
+        })
+        .unwrap();
+        let Data::Inventory(page) = result else {
+            panic!("inventory")
+        };
+        assert_eq!(page.totals.closed, "0");
+        assert!(!page.pools[0].pool.closed);
+        let current = inventory(&store, serde_json::json!({"filter":"all","limit":10})).unwrap();
+        assert_eq!(current["data"]["totals"]["closed"], "1");
+        assert_eq!(current["data"]["pools"][0]["pool"]["closed"], true);
+        assert_ne!(current["data"]["source"]["revision"], page.source.revision);
+    }
+    /// The entire maximum roster is returned in slot order; corrupt over-capacity data refuses.
+    #[test]
+    fn inventory_full_roster_and_capacity_overflow() {
+        use serde_json::json;
+        let (_dir, mut store) = fixture();
+        let owner = actor("roster-owner");
+        let pid = make(&mut store, &owner, "roster");
+        let mut expected = Vec::new();
+        for index in 0..20 {
+            expected.push(add(
+                &mut store,
+                &owner,
+                &pid,
+                &actor(&format!("roster-{index}")),
+            ));
+        }
+        expected.sort();
+        let page = inventory(&store, json!({"filter":"all","limit":1})).unwrap();
+        let ids: Vec<_> = page["data"]["pools"][0]["roster"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|member| member["member_id"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(ids, expected);
+        let (pool, _) = pool(&store.db, &pid).unwrap();
+        let extra = new_binding(&pool, "extra", "extra", "extra", None);
+        save_binding(&store.db, &extra, true).unwrap();
+        assert_eq!(
+            inventory(&store, json!({"filter":"all","limit":1})).err(),
+            Some(Fault::Unavailable)
+        );
+    }
+    /// Oversized envelopes and a revision counter overflow fail atomically instead of truncating.
+    #[test]
+    fn inventory_overflow_refuses_without_partial_result() {
+        let (_dir, mut store) = fixture();
+        let owner = actor("overflow-owner");
+        let pid = make(&mut store, &owner, "one");
+        let (mut p, _) = pool(&store.db, &pid).unwrap();
+        p.name = "x".repeat(crate::integrations::MAX_FRAME);
+        save_pool(&store.db, &p).unwrap();
+        assert_eq!(
+            inventory(&store, serde_json::json!({"filter":"all","limit":1})).err(),
+            Some(Fault::Unavailable)
+        );
+        store
+            .db
+            .execute("UPDATE inventory_source SET revision=?1", [i64::MAX])
+            .unwrap();
+        p.name = "small".into();
+        assert!(save_pool(&store.db, &p).is_err());
+        assert_eq!(
+            pool(&store.db, &pid).unwrap().0.name.len(),
+            crate::integrations::MAX_FRAME
+        );
+        let revision: i64 = store
+            .db
+            .query_row("SELECT revision FROM inventory_source", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(revision, i64::MAX);
     }
     /// SQLite state and sidecars inherit the private owner-only storage boundary.
     #[test]
@@ -7400,10 +8508,10 @@ mod tests {
         assert!(matches!(Store::open(&path), Err(Fault::Conflict)));
         assert_eq!(std::fs::read(&path).unwrap(), before);
     }
-    /// V1–v4 data and their original receipts survive the semantic-schema upgrade.
+    /// V1–v5 data and their original receipts survive all semantic-schema upgrades.
     #[test]
     fn older_schema_upgrade_preserves_pool_and_receipts() {
-        for prior_version in [1, 2, 3, 4] {
+        for prior_version in [1, 2, 3, 4, 5] {
             let (directory, mut store) = fixture();
             let owner = actor("upgrade-owner");
             let command = Command::Create(Create {
@@ -7453,11 +8561,31 @@ mod tests {
                 )
                 .unwrap();
             let frozen = encode(&legacy.work).unwrap();
+            // Remove newer objects to construct the corresponding old-schema fixture.
+            store.db.execute_batch("DROP TABLE managed_ballot_provenance; DROP TABLE managed_domain_keys; DROP TABLE managed_intents; DROP TABLE managed_current_requests; DROP TABLE managed_context_epochs; DROP TABLE managed_context_bindings; DROP TABLE managed_contexts; DROP TABLE managed_bootstrap; DROP TABLE managed_namespaces; DROP TABLE managed_run_routes; DROP TABLE managed_bridge_routes; DROP TABLE managed_rebinds; DROP TABLE managed_bindings; DROP TABLE managed_pool_epochs;").unwrap();
+            let mut stmt = store.db.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'inventory_rev_%'").unwrap();
+            let triggers: Vec<String> = stmt
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            drop(stmt);
+            for trigger in triggers {
+                store
+                    .db
+                    .execute_batch(&format!("DROP TRIGGER {trigger}"))
+                    .unwrap();
+            }
             store
                 .db
-                .execute_batch(&format!(
-                    "DROP TABLE member_slots; PRAGMA user_version={prior_version};"
-                ))
+                .execute_batch("DROP TABLE inventory_source")
+                .unwrap();
+            if prior_version < 5 {
+                store.db.execute_batch("DROP TABLE member_slots").unwrap();
+            }
+            store
+                .db
+                .execute_batch(&format!("PRAGMA user_version={prior_version}"))
                 .unwrap();
             drop(store);
             let mut upgraded = Store::open(&directory.path().join("pool.sqlite")).unwrap();
@@ -7465,7 +8593,7 @@ mod tests {
                 .db
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 5);
+            assert_eq!(version, 8);
             assert_eq!(
                 encode(&before).unwrap(),
                 encode(&upgraded.execute(&owner, &command).unwrap()).unwrap()
@@ -7480,6 +8608,88 @@ mod tests {
             assert_eq!(count(&upgraded, "pools"), 1);
             assert_eq!(count(&upgraded, "events"), 2);
         }
+    }
+    /// Version 6/7 upgrades retain source identity, do not promote old members, and survive reopen.
+    #[test]
+    fn managed_schema_migration_preserves_v6_v7_source() {
+        for prior in [6, 7] {
+            let (directory, mut store) = fixture();
+            let owner = actor("migration-managed");
+            let pool_id = make(&mut store, &owner, "existing");
+            let member = actor("migration-member");
+            add(&mut store, &owner, &pool_id, &member);
+            let source: String = store
+                .db
+                .query_row("SELECT store_id FROM inventory_source", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            store.db.execute_batch("DROP TABLE managed_ballot_provenance; DROP TABLE managed_domain_keys; DROP TABLE managed_intents;").unwrap();
+            if prior == 6 {
+                store.db.execute_batch("DROP TABLE managed_current_requests; DROP TABLE managed_context_epochs; DROP TABLE managed_context_bindings; DROP TABLE managed_contexts; DROP TABLE managed_bootstrap; DROP TABLE managed_namespaces; DROP TABLE managed_run_routes; DROP TABLE managed_bridge_routes; DROP TABLE managed_rebinds; DROP TABLE managed_bindings; DROP TABLE managed_pool_epochs;").unwrap();
+            }
+            store
+                .db
+                .execute_batch(&format!("PRAGMA user_version={prior}"))
+                .unwrap();
+            drop(store);
+            let upgraded = Store::open(&directory.path().join("pool.sqlite")).unwrap();
+            let version: i64 = upgraded
+                .db
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, 8);
+            let retained: String = upgraded
+                .db
+                .query_row("SELECT store_id FROM inventory_source", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(source, retained);
+            assert_eq!(count(&upgraded, "managed_bindings"), 0);
+            assert_eq!(count(&upgraded, "managed_ballot_provenance"), 0);
+            assert_eq!(count(&upgraded, "pools"), 1);
+            drop(upgraded);
+            assert!(Store::open(&directory.path().join("pool.sqlite")).is_ok());
+        }
+    }
+    /// A failed numbered migration rolls back its intermediate schema and version.
+    #[test]
+    fn managed_migration_failure_rolls_back_v6() {
+        let (directory, mut store) = fixture();
+        let owner = actor("migration-rollback");
+        make(&mut store, &owner, "retained");
+        let source: String = store
+            .db
+            .query_row("SELECT store_id FROM inventory_source", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        store.db.execute_batch("DROP TABLE managed_ballot_provenance; DROP TABLE managed_domain_keys; DROP TABLE managed_intents; DROP TABLE managed_current_requests; DROP TABLE managed_context_epochs; DROP TABLE managed_context_bindings; DROP TABLE managed_contexts; DROP TABLE managed_bootstrap; DROP TABLE managed_namespaces; DROP TABLE managed_run_routes; DROP TABLE managed_bridge_routes; DROP TABLE managed_rebinds; DROP TABLE managed_bindings; DROP TABLE managed_pool_epochs; CREATE TABLE managed_contexts(sentinel TEXT); INSERT INTO managed_contexts VALUES('retained'); PRAGMA user_version=6;").unwrap();
+        drop(store);
+        assert!(Store::open(&directory.path().join("pool.sqlite")).is_err());
+        let db = Connection::open(directory.path().join("pool.sqlite")).unwrap();
+        let version: i64 = db
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        let retained: String = db
+            .query_row("SELECT store_id FROM inventory_source", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let sentinel: String = db
+            .query_row("SELECT sentinel FROM managed_contexts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let intermediate:i64=db.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='managed_pool_epochs'",[],|row|row.get(0)).unwrap();
+        let pools: i64 = db
+            .query_row("SELECT count(*) FROM pools", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            (version, retained, sentinel, intermediate, pools),
+            (6, source, "retained".into(), 0, 1)
+        );
     }
     /// A confirmed lost execution wakes the owner without closing the pool or removing membership.
     #[test]

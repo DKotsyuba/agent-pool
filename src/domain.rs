@@ -52,6 +52,8 @@ pub enum Fault {
     Closed,
     /// A configured dependency is unavailable; no success is implied.
     Unavailable,
+    /// The Pool resident must be relaunched after Bridge enabled its managed role.
+    RelaunchRequired,
     /// An internal storage or serialization failure occurred; details stay private.
     Internal,
 }
@@ -996,6 +998,13 @@ pub enum Reply {
         next_after: Option<String>,
         /// Whether more accessible pools remain.
         has_more: bool,
+    },
+    /// An authenticated identical domain request is still being reconciled.
+    Pending {
+        /// Exact pool selected by the original mutation.
+        pool_id: String,
+        /// Original domain replay key; retry only this key with fresh proof.
+        request_key: String,
     },
     /// Durable mutation acknowledgment.
     Receipt(Box<Receipt>),

@@ -702,6 +702,28 @@ struct RunReply<T> {
     /// Structured service failure; prose is ignored by the closed classifier.
     error: Option<Value>,
 }
+/// Hold responses require one present object branch; explicit null is not omission.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictHoldEnvelope {
+    jsonrpc: String,
+    id: u64,
+    #[serde(default, deserialize_with = "present_object")]
+    result: Option<serde::de::IgnoredAny>,
+    #[serde(default, deserialize_with = "present_object")]
+    error: Option<serde::de::IgnoredAny>,
+}
+
+/// Checks a hold envelope without weakening the typed result's duplicate-key checks.
+fn strict_hold_envelope(frame: &[u8], request_id: u64) -> bool {
+    let Ok(JsonObject(reply)) = serde_json::from_slice::<JsonObject<StrictHoldEnvelope>>(frame)
+    else {
+        return false;
+    };
+    reply.jsonrpc == "2.0"
+        && reply.id == request_id
+        && (reply.result.is_some() != reply.error.is_some())
+}
 /// Strictly decoded precondition refusal; duplicate fields cannot manufacture a terminal outcome.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -810,7 +832,7 @@ async fn run_rpc(config: &Config, method: &str, params: Value) -> Result<Value, 
 }
 
 /// Decodes a correlated Run result directly into its typed representation.
-async fn run_rpc_typed<T: serde::de::DeserializeOwned>(
+pub(crate) async fn run_rpc_typed<T: serde::de::DeserializeOwned>(
     config: &Config,
     method: &str,
     params: Value,
@@ -838,6 +860,9 @@ async fn run_rpc_typed<T: serde::de::DeserializeOwned>(
         let frame = read_frame(&mut stream)
             .await
             .map_err(|_| RunFailure::unknown())?;
+        if method.starts_with("_lineage_hold_") && !strict_hold_envelope(&frame, request_id) {
+            return Err(RunFailure::unknown());
+        }
         let JsonObject(reply): JsonObject<RunReply<T>> =
             serde_json::from_slice(&frame).map_err(|_| RunFailure::unknown())?;
         if reply.jsonrpc != "2.0"
@@ -1566,6 +1591,20 @@ mod tests {
     use super::*;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
+    /// Hold envelopes reject null branches while other Run methods retain their prior parser.
+    #[test]
+    fn hold_envelope_null_branches_do_not_change_legacy_parsing() {
+        let success = br#"{"jsonrpc":"2.0","id":7,"result":{}}"#;
+        let failure = br#"{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"invalid"}}"#;
+        let success_with_null = br#"{"jsonrpc":"2.0","id":7,"result":{},"error":null}"#;
+        let failure_with_null = br#"{"jsonrpc":"2.0","id":7,"result":null,"error":{"code":-32602,"message":"invalid"}}"#;
+        assert!(strict_hold_envelope(success, 7));
+        assert!(strict_hold_envelope(failure, 7));
+        assert!(!strict_hold_envelope(success_with_null, 7));
+        assert!(!strict_hold_envelope(failure_with_null, 7));
+        assert!(serde_json::from_slice::<JsonObject<RunReply<Value>>>(success_with_null).is_ok());
+        assert!(serde_json::from_slice::<JsonObject<RunReply<Value>>>(failure_with_null).is_ok());
+    }
     /// A wall-clock rollback cannot extend an invocation beyond its original monotonic lifetime.
     #[test]
     fn invocation_expiry_fences_both_clocks() -> Result<(), Box<dyn std::error::Error>> {
@@ -1642,11 +1681,15 @@ mod tests {
             bridge_credential_file: path.join("token"),
             bridge_producer_id: "pool-test".into(),
             bridge_audience: "pool-test-backend".into(),
+            bridge_server_executable: "/fixture/bridge".into(),
+            bridge_server_sha256: "0".repeat(64),
             bridge_observer_socket: None,
             bridge_observer_credential_file: None,
             owner_observer_credential_file: None,
             run_socket: Some(path.join("run.sock")),
             run_peer_uid: None,
+            managed_run_reader: None,
+            managed_run_transport: None,
         }
     }
 

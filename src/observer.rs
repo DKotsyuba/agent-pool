@@ -31,6 +31,8 @@ pub enum Operation {
     Identity(IdentityParams),
     /// All pools, independent of participant membership, in ascending stable ID order.
     List(domain::List),
+    /// Source-fenced retained inventory with a complete current roster per row.
+    InventorySnapshot(InventoryRequest),
     /// One independently paged section; mappings require an explicit opt-in.
     Get(Get),
 }
@@ -38,6 +40,55 @@ pub enum Operation {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IdentityParams {}
+/// Stable selection for the inventory page; totals always cover the entire source.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InventoryFilter {
+    /// Include every retained pool.
+    All,
+    /// Include only explicitly closed pools.
+    Closed,
+    /// Include only pools not explicitly closed.
+    NotClosed,
+}
+/// Explicit continuation binding. Its contents are opaque to consumers.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryCursor {
+    /// Cursor format version.
+    pub version: u8,
+    /// Exact source captured on the first page.
+    pub source: InventorySource,
+    /// Selection captured on the first page.
+    pub filter: InventoryFilter,
+    /// Page bound captured on the first page.
+    pub limit: u8,
+    /// Exclusive pool ID boundary.
+    pub after: String,
+}
+/// Source identity and restart/write fences, represented without numeric precision loss.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InventorySource {
+    /// Durable identity of this SQLite store.
+    pub store_id: String,
+    /// Fresh resident-store-open epoch; cursors cannot cross a reopen.
+    pub read_epoch: String,
+    /// Monotonic committed source revision in canonical decimal text.
+    pub revision: String,
+}
+/// Inventory selector and optional continuation, repeated unchanged on every page.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryRequest {
+    /// Selection, independent from source-wide totals.
+    pub filter: InventoryFilter,
+    /// Maximum number of pools, 1 through 10.
+    pub limit: u8,
+    /// Omit or null to start; otherwise pass the exact previous next_cursor.
+    #[serde(default)]
+    pub cursor: Option<InventoryCursor>,
+}
 /// Owner-specific arguments; existing participant Get semantics remain unchanged.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -201,6 +252,18 @@ impl Request {
         match &self.operation {
             Operation::Identity(_) => Ok(()),
             Operation::List(args) => domain::Command::List(args.clone()).validate(),
+            Operation::InventorySnapshot(args) => {
+                if !(1..=10).contains(&args.limit) {
+                    return Err(Fault::Invalid);
+                }
+                if let Some(cursor) = &args.cursor {
+                    domain::identifier(&cursor.after)?;
+                    if cursor.version != 1 {
+                        return Err(Fault::Invalid);
+                    }
+                }
+                Ok(())
+            }
             Operation::Get(args) if args.section == "decisions" => {
                 domain::identifier(&args.pool_id)?;
                 i64::try_from(args.after).map_err(|_| Fault::Invalid)?;
@@ -234,6 +297,7 @@ impl Request {
         match self.operation {
             Operation::Identity(_) => "identity",
             Operation::List(_) => "pool_page",
+            Operation::InventorySnapshot(_) => "inventory_snapshot",
             Operation::Get(ref args) if args.section == "run_proof" => "run_proof",
             Operation::Get(_) => "pool_detail",
         }
@@ -280,6 +344,8 @@ pub struct Envelope {
 pub enum Data {
     /// Authenticated product identity.
     Identity(Identity),
+    /// Fenced inventory and source-wide totals.
+    Inventory(Box<InventorySnapshot>),
     /// Complete metadata rows for one pool inventory page.
     Pools(PoolPage),
     /// Existing safe section projection plus explicit owner-only mappings when requested.
@@ -410,7 +476,7 @@ pub struct Page {
     pub returned: usize,
     /// Source snapshot observation time, in Unix milliseconds.
     pub observed_at_unix_ms: u64,
-    /// Historical timestamps are absent from Store schema v5, explicitly null.
+    /// Historical timestamps are absent from Store schema v8, explicitly null.
     pub source_timestamp: Option<u64>,
     /// Explicit paging/snapshot and missing timestamp limitations.
     pub coverage: String,
@@ -423,6 +489,53 @@ pub struct PoolPage {
     /// Paging and freshness metadata.
     #[serde(flatten)]
     pub page: Page,
+}
+/// Source-wide retained counts; null denotes unsupported completion classification.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryTotals {
+    /// All retained pools.
+    pub total: String,
+    /// Unsupported until atomic completion classification exists.
+    pub open: Option<String>,
+    /// Unsupported until atomic completion records exist.
+    pub completed: Option<String>,
+    /// Pools whose completion classification is unsupported.
+    pub unknown: String,
+    /// Explicitly closed pools, independent of completion classification.
+    pub closed: String,
+}
+/// One pool and its full current compact roster; leader is never a roster member.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryRow {
+    /// Metadata with proposal and criteria omitted and long purpose previewed.
+    pub pool: domain::Pool,
+    /// Stable owner identity, distinct from the roster.
+    pub leader_id: String,
+    /// Full current roster, in stable slot order, with no private bindings.
+    pub roster: Vec<domain::Member>,
+}
+/// One page and totals from the same SQLite read snapshot.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InventorySnapshot {
+    /// Durable source identity and revision fence.
+    pub source: InventorySource,
+    /// Source-wide retained counts, independent of the page filter.
+    pub totals: InventoryTotals,
+    /// Explicit limits on classification and retention coverage.
+    pub coverage: String,
+    /// Selected complete roster rows.
+    pub pools: Vec<InventoryRow>,
+    /// Number of pool rows returned.
+    pub returned: usize,
+    /// Whether a further selected row exists.
+    pub has_more: bool,
+    /// Present exactly when has_more is true.
+    pub next_cursor: Option<InventoryCursor>,
+    /// Time at which the result was assembled, not a historical source timestamp.
+    pub observed_at_unix_ms: u64,
 }
 /// One independent section; execution, voting, acceptance and delivery retain their own states.
 #[derive(Serialize, Deserialize)]
@@ -449,7 +562,7 @@ impl Page {
     /// Constructs truthful metadata; each request is a current resident snapshot, not a cross-page snapshot.
     pub fn new(cursor: Option<String>, has_more: bool, returned: usize) -> Result<Self, Fault> {
         Ok(Self { cursor, has_more, returned, observed_at_unix_ms: now()?, source_timestamp:None,
-            coverage:"Selected section only; follow cursor while has_more. Pages observe current state independently. Historical source timestamps are not recorded in Store schema v5.".into() })
+            coverage:"Selected section only; follow cursor while has_more. Pages observe current state independently. Historical source timestamps are not recorded in Store schema v8.".into() })
     }
 }
 /// Returns current Unix milliseconds, refusing clocks before the epoch or unrepresentable values.
@@ -491,6 +604,7 @@ impl Envelope {
                 "message_parts_v1".into(),
                 "content_pages_v1".into(),
                 "run_proof_v1".into(),
+                "inventory_snapshot_v1".into(),
             ],
             observed_at_unix_ms: now()?,
         }))
@@ -580,6 +694,7 @@ pub async fn frontend(request: Request, path: &Path) -> Result<Envelope, Fault> 
                 (expected_kind, data),
                 ("identity", Data::Identity(_))
                     | ("pool_page", Data::Pools(_))
+                    | ("inventory_snapshot", Data::Inventory(_))
                     | ("pool_detail", Data::Detail(_))
                     | ("run_proof", Data::RunProof(_))
             )
@@ -769,7 +884,7 @@ mod tests {
         fs::write(
             &config,
             format!(
-                "socket_path={socket:?}\ndatabase_path={:?}\nexpected_uid={}\nbridge_registration_socket={:?}\nbridge_core_socket={:?}\nbridge_credential_file={:?}\nbridge_producer_id=\"fixture\"\nbridge_audience=\"fixture\"\nowner_observer_credential_file={token:?}\n",
+                "socket_path={socket:?}\ndatabase_path={:?}\nexpected_uid={}\nbridge_registration_socket={:?}\nbridge_core_socket={:?}\nbridge_credential_file={:?}\nbridge_producer_id=\"fixture\"\nbridge_audience=\"fixture\"\nbridge_server_executable=\"/fixture/bridge\"\nbridge_server_sha256=\"0000000000000000000000000000000000000000000000000000000000000000\"\nowner_observer_credential_file={token:?}\n",
                 path.join("unused.db"),
                 fs::metadata(path)?.uid(),
                 path.join("registration"),

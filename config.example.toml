@@ -9,6 +9,9 @@ bridge_core_socket = "/absolute/private/agent-bridge/core.sock"
 bridge_credential_file = "/absolute/private/agent-pool/producer.token"
 bridge_producer_id = "agent-pool"
 bridge_audience = "agent-pool-backend"
+# Required same-connection server build pin for every managed B1 exchange.
+bridge_server_executable = "/absolute/path/to/bridge"
+bridge_server_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 # Optional separate opt-in read grant; both fields must be present together.
 # bridge_observer_socket = "/absolute/private/agent-bridge/adapter.sock"
 # bridge_observer_credential_file = "/absolute/private/agent-pool/observer.token"
@@ -24,3 +27,29 @@ bridge_audience = "agent-pool-backend"
 # Optional independent owner-only Pool observation grant; absent disables `observe`.
 # Provision a separate protected token explicitly; this is not a Bridge assertion or grant.
 # owner_observer_credential_file = "/absolute/private/agent-pool/owner-observer.token"
+# Optional private Run reader for the P1 outcome/seal endpoint. This grant does not
+# enable managed participant commands. Provision the exact executable and routes.
+# [managed_run_reader]
+# executable = "/absolute/path/to/agent-run"
+# sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+# run_store_id = "store_00000000000000000000000000000000"
+# run_route_id = "run-route"
+# bridge_store_id = "00000000-0000-4000-8000-000000000001"
+# bridge_route_id = "bridge-route"
+# producer = "agent-pool"
+# Optional private Run attempt endpoint. It never falls back to the legacy socket.
+# Enabling the stdio frontend also requires the matching managed_run_reader grant.
+# Bridge frontend and consumer grants use the same agent-pool executable and hash;
+# Bridge verifies their distinct process roles. mcp_server matches Bridge's mapping.
+# [managed_run_transport]
+# frontend_enabled = false
+# mcp_server = "pool"
+# socket = "/absolute/private/agent-run/attempt.sock"
+# executable = "/absolute/path/to/agent-run"
+# sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+# run_store_id = "store_00000000000000000000000000000000"
+# run_route_id = "run-route"
+# pool_route_id = "pool-route"
+# bridge_store_id = "00000000-0000-4000-8000-000000000001"
+# bridge_route_id = "bridge-route"
+# producer = "agent-pool"

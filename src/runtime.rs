@@ -7,6 +7,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashSet,
     fs,
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
@@ -28,6 +29,51 @@ const MAX_WAITERS: usize = 8;
 const OBSERVATION_INTERVAL: Duration = Duration::from_secs(5);
 /// One SQLite writer shared only through finite blocking store operations.
 type SharedStore = Arc<Mutex<Store>>;
+
+/// A live frontend and recovery must never drive the same durable work at once.
+#[derive(Clone, Hash, PartialEq, Eq)]
+enum ManagedWork {
+    Bootstrap(String),
+    Intent(String),
+}
+#[derive(Default)]
+struct ManagedActivity {
+    active: Mutex<HashSet<ManagedWork>>,
+}
+#[derive(Clone)]
+struct ManagedLease {
+    _inner: Arc<ManagedLeaseInner>,
+}
+struct ManagedLeaseInner {
+    activity: Arc<ManagedActivity>,
+    work: ManagedWork,
+}
+impl Drop for ManagedLeaseInner {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.activity.active.lock() {
+            active.remove(&self.work);
+        }
+    }
+}
+impl ManagedActivity {
+    fn acquire(self: &Arc<Self>, work: ManagedWork) -> Result<Option<ManagedLease>, Fault> {
+        let mut active = self.active.lock().map_err(|_| Fault::Unavailable)?;
+        if active.contains(&work) {
+            return Ok(None);
+        }
+        if active.len() >= MAX_CONNECTIONS * 2 + 2 {
+            return Ok(None);
+        }
+        active.insert(work.clone());
+        drop(active);
+        Ok(Some(ManagedLease {
+            _inner: Arc::new(ManagedLeaseInner {
+                activity: Arc::clone(self),
+                work,
+            }),
+        }))
+    }
+}
 
 /// One private resident request; identity is an issuer secret plus exact invocation, never arguments.
 #[derive(Serialize, Deserialize)]
@@ -76,6 +122,531 @@ where
     .map_err(|_| Fault::Internal)?
 }
 
+/// Keep the lease inside a blocking closure even if its async caller is cancelled.
+async fn stored_managed<T, F>(
+    store: &SharedStore,
+    lease: &ManagedLease,
+    operation: F,
+) -> Result<T, Fault>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut Store) -> Result<T, Fault> + Send + 'static,
+{
+    let lease = lease.clone();
+    stored(store, move |store| {
+        let _lease = lease;
+        operation(store)
+    })
+    .await
+}
+
+/// Pin both endpoints of the managed local session to this exact loaded Pool build.
+async fn verify_managed_peer(stream: &UnixStream, uid: u32) -> Result<(), Fault> {
+    let credentials = stream.peer_cred().map_err(|_| Fault::Unauthorized)?;
+    let pid = u32::try_from(credentials.pid().ok_or(Fault::Unauthorized)?)
+        .map_err(|_| Fault::Unauthorized)?;
+    if credentials.uid() != uid || pid == std::process::id() {
+        return Err(Fault::Unauthorized);
+    }
+    tokio::task::spawn_blocking(move || {
+        use sha2::Digest;
+        use std::sync::OnceLock;
+        static SELF_PIN: OnceLock<Result<(PathBuf, String), Fault>> = OnceLock::new();
+        let (executable, sha256) = SELF_PIN
+            .get_or_init(|| {
+                let executable =
+                    fs::canonicalize(std::env::current_exe().map_err(|_| Fault::Unavailable)?)
+                        .map_err(|_| Fault::Unavailable)?;
+                let loaded = fs::metadata("/proc/self/exe").map_err(|_| Fault::Unavailable)?;
+                let path = fs::metadata(&executable).map_err(|_| Fault::Unavailable)?;
+                if !loaded.is_file()
+                    || loaded.len() > 512 * 1024 * 1024
+                    || (loaded.dev(), loaded.ino()) != (path.dev(), path.ino())
+                {
+                    return Err(Fault::Unavailable);
+                }
+                let bytes = fs::read("/proc/self/exe").map_err(|_| Fault::Unavailable)?;
+                let after = fs::metadata("/proc/self/exe").map_err(|_| Fault::Unavailable)?;
+                if (
+                    loaded.dev(),
+                    loaded.ino(),
+                    loaded.len(),
+                    loaded.mtime(),
+                    loaded.mtime_nsec(),
+                    loaded.ctime(),
+                    loaded.ctime_nsec(),
+                ) != (
+                    after.dev(),
+                    after.ino(),
+                    after.len(),
+                    after.mtime(),
+                    after.mtime_nsec(),
+                    after.ctime(),
+                    after.ctime_nsec(),
+                ) {
+                    return Err(Fault::Unavailable);
+                }
+                Ok((executable, format!("{:x}", sha2::Sha256::digest(bytes))))
+            })
+            .clone()?;
+        let route = crate::managed_state::Route {
+            component_store_id: String::new(),
+            route_id: String::new(),
+            worker_uid: uid,
+        };
+        let peer = crate::managed_run::RunPeer {
+            socket: PathBuf::new(),
+            expected_uid: uid,
+            executable,
+            sha256,
+            route: route.clone(),
+            pool_route: route.clone(),
+            bridge_route: route,
+            producer: String::new(),
+            recovery_capabilities: Vec::new(),
+        };
+        crate::managed_run::verify_peer(pid, &peer).map_err(|_| Fault::Unauthorized)
+    })
+    .await
+    .map_err(|_| Fault::Unavailable)?
+}
+
+pub(crate) async fn connect_managed_peer(path: &Path, uid: u32) -> Result<UnixStream, Fault> {
+    let stream = integrations::connect(path, uid).await?;
+    verify_managed_peer(&stream, uid).await?;
+    Ok(stream)
+}
+
+/// Original-observation bootstrap and admitted-command orchestration.
+mod managed_dispatch {
+    use super::*;
+    use crate::{
+        managed_bridge::Consumed,
+        managed_run::{
+            Admission, ConsensusAuthority, CurrentAuthority, IngressInput, IngressQuery, RunError,
+            RunPeer,
+        },
+        managed_state::{
+            AdmissionPlan, ConsensusFence, IntentReservation, PendingConsensus, Route,
+            RunAuthority, RunPin, VoterState,
+        },
+    };
+    use std::{future::Future, pin::Pin};
+
+    pub(super) type Response<'a, T, E = Fault> =
+        Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
+
+    pub(super) trait IngressClient {
+        fn current<'a>(
+            &'a self,
+            query: &'a IngressQuery,
+        ) -> Response<'a, CurrentAuthority, RunError>;
+    }
+    impl IngressClient for RunPeer {
+        fn current<'a>(
+            &'a self,
+            query: &'a IngressQuery,
+        ) -> Response<'a, CurrentAuthority, RunError> {
+            Box::pin(async move { self.current_ingress(query).await })
+        }
+    }
+
+    /// Retain the original staged request on early-hook not-ready; no newer
+    /// process snapshot or alternate route is substituted during retry.
+    pub(super) async fn ingress<C: IngressClient>(
+        store: &SharedStore,
+        activity: &Arc<ManagedActivity>,
+        bootstrap: &ManagedLease,
+        bootstrap_id: String,
+        pin: RunPin,
+        input: IngressInput,
+        client: &C,
+    ) -> Result<CurrentAuthority, Fault> {
+        if !Arc::ptr_eq(&bootstrap._inner.activity, activity)
+            || bootstrap._inner.work != ManagedWork::Bootstrap(bootstrap_id.clone())
+        {
+            return Err(Fault::Unauthorized);
+        }
+        let request_id = input.request_id.clone();
+        let query = stored_managed(store, bootstrap, move |store| {
+            store.managed_stage_ingress(&bootstrap_id, &pin, input)
+        })
+        .await?;
+        let authority = tokio::time::timeout(EXCHANGE_TIMEOUT, async {
+            loop {
+                match client.current(&query).await {
+                    Ok(authority) => break Ok(authority),
+                    Err(RunError::NotReady) => tokio::time::sleep(Duration::from_millis(250)).await,
+                    Err(_) => break Err(Fault::Unavailable),
+                }
+            }
+        })
+        .await
+        .map_err(|_| Fault::Unavailable)??;
+        stored_managed(store, bootstrap, move |store| {
+            store.managed_record_current(&request_id, &authority)?;
+            Ok(authority)
+        })
+        .await
+    }
+
+    pub(super) trait Client {
+        fn admit<'a>(&'a self, plan: &'a AdmissionPlan) -> Response<'a, Admission, RunError>;
+        fn consensus<'a>(
+            &'a self,
+            pending: PendingConsensus,
+            store: &'a SharedStore,
+            lease: &'a ManagedLease,
+        ) -> Response<'a, ConsensusFence>;
+    }
+
+    pub(super) trait SessionClient:
+        IngressClient + Client + Clone + Send + Sync + 'static
+    {
+        fn current_pin<'a>(&'a self) -> Response<'a, RunPin>;
+        fn endpoint(&self) -> crate::managed_state::RunEndpointPin;
+        fn pool_route(&self) -> Route;
+        fn consume(
+            &self,
+            key: &crate::managed_bridge::ConsumeKey<'_>,
+            assertion: &bridge_sdk::bridge_protocol::Secret,
+            server: &str,
+            command: &Command,
+            epoch: &str,
+        ) -> Result<Consumed, crate::managed_bridge::BridgeFailure>;
+    }
+
+    #[derive(Clone)]
+    pub(super) struct LiveSessionClient {
+        pub config: Config,
+        pub peer: RunPeer,
+        pub bridge: crate::managed_bridge::SdkBridge,
+    }
+    impl IngressClient for LiveSessionClient {
+        fn current<'a>(
+            &'a self,
+            query: &'a IngressQuery,
+        ) -> Response<'a, CurrentAuthority, RunError> {
+            Box::pin(async move { self.peer.current_ingress(query).await })
+        }
+    }
+    impl Client for LiveSessionClient {
+        fn admit<'a>(&'a self, plan: &'a AdmissionPlan) -> Response<'a, Admission, RunError> {
+            Box::pin(async move {
+                ConfiguredClient {
+                    config: &self.config,
+                }
+                .admit(plan)
+                .await
+            })
+        }
+        fn consensus<'a>(
+            &'a self,
+            pending: PendingConsensus,
+            store: &'a SharedStore,
+            lease: &'a ManagedLease,
+        ) -> Response<'a, ConsensusFence> {
+            Box::pin(async move {
+                ConfiguredClient {
+                    config: &self.config,
+                }
+                .consensus(pending, store, lease)
+                .await
+            })
+        }
+    }
+    impl SessionClient for LiveSessionClient {
+        fn current_pin<'a>(&'a self) -> Response<'a, RunPin> {
+            Box::pin(async move {
+                self.peer
+                    .current_pin("attempt_current_ingress_v1")
+                    .await
+                    .map_err(|_| Fault::Unavailable)
+            })
+        }
+        fn endpoint(&self) -> crate::managed_state::RunEndpointPin {
+            self.peer.endpoint_pin()
+        }
+        fn pool_route(&self) -> Route {
+            self.peer.pool_route.clone()
+        }
+        fn consume(
+            &self,
+            key: &crate::managed_bridge::ConsumeKey<'_>,
+            assertion: &bridge_sdk::bridge_protocol::Secret,
+            server: &str,
+            command: &Command,
+            epoch: &str,
+        ) -> Result<Consumed, crate::managed_bridge::BridgeFailure> {
+            crate::managed_bridge::consume_original(
+                &self.bridge,
+                key,
+                assertion,
+                server,
+                command,
+                epoch,
+            )
+        }
+    }
+
+    /// Uses only the original configured and durably pinned Run routes.
+    pub(super) struct ConfiguredClient<'a> {
+        pub config: &'a Config,
+    }
+    impl Client for ConfiguredClient<'_> {
+        fn admit<'a>(&'a self, plan: &'a AdmissionPlan) -> Response<'a, Admission, RunError> {
+            Box::pin(async move {
+                let peer = RunPeer::from_recovery(self.config, &plan.recovery)?;
+                peer.admit(
+                    &crate::domain::id(),
+                    &plan.recovery.intent_id,
+                    &plan.recovery.security_digest,
+                    &plan.binding,
+                    &plan.recovery.consumed_ref,
+                )
+                .await
+            })
+        }
+        fn consensus<'a>(
+            &'a self,
+            pending: PendingConsensus,
+            store: &'a SharedStore,
+            lease: &'a ManagedLease,
+        ) -> Response<'a, ConsensusFence> {
+            Box::pin(async move {
+                let voters = pending.voters().to_vec();
+                let mut observations = Vec::with_capacity(voters.len());
+                for voter in &voters {
+                    let peer = RunPeer::from_config(self.config, &voter.binding.pool_store_id)
+                        .map_err(|_| Fault::Unavailable)?;
+                    if peer.route != voter.binding.run_route {
+                        return Err(Fault::Unavailable);
+                    }
+                    let endpoint = peer.endpoint_pin();
+                    stored_managed(store, lease, move |store| {
+                        store.managed_require_run_pin(&endpoint)
+                    })
+                    .await?;
+                    let pin = peer
+                        .current_pin("attempt_consensus_v1")
+                        .await
+                        .map_err(|_| Fault::Unavailable)?;
+                    let request_id = crate::domain::id();
+                    let transport_id = crate::domain::id();
+                    let voter = voter.clone();
+                    let query = stored_managed(store, lease, move |store| {
+                        store.managed_stage_voter(&pin, &voter, &request_id, &transport_id)
+                    })
+                    .await?;
+                    observations.push(
+                        peer.collect_voters(&[query])
+                            .await
+                            .map_err(|_| Fault::Unavailable)?,
+                    );
+                }
+                let authority =
+                    ConsensusAuthority::combine(observations).map_err(|_| Fault::Unavailable)?;
+                for voter in &voters {
+                    let observation = authority.consensus(
+                        &voter.binding.run_route,
+                        &voter.attempt,
+                        &voter.incarnation,
+                    );
+                    if !matches!(observation, Ok(ref result) if result.state == VoterState::Superseded)
+                    {
+                        continue;
+                    }
+                    let peer = RunPeer::from_config(self.config, &voter.binding.pool_store_id)
+                        .map_err(|_| Fault::Unavailable)?;
+                    if peer.route != voter.binding.run_route {
+                        return Err(Fault::Unavailable);
+                    }
+                    let endpoint = peer.endpoint_pin();
+                    stored_managed(store, lease, move |store| {
+                        store.managed_require_run_pin(&endpoint)
+                    })
+                    .await?;
+                    let pin = peer
+                        .current_pin("attempt_current_egress_v1")
+                        .await
+                        .map_err(|_| Fault::Unavailable)?;
+                    let request_id = crate::domain::id();
+                    let transport_id = crate::domain::id();
+                    let staged_id = request_id.clone();
+                    let bound = voter.attempt.clone();
+                    let query = stored_managed(store, lease, move |store| {
+                        store.managed_stage_egress(&pin, &bound, &staged_id, &transport_id)
+                    })
+                    .await?;
+                    let current = peer
+                        .current_egress(&query)
+                        .await
+                        .map_err(|_| Fault::Unavailable)?;
+                    if current.receipt().attempt == voter.attempt {
+                        return Err(Fault::Unavailable);
+                    }
+                    let mut successor = voter.binding.clone();
+                    successor.attempt = current.receipt().attempt.clone();
+                    successor.actor = current.receipt().actor.clone();
+                    let incarnation = current.receipt().incarnation.clone();
+                    let old = voter.binding.clone();
+                    stored_managed(store, lease, move |store| {
+                        store.managed_record_current(&request_id, &current)?;
+                        store.managed_rebind(&current, &old, &successor, &incarnation, "egress")
+                    })
+                    .await?;
+                }
+                pending.verify(&authority)
+            })
+        }
+    }
+
+    pub(super) struct Read {
+        pub bootstrap_id: String,
+        pub context_id: String,
+        pub command: Command,
+        pub digest: String,
+        pub authorities: Vec<CurrentAuthority>,
+        pub consumed: Consumed,
+    }
+
+    /// Immediate reads use the same live bootstrap lease and binding CAS.
+    pub(super) async fn read(
+        store: &SharedStore,
+        activity: &Arc<ManagedActivity>,
+        bootstrap: &ManagedLease,
+        request: Read,
+    ) -> Result<Reply, Fault> {
+        if !Arc::ptr_eq(&bootstrap._inner.activity, activity)
+            || bootstrap._inner.work != ManagedWork::Bootstrap(request.bootstrap_id.clone())
+        {
+            return Err(Fault::Unauthorized);
+        }
+        stored_managed(store, bootstrap, move |store| {
+            store.managed_read(
+                &request.bootstrap_id,
+                &request.context_id,
+                &request.command,
+                &request.digest,
+                &request.authorities,
+                &request.consumed,
+            )
+        })
+        .await
+    }
+
+    pub(super) struct Mutation {
+        pub bootstrap_id: String,
+        pub context_id: String,
+        pub intent_id: String,
+        pub member_id: String,
+        pub command: Command,
+        pub digest: String,
+        pub authority: CurrentAuthority,
+        pub consumed: Consumed,
+        pub pool_route: Route,
+    }
+
+    /// The bootstrap lease is acquired before Bridge I/O and transferred only
+    /// after the intent lease is held. No store mutex crosses Run I/O.
+    pub(super) async fn mutation<C: Client>(
+        store: &SharedStore,
+        activity: &Arc<ManagedActivity>,
+        bootstrap: &ManagedLease,
+        request: Mutation,
+        client: &C,
+    ) -> Result<IntentReservation, Fault> {
+        if !Arc::ptr_eq(&bootstrap._inner.activity, activity)
+            || bootstrap._inner.work != ManagedWork::Bootstrap(request.bootstrap_id.clone())
+        {
+            return Err(Fault::Unauthorized);
+        }
+        let Some(lease) = activity.acquire(ManagedWork::Intent(request.intent_id.clone()))? else {
+            return Err(Fault::Unavailable);
+        };
+        let intent_id = request.intent_id.clone();
+        let digest = request.digest.clone();
+        let is_vote = matches!(request.command, Command::Vote(_));
+        let (reservation, plan) = stored_managed(store, &lease, move |store| {
+            store.managed_reserve(
+                &request.bootstrap_id,
+                &request.context_id,
+                &request.intent_id,
+                &request.member_id,
+                &request.command,
+                &request.digest,
+                request.authority,
+                &request.consumed,
+                &request.pool_route,
+            )
+        })
+        .await?;
+        if reservation != IntentReservation::Created {
+            return Ok(reservation);
+        }
+        let plan = plan.ok_or(Fault::Internal)?;
+        let result = async {
+            // A definitive early-hook refusal may retry the exact same intent
+            // while Run rechecks the original Bridge observation. This local
+            // deadline bounds waiting; it never infers Bridge freshness.
+            let admission = tokio::time::timeout(EXCHANGE_TIMEOUT, async {
+                loop {
+                    match client.admit(&plan).await {
+                        Ok(admission) => break Ok(admission),
+                        Err(RunError::NotReady) => {
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                        }
+                        Err(_) => break Err(Fault::Unavailable),
+                    }
+                }
+            })
+            .await
+            .map_err(|_| Fault::Unavailable)??;
+            let id = intent_id.clone();
+            let hash = digest.clone();
+            stored_managed(store, &lease, move |store| {
+                store.managed_mark_admitted(&id, &hash, &admission)
+            })
+            .await?;
+            if is_vote {
+                let id = intent_id.clone();
+                let hash = digest.clone();
+                let pending = stored_managed(store, &lease, move |store| {
+                    store.managed_snapshot_consensus(&id, &hash)
+                })
+                .await?;
+                let fence = client.consensus(pending, store, &lease).await?;
+                let id = intent_id.clone();
+                let hash = digest.clone();
+                stored_managed(store, &lease, move |store| {
+                    store.managed_commit_vote(&id, &hash, fence)
+                })
+                .await
+            } else {
+                let id = intent_id.clone();
+                let hash = digest.clone();
+                stored_managed(store, &lease, move |store| {
+                    store.managed_commit_domain(&id, &hash)
+                })
+                .await
+            }
+        }
+        .await;
+        match result {
+            Ok(receipt) => Ok(IntentReservation::Committed(receipt)),
+            Err(error) => {
+                // If commit already won, this conflicts without undoing it; the
+                // recovery worker settles the retained terminal outcome.
+                let _ = stored_managed(store, &lease, move |store| {
+                    store.managed_terminal_abort(&intent_id, &digest)
+                })
+                .await;
+                Err(error)
+            }
+        }
+    }
+}
+
 /// Executes one actual MCP invocation against an already running resident.
 /// Registering original metadata occurs in this process before any IPC forwarding.
 /// EOF of this frontend never stops or starts the separately owned resident.
@@ -90,6 +661,13 @@ pub async fn frontend(
         .await
         .map_err(|_| Fault::Internal)??;
     integrations::own_uid(config.expected_uid)?;
+    if config
+        .managed_run_transport
+        .as_ref()
+        .is_some_and(|transport| transport.frontend_enabled)
+    {
+        return crate::managed_session::frontend(command, original_meta, &config).await;
+    }
     let assertion = integrations::register(config.clone(), original_meta).await?;
     let request = Request {
         assertion,
@@ -118,12 +696,380 @@ pub async fn frontend(
     .map_err(|_| Fault::Unavailable)?
 }
 
+/// One authenticated managed frontend session, with all remote operations outside SQLite locks.
+async fn managed_session(
+    stream: &mut UnixStream,
+    config: &Config,
+    store: &SharedStore,
+    activity: &Arc<ManagedActivity>,
+    begin: crate::managed_session::Begin,
+) -> Result<(), Fault> {
+    let transport = config
+        .managed_run_transport
+        .as_ref()
+        .ok_or(Fault::Unavailable)?;
+    if !transport.frontend_enabled || begin.version != 1 {
+        return Err(Fault::Unavailable);
+    }
+    match &begin.proof {
+        bridge_sdk::bridge_protocol::CallEvidence::Native {
+            host:
+                bridge_sdk::bridge_protocol::Host::Codex | bridge_sdk::bridge_protocol::Host::ClaudeCode,
+            ..
+        } => {}
+        _ => return Err(Fault::Unauthorized),
+    }
+    let (command, normalized) = crate::managed_codec::normalize_command(begin.command.clone())?;
+    if matches!(
+        command,
+        Command::Join(_) | Command::Start(_) | Command::StartBatch(_) | Command::Replace(_)
+    ) || matches!(&command, Command::Get(get) if get.wait_seconds > 0.0)
+    {
+        return Err(Fault::Unavailable);
+    }
+    let route = crate::managed_state::Route {
+        component_store_id: transport.bridge_store_id.clone(),
+        route_id: transport.bridge_route_id.clone(),
+        worker_uid: config.expected_uid,
+    };
+    let capture_config = config.clone();
+    let capture_route = route.clone();
+    let (bridge, bridge_pin) = tokio::task::spawn_blocking(move || {
+        crate::managed_bridge::SdkBridge::capture(&capture_config, capture_route)
+    })
+    .await
+    .map_err(|_| Fault::Unavailable)??;
+    if bridge_pin != begin.bridge_pin {
+        return Err(Fault::Conflict);
+    }
+    let Some(lease) = activity.acquire(ManagedWork::Bootstrap(begin.bootstrap_id.clone()))? else {
+        return Err(Fault::Unavailable);
+    };
+    let store_id = stored_managed(store, &lease, |store| store.managed_store_id()).await?;
+    let peer = crate::managed_run::RunPeer::from_config(config, &store_id)
+        .map_err(|_| Fault::Unavailable)?;
+    let services = managed_dispatch::LiveSessionClient {
+        config: config.clone(),
+        peer,
+        bridge,
+    };
+    managed_session_core(
+        stream, config, store, activity, begin, command, normalized, bridge_pin, lease, services,
+    )
+    .await
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Authenticated session state and fixed service endpoints"
+)]
+async fn managed_session_core<S: managed_dispatch::SessionClient>(
+    stream: &mut UnixStream,
+    config: &Config,
+    store: &SharedStore,
+    activity: &Arc<ManagedActivity>,
+    begin: crate::managed_session::Begin,
+    command: Command,
+    normalized: serde_json::Value,
+    bridge_pin: crate::managed_bridge::BridgePin,
+    lease: ManagedLease,
+    services: S,
+) -> Result<(), Fault> {
+    use crate::managed_session::{ClientFrame, FrozenContext, ServerFrame};
+    let transport = config
+        .managed_run_transport
+        .as_ref()
+        .ok_or(Fault::Unavailable)?;
+    let route = bridge_pin.route.clone();
+    let endpoint = services.endpoint();
+    let persisted_pin = bridge_pin.clone();
+    stored_managed(store, &lease, move |store| {
+        store.managed_pin_routes(&persisted_pin, &endpoint)
+    })
+    .await?;
+    crate::managed_session::send(stream, &ServerFrame::Ready).await?;
+    let epoch = match crate::managed_session::receive::<ClientFrame>(stream).await? {
+        ClientFrame::Epoch { issuer_epoch }
+            if !issuer_epoch.is_empty()
+                && issuer_epoch.len() <= 256
+                && !issuer_epoch.chars().any(char::is_control) =>
+        {
+            issuer_epoch
+        }
+        _ => return Err(Fault::Invalid),
+    };
+    let bootstrap_id = begin.bootstrap_id.clone();
+    let invocation = begin.invocation_key.clone();
+    let epoch_for_store = epoch.clone();
+    let command_for_store = command.clone();
+    let proof_for_store = begin.proof.clone();
+    let pin_for_store = bridge_pin.clone();
+    let (namespace, dispatch) = stored_managed(store, &lease, move |store| {
+        store.managed_begin_bootstrap(
+            &bootstrap_id,
+            &invocation,
+            &epoch_for_store,
+            &command_for_store,
+            &proof_for_store,
+            &pin_for_store,
+        )
+    })
+    .await?;
+    crate::managed_session::send(stream, &ServerFrame::Reserved).await?;
+    let prepared = match crate::managed_session::receive::<ClientFrame>(stream).await? {
+        ClientFrame::StaleEpoch => {
+            stored_managed(store, &lease, move |store| {
+                store.managed_stale_bootstrap(dispatch)
+            })
+            .await?;
+            crate::managed_session::send(stream, &ServerFrame::RetryEpoch).await?;
+            return Ok(());
+        }
+        ClientFrame::Prepared {
+            store_id,
+            bridge_context_ref,
+            invocation_key,
+            expires_at_ms,
+        } if expires_at_ms > 0 => crate::managed_bridge::Prepared {
+            store_id,
+            bridge_context_ref,
+            invocation_key,
+            expires_at_ms,
+        },
+        _ => return Err(Fault::Invalid),
+    };
+    let observation_ref = prepared.bridge_context_ref.clone();
+    let pin_for_store = bridge_pin.clone();
+    stored_managed(store, &lease, move |store| {
+        store.managed_record_bootstrap_ref(dispatch, &prepared, &pin_for_store)
+    })
+    .await?;
+    let run_pin = services.current_pin().await?;
+    let ingress = crate::managed_run::IngressInput {
+        bridge_route: route.clone(),
+        producer: config.bridge_producer_id.clone(),
+        observation_ref: observation_ref.clone(),
+        invocation_key: begin.invocation_key.clone(),
+        request_id: crate::domain::id(),
+        transport_id: crate::domain::id(),
+    };
+    let initial = managed_dispatch::ingress(
+        store,
+        activity,
+        &lease,
+        begin.bootstrap_id.clone(),
+        run_pin.clone(),
+        ingress,
+        &services,
+    )
+    .await?;
+    let context_id = crate::domain::id();
+    let intent_id = crate::domain::id();
+    let nonce = crate::domain::id();
+    let registration_id = crate::domain::id();
+    let command_for_store = command.clone();
+    let route_for_store = route.clone();
+    let producer = config.bridge_producer_id.clone();
+    let audience = config.bridge_audience.clone();
+    let invocation = begin.invocation_key.clone();
+    let context_for_store = context_id.clone();
+    let intent_for_store = intent_id.clone();
+    let bootstrap_for_store = begin.bootstrap_id.clone();
+    let registration_for_store = registration_id.clone();
+    let pin_for_store = bridge_pin.clone();
+    let (context, digest, binding) = stored_managed(store, &lease, move |store| {
+        let binding = store.managed_select_ingress_binding(
+            &initial,
+            &route_for_store,
+            &producer,
+            &command_for_store,
+        )?;
+        let context = crate::managed_state::SecurityContext {
+            version: 1,
+            command_schema: "pool-command-v1".into(),
+            pool_store_id: binding.pool_store_id.clone(),
+            audience,
+            producer,
+            intent_id: intent_for_store,
+            invocation_key: invocation,
+            nonce,
+            bindings: vec![binding.clone()],
+        };
+        let digest = store.managed_prepare_context(
+            &context_for_store,
+            &namespace,
+            &bootstrap_for_store,
+            &command_for_store,
+            &context,
+            &initial,
+            &registration_for_store,
+            &pin_for_store,
+        )?;
+        Ok((context, digest, binding))
+    })
+    .await?;
+    crate::managed_session::send(
+        stream,
+        &ServerFrame::Context(Box::new(FrozenContext {
+            context_id: context_id.clone(),
+            registration_request_id: registration_id,
+            command: normalized,
+            context: context.clone(),
+            security_digest: digest.clone(),
+        })),
+    )
+    .await?;
+    let assertion = match crate::managed_session::receive::<ClientFrame>(stream).await? {
+        ClientFrame::Execute { assertion_key } => assertion_key,
+        _ => return Err(Fault::Invalid),
+    };
+    let context_for_store = context_id.clone();
+    let intent_for_store = intent_id.clone();
+    let digest_for_store = digest.clone();
+    let pin_for_store = bridge_pin.clone();
+    stored_managed(store, &lease, move |store| {
+        store.managed_mark_consume(
+            &context_for_store,
+            &intent_for_store,
+            &digest_for_store,
+            &pin_for_store,
+        )
+    })
+    .await?;
+    let consume_services = services.clone();
+    let consume_pin = bridge_pin.clone();
+    let consume_intent = intent_id.clone();
+    let consume_invocation = begin.invocation_key.clone();
+    let consume_digest = digest.clone();
+    let consume_command = command.clone();
+    let consume_epoch = epoch.clone();
+    let consume_audience = config.bridge_audience.clone();
+    let server = transport.mcp_server.clone().ok_or(Fault::Invalid)?;
+    let consume_server = server.clone();
+    let bridge_lease = lease.clone();
+    let consumed = tokio::task::spawn_blocking(move || {
+        let _lease = bridge_lease;
+        let key = crate::managed_bridge::ConsumeKey {
+            abort_request_id: "unused",
+            expected_store_id: &consume_pin.route.component_store_id,
+            producer: &consume_pin.producer,
+            consume_request_id: &consume_intent,
+            invocation_key: &consume_invocation,
+            security_digest: &consume_digest,
+            audience: &consume_audience,
+        };
+        consume_services.consume(
+            &key,
+            &assertion,
+            &consume_server,
+            &consume_command,
+            &consume_epoch,
+        )
+    })
+    .await
+    .map_err(|_| Fault::Unavailable)?
+    .map_err(crate::managed_bridge::fault)?;
+    let stored_consumed = consumed.clone();
+    let context_for_store = context_id.clone();
+    let intent_for_store = intent_id.clone();
+    let invocation_for_store = begin.invocation_key.clone();
+    let digest_for_store = digest.clone();
+    let command_for_store = command.clone();
+    let epoch_for_store = epoch.clone();
+    let audience_for_store = config.bridge_audience.clone();
+    let pin_for_store = bridge_pin.clone();
+    stored_managed(store, &lease, move |store| {
+        let key = crate::managed_bridge::ConsumeKey {
+            abort_request_id: "unused",
+            expected_store_id: &pin_for_store.route.component_store_id,
+            producer: &pin_for_store.producer,
+            consume_request_id: &intent_for_store,
+            invocation_key: &invocation_for_store,
+            security_digest: &digest_for_store,
+            audience: &audience_for_store,
+        };
+        store.managed_record_consumption(
+            &context_for_store,
+            &key,
+            &stored_consumed,
+            &server,
+            &command_for_store,
+            &epoch_for_store,
+            &pin_for_store,
+        )
+    })
+    .await?;
+    let fresh = crate::managed_run::IngressInput {
+        bridge_route: route,
+        producer: config.bridge_producer_id.clone(),
+        observation_ref,
+        invocation_key: begin.invocation_key,
+        request_id: crate::domain::id(),
+        transport_id: crate::domain::id(),
+    };
+    let authority = managed_dispatch::ingress(
+        store,
+        activity,
+        &lease,
+        begin.bootstrap_id.clone(),
+        run_pin,
+        fresh,
+        &services,
+    )
+    .await?;
+    let result = if matches!(command, Command::Get(_) | Command::List(_)) {
+        managed_dispatch::read(
+            store,
+            activity,
+            &lease,
+            managed_dispatch::Read {
+                bootstrap_id: begin.bootstrap_id,
+                context_id,
+                command,
+                digest,
+                authorities: vec![authority],
+                consumed,
+            },
+        )
+        .await
+    } else {
+        let change = command.change().ok_or(Fault::Invalid)?;
+        let pending_pool = change.pool_id.clone();
+        let pending_key = change.request_key.clone();
+        let request = managed_dispatch::Mutation {
+            bootstrap_id: begin.bootstrap_id,
+            context_id,
+            intent_id,
+            member_id: binding.member_id,
+            command,
+            digest,
+            authority,
+            consumed,
+            pool_route: services.pool_route(),
+        };
+        match managed_dispatch::mutation(store, activity, &lease, request, &services).await {
+            Ok(crate::managed_state::IntentReservation::Committed(receipt)) => {
+                serde_json::from_str(&receipt).map_err(|_| Fault::Internal)
+            }
+            Ok(crate::managed_state::IntentReservation::Pending) => Ok(Reply::Pending {
+                pool_id: pending_pool,
+                request_key: pending_key,
+            }),
+            Ok(crate::managed_state::IntentReservation::Aborted(_)) => Err(Fault::Unavailable),
+            Ok(crate::managed_state::IntentReservation::Created) => Err(Fault::Internal),
+            Err(error) => Err(error),
+        }
+    };
+    crate::managed_session::send(stream, &ServerFrame::Finished(result)).await
+}
+
 /// Authenticates and executes exactly one private frame, then closes its connection.
 /// Every native replay consumes current evidence; the separate owner ingress can only project reads.
 async fn connection(
     mut stream: UnixStream,
     config: Config,
     store: SharedStore,
+    activity: Arc<ManagedActivity>,
     waits: Arc<Semaphore>,
     stopped: watch::Receiver<bool>,
 ) -> Result<(), Fault> {
@@ -131,14 +1077,73 @@ async fn connection(
         return Err(Fault::Unauthorized);
     }
     let mut wait_expiry = None;
+    enum Special {
+        Owner(crate::observer::Envelope),
+        Managed(serde_json::Value),
+        Handled,
+    }
     let result = async {
         let bytes = tokio::time::timeout(EXCHANGE_TIMEOUT, integrations::read_frame(&mut stream))
             .await
             .map_err(|_| Fault::Unavailable)??;
-        let value: serde_json::Value =
-            serde_json::from_slice(&bytes).map_err(|_| Fault::Invalid)?;
+        let value = crate::managed_codec::parse_raw(&bytes)?;
+        if value.get("managed_begin").is_some() {
+            let envelope: crate::managed_session::BeginEnvelope =
+                serde_json::from_value(value).map_err(|_| Fault::Invalid)?;
+            verify_managed_peer(&stream, config.expected_uid).await?;
+            let result = managed_session(
+                &mut stream,
+                &config,
+                &store,
+                &activity,
+                envelope.managed_begin,
+            )
+            .await;
+            if let Err(error) = result {
+                let _ = crate::managed_session::send(
+                    &mut stream,
+                    &crate::managed_session::ServerFrame::Failure(error),
+                )
+                .await;
+            }
+            return Ok(Err(Special::Handled));
+        }
         if value.get("observer_credential").is_some() || value.get("observe").is_some() {
-            return Ok::<_, Fault>(Err(owner_observation(&bytes, &config, &store).await));
+            return Ok::<_, Fault>(Err(Special::Owner(
+                owner_observation(&bytes, &config, &store).await,
+            )));
+        }
+        if value.get("method").is_some() {
+            if bytes.len() >= MAX_FRAME {
+                return Ok(Err(Special::Managed(crate::managed_ingress::refused())));
+            }
+            let managed = async {
+                let request = crate::managed_ingress::Request::parse(value)?;
+                let pid = stream
+                    .peer_cred()
+                    .map_err(|_| Fault::Unauthorized)?
+                    .pid()
+                    .ok_or(Fault::Unauthorized)?;
+                let pid = u32::try_from(pid).map_err(|_| Fault::Unauthorized)?;
+                let verified_config = config.clone();
+                let (request, authorized) = tokio::task::spawn_blocking(move || {
+                    let authorized = request.authenticate(&verified_config, pid).is_ok();
+                    (request, authorized)
+                })
+                .await
+                .map_err(|_| Fault::Unavailable)?;
+                if !authorized {
+                    return Ok(request.refused());
+                }
+                let request_config = config.clone();
+                stored(&store, move |store| {
+                    Ok(request.execute(&request_config, store))
+                })
+                .await
+            }
+            .await
+            .unwrap_or_else(|_| crate::managed_ingress::refused());
+            return Ok(Err(Special::Managed(managed)));
         }
         let request: Request = serde_json::from_slice(&bytes).map_err(|_| Fault::Invalid)?;
         request.command.validate()?;
@@ -186,10 +1191,22 @@ async fn connection(
     }
     .await;
     let mut native = match result {
-        Ok(Err(envelope)) => {
+        Ok(Err(Special::Handled)) => return Ok(()),
+        Ok(Err(Special::Owner(envelope))) => {
             let bytes = crate::observer::encode(&envelope).or_else(|error| {
                 crate::observer::encode(&crate::observer::Envelope::failure(&envelope.kind, error))
             })?;
+            return tokio::time::timeout(EXCHANGE_TIMEOUT, stream.write_all(&bytes))
+                .await
+                .map_err(|_| Fault::Unavailable)?
+                .map_err(|_| Fault::Unavailable);
+        }
+        Ok(Err(Special::Managed(value))) => {
+            let mut bytes = serde_json::to_vec(&value).map_err(|_| Fault::Internal)?;
+            if bytes.len() >= MAX_FRAME {
+                return Err(Fault::Unavailable);
+            }
+            bytes.push(b'\n');
             return tokio::time::timeout(EXCHANGE_TIMEOUT, stream.write_all(&bytes))
                 .await
                 .map_err(|_| Fault::Unavailable)?
@@ -624,7 +1641,13 @@ pub async fn serve(config_path: &Path) -> Result<(), Fault> {
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|_| Fault::Unavailable)?;
     let (stop, stopped) = watch::channel(false);
-    let mut worker = tokio::spawn(work(config.clone(), Arc::clone(&store), stopped.clone()));
+    let managed_activity = Arc::new(ManagedActivity::default());
+    let mut worker = tokio::spawn(work(
+        config.clone(),
+        Arc::clone(&store),
+        stopped.clone(),
+        Arc::clone(&managed_activity),
+    ));
     let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let waits = Arc::new(Semaphore::new(MAX_WAITERS));
     let mut connections = JoinSet::new();
@@ -649,9 +1672,10 @@ pub async fn serve(config_path: &Path) -> Result<(), Fault> {
                 let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else { drop(stream); continue; };
                 let config = config.clone();
                 let store = Arc::clone(&store);
+                let activity = Arc::clone(&managed_activity);
                 let waits = Arc::clone(&waits);
                 let stopped = stopped.clone();
-                connections.spawn(async move { let _permit = permit; connection(stream, config, store, waits, stopped).await });
+                connections.spawn(async move { let _permit = permit; connection(stream, config, store, activity, waits, stopped).await });
             }
         }
     };
@@ -1193,12 +2217,169 @@ async fn observation(store: &SharedStore, config: &Config, target: Binding) -> R
     .await
 }
 
-/// Owns serial effects and bounded rotating observations; shutdown is checked between finite exchanges.
+/// Reconcile managed work only when no live caller owns its exact key.
+/// Each store operation finishes before any authenticated Bridge/Run I/O begins.
+async fn recover_managed(
+    config: &Config,
+    store: &SharedStore,
+    stopped: &watch::Receiver<bool>,
+    activity: &Arc<ManagedActivity>,
+) -> Result<(), Fault> {
+    use crate::managed_state::{BootstrapRecoveryAction, RecoveryAction};
+    let bootstraps = stored(store, |store| store.managed_pending_bootstraps()).await?;
+    for bootstrap in bootstraps {
+        if *stopped.borrow() {
+            return Ok(());
+        }
+        let Some(lease) = activity.acquire(ManagedWork::Bootstrap(bootstrap.clone()))? else {
+            continue;
+        };
+        let action = stored_managed(store, &lease, move |store| {
+            store.managed_stage_bootstrap(&bootstrap)
+        })
+        .await;
+        let Ok(BootstrapRecoveryAction::BridgeAbort {
+            context_id,
+            pin,
+            key,
+        }) = action
+        else {
+            continue;
+        };
+        let cfg = config.clone();
+        let bridge_lease = lease.clone();
+        let (pin, key, result) = tokio::task::spawn_blocking(move || {
+            let _lease = bridge_lease;
+            let result = crate::managed_bridge::SdkBridge::recover(&cfg, &pin)
+                .ok()
+                .and_then(|bridge| {
+                    crate::managed_bridge::abort_original(&bridge, &key.borrowed()).ok()
+                });
+            (pin, key, result)
+        })
+        .await
+        .map_err(|_| Fault::Internal)?;
+        if let Some(result) = result {
+            let _ = stored_managed(store, &lease, move |store| {
+                store.managed_record_bootstrap_abort(&context_id, &key, &pin, &result)
+            })
+            .await;
+        }
+    }
+    let pending = stored(store, |store| store.managed_pending()).await?;
+    for (id, digest) in pending {
+        if *stopped.borrow() {
+            return Ok(());
+        }
+        let Some(lease) = activity.acquire(ManagedWork::Intent(id.clone()))? else {
+            continue;
+        };
+        let stage_id = id.clone();
+        let stage_digest = digest.clone();
+        let Ok(action) = stored_managed(store, &lease, move |store| {
+            store.managed_stage_recovery(&stage_id, &stage_digest)
+        })
+        .await
+        else {
+            continue;
+        };
+        match action {
+            RecoveryAction::LocallyFenced | RecoveryAction::Done => {}
+            RecoveryAction::BridgeAbort {
+                intent_id,
+                context_id: _,
+                digest,
+                pin,
+                key,
+            } => {
+                let cfg = config.clone();
+                let bridge_lease = lease.clone();
+                let (pin, key, result) = tokio::task::spawn_blocking(move || {
+                    let _lease = bridge_lease;
+                    let result = crate::managed_bridge::SdkBridge::recover(&cfg, &pin)
+                        .ok()
+                        .and_then(|bridge| {
+                            crate::managed_bridge::abort_original(&bridge, &key.borrowed()).ok()
+                        });
+                    (pin, key, result)
+                })
+                .await
+                .map_err(|_| Fault::Internal)?;
+                if let Some(result) = result {
+                    let _ = stored_managed(store, &lease, move |store| {
+                        store.managed_record_bridge_abort(&intent_id, &digest, &key, &pin, &result)
+                    })
+                    .await;
+                }
+            }
+            RecoveryAction::RunAbort {
+                intent,
+                outcome_digest,
+            } => {
+                let Ok(peer) = crate::managed_run::RunPeer::from_recovery(config, &intent) else {
+                    continue;
+                };
+                if let Ok(result) = peer
+                    .abort(
+                        &crate::domain::id(),
+                        &intent.intent_id,
+                        &intent.security_digest,
+                        &intent.pool_route,
+                        Some(&outcome_digest),
+                    )
+                    .await
+                {
+                    let _ = stored_managed(store, &lease, move |store| {
+                        store.managed_record_run_abort(
+                            &intent.intent_id,
+                            &intent.security_digest,
+                            &result,
+                        )
+                    })
+                    .await;
+                }
+            }
+            RecoveryAction::RunSettle {
+                intent,
+                outcome_digest,
+            } => {
+                let Some(admission) = intent.admission.as_ref() else {
+                    continue;
+                };
+                let Ok(peer) = crate::managed_run::RunPeer::from_recovery(config, &intent) else {
+                    continue;
+                };
+                if let Ok(result) = peer
+                    .settle(
+                        &crate::domain::id(),
+                        &admission.admission_id,
+                        &intent.intent_id,
+                        &intent.security_digest,
+                        &outcome_digest,
+                    )
+                    .await
+                {
+                    let _ = stored_managed(store, &lease, move |store| {
+                        store.managed_record_run_settlement(
+                            &intent.intent_id,
+                            &intent.security_digest,
+                            &result,
+                        )
+                    })
+                    .await;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Unknown delivery uses status only; unknown Run admission retries the same frozen admission key.
 async fn work(
     config: Config,
     store: SharedStore,
     mut stopped: watch::Receiver<bool>,
+    activity: Arc<ManagedActivity>,
 ) -> Result<(), Fault> {
     let mut interval = tokio::time::interval(OBSERVATION_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1209,6 +2390,7 @@ async fn work(
             changed = stopped.changed() => { if changed.is_err() || *stopped.borrow() { return Ok(()); } }
             _ = interval.tick() => (),
         }
+        recover_managed(&config, &store, &stopped, &activity).await?;
         for _ in 0..32 {
             if *stopped.borrow() {
                 return Ok(());
@@ -1300,11 +2482,15 @@ mod tests {
             bridge_credential_file: path.join("absent-token"),
             bridge_producer_id: "fixture".into(),
             bridge_audience: "fixture".into(),
+            bridge_server_executable: "/fixture/bridge".into(),
+            bridge_server_sha256: "0".repeat(64),
             bridge_observer_socket: None,
             bridge_observer_credential_file: None,
             owner_observer_credential_file: None,
             run_socket: Some(path.join("run.sock")),
             run_peer_uid: None,
+            managed_run_reader: None,
+            managed_run_transport: None,
         };
         let socket = config.run_socket.as_ref().ok_or("Run socket")?;
         let listener = UnixListener::bind(socket)?;
@@ -2196,11 +3382,15 @@ mod tests {
             bridge_credential_file: path.join("absent-token"),
             bridge_producer_id: "fixture".into(),
             bridge_audience: "fixture-backend".into(),
+            bridge_server_executable: "/fixture/bridge".into(),
+            bridge_server_sha256: "0".repeat(64),
             bridge_observer_socket: None,
             bridge_observer_credential_file: None,
             owner_observer_credential_file: None,
             run_socket: Some(path.join("run.sock")),
             run_peer_uid: None,
+            managed_run_reader: None,
+            managed_run_transport: None,
         };
         let socket = config.run_socket.as_ref().ok_or("missing socket")?;
         let listener = UnixListener::bind(socket)?;
@@ -2337,11 +3527,15 @@ mod tests {
             bridge_credential_file: path.join("absent-token"),
             bridge_producer_id: "fixture".into(),
             bridge_audience: "fixture".into(),
+            bridge_server_executable: "/fixture/bridge".into(),
+            bridge_server_sha256: "0".repeat(64),
             bridge_observer_socket: None,
             bridge_observer_credential_file: None,
             owner_observer_credential_file: None,
             run_socket: Some(path.join("run.sock")),
             run_peer_uid: None,
+            managed_run_reader: None,
+            managed_run_transport: None,
         };
         let listener = UnixListener::bind(config.run_socket.as_ref().ok_or("Run socket")?)?;
         fs::set_permissions(path.join("run.sock"), fs::Permissions::from_mode(0o600))?;
@@ -2440,11 +3634,15 @@ mod tests {
             bridge_credential_file: path.join("absent-token"),
             bridge_producer_id: "fixture".into(),
             bridge_audience: "fixture-backend".into(),
+            bridge_server_executable: "/fixture/bridge".into(),
+            bridge_server_sha256: "0".repeat(64),
             bridge_observer_socket: None,
             bridge_observer_credential_file: None,
             owner_observer_credential_file: None,
             run_socket: Some(path.join("run.sock")),
             run_peer_uid: None,
+            managed_run_reader: None,
+            managed_run_transport: None,
         };
         let socket = config.run_socket.as_ref().ok_or("missing socket")?;
         let listener = UnixListener::bind(socket)?;
@@ -2728,11 +3926,15 @@ mod tests {
             bridge_credential_file: path.join("absent-token"),
             bridge_producer_id: "fixture".into(),
             bridge_audience: "fixture-backend".into(),
+            bridge_server_executable: "/fixture/bridge".into(),
+            bridge_server_sha256: "0".repeat(64),
             bridge_observer_socket: None,
             bridge_observer_credential_file: None,
             owner_observer_credential_file: None,
             run_socket: Some(path.join("run.sock")),
             run_peer_uid: None,
+            managed_run_reader: None,
+            managed_run_transport: None,
         };
         let socket = config.run_socket.as_ref().ok_or("missing socket")?;
         let listener = UnixListener::bind(socket)?;
@@ -2981,11 +4183,15 @@ mod tests {
             bridge_credential_file: path.join("absent-token"),
             bridge_producer_id: "fixture".into(),
             bridge_audience: "fixture-backend".into(),
+            bridge_server_executable: "/fixture/bridge".into(),
+            bridge_server_sha256: "0".repeat(64),
             bridge_observer_socket: None,
             bridge_observer_credential_file: None,
             owner_observer_credential_file: None,
             run_socket: Some(path.join("run.sock")),
             run_peer_uid: None,
+            managed_run_reader: None,
+            managed_run_transport: None,
         };
         let socket = config.run_socket.as_ref().ok_or("missing socket")?;
         let listener = UnixListener::bind(socket)?;
@@ -3100,11 +4306,15 @@ mod tests {
             bridge_credential_file: path.join("absent-token"),
             bridge_producer_id: "fixture".into(),
             bridge_audience: "fixture-backend".into(),
+            bridge_server_executable: "/fixture/bridge".into(),
+            bridge_server_sha256: "0".repeat(64),
             bridge_observer_socket: None,
             bridge_observer_credential_file: None,
             owner_observer_credential_file: None,
             run_socket: Some(path.join("run.sock")),
             run_peer_uid: None,
+            managed_run_reader: None,
+            managed_run_transport: None,
         };
         let socket = config.run_socket.as_ref().ok_or("fixture socket missing")?;
         let listener = UnixListener::bind(socket)?;
@@ -3358,11 +4568,15 @@ mod tests {
             bridge_credential_file: path.join("absent-token"),
             bridge_producer_id: "fixture".into(),
             bridge_audience: "fixture-backend".into(),
+            bridge_server_executable: "/fixture/bridge".into(),
+            bridge_server_sha256: "0".repeat(64),
             bridge_observer_socket: None,
             bridge_observer_credential_file: None,
             owner_observer_credential_file: None,
             run_socket: Some(path.join("run.sock")),
             run_peer_uid: None,
+            managed_run_reader: None,
+            managed_run_transport: None,
         };
         let listener = UnixListener::bind(config.run_socket.as_ref().ok_or("socket")?)?;
         fs::set_permissions(path.join("run.sock"), fs::Permissions::from_mode(0o600))?;
@@ -3569,11 +4783,15 @@ mod tests {
             bridge_credential_file: pool_root.join("absent-token"),
             bridge_producer_id: "fixture".into(),
             bridge_audience: "fixture-backend".into(),
+            bridge_server_executable: "/fixture/bridge".into(),
+            bridge_server_sha256: "0".repeat(64),
             bridge_observer_socket: None,
             bridge_observer_credential_file: None,
             owner_observer_credential_file: None,
             run_socket: Some(home.join("api.sock")),
             run_peer_uid: None,
+            managed_run_reader: None,
+            managed_run_transport: None,
         };
         let mut initial = Store::open(&config.database_path)?;
         let owner = Actor::verified("local/codex/main/owner".into(), "owner", "root")?;
@@ -3779,11 +4997,15 @@ mod tests {
             bridge_credential_file: pool_root.join("absent-token"),
             bridge_producer_id: "fixture".into(),
             bridge_audience: "fixture".into(),
+            bridge_server_executable: "/fixture/bridge".into(),
+            bridge_server_sha256: "0".repeat(64),
             bridge_observer_socket: None,
             bridge_observer_credential_file: None,
             owner_observer_credential_file: None,
             run_socket: Some(home.join("api.sock")),
             run_peer_uid: None,
+            managed_run_reader: None,
+            managed_run_transport: None,
         };
         let mut initial = Store::open(&config.database_path)?;
         let owner = Actor::verified("local/codex/main/owner".into(), "owner", "root")?;
@@ -4246,12 +5468,13 @@ mod tests {
             let response = integrations::read_frame(&mut client).await?;
             Ok::<_, Box<dyn std::error::Error>>(serde_json::from_slice(&response)?)
         };
-        let (server, response) = tokio::time::timeout(Duration::from_secs(3), async {
+        let (server, response) = tokio::time::timeout(Duration::from_secs(15), async {
             tokio::join!(
                 connection(
                     server,
                     config.clone(),
                     Arc::clone(store),
+                    Arc::new(ManagedActivity::default()),
                     Arc::new(Semaphore::new(MAX_WAITERS)),
                     stopped
                 ),
@@ -4284,11 +5507,15 @@ mod tests {
             bridge_credential_file: path.join("absent-producer.token"),
             bridge_producer_id: "fixture".into(),
             bridge_audience: "fixture".into(),
+            bridge_server_executable: "/fixture/bridge".into(),
+            bridge_server_sha256: "0".repeat(64),
             bridge_observer_socket: None,
             bridge_observer_credential_file: None,
             owner_observer_credential_file: Some(token),
             run_socket: None,
             run_peer_uid: None,
+            managed_run_reader: None,
+            managed_run_transport: None,
         };
         let mut initial = Store::open(&config.database_path)?;
         let actor = Actor::verified("codex:test:observer:owner".into(), "owner", "root")?;
@@ -4312,6 +5539,7 @@ mod tests {
         for observe in [
             identity.clone(),
             serde_json::json!({"schema_version":1,"operation":"list","params":{}}),
+            serde_json::json!({"schema_version":1,"operation":"inventory_snapshot","params":{"filter":"all","limit":10}}),
             serde_json::json!({"schema_version":1,"operation":"get","params":{"pool_id":receipt.pool_id}}),
         ] {
             let response = observer_exchange(&config, &store, serde_json::json!({"observer_credential":"fixture-owner-observer","observe":observe})).await?;
@@ -4374,6 +5602,1781 @@ mod tests {
         Ok(())
     }
 
+    /// A separately pinned Run reader can inspect outcomes and seal its exact namespace.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn managed_run_reader_is_build_and_namespace_fenced()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use sha2::Digest;
+        let _hash_guard = crate::TEST_EXEC_HASH_LOCK.lock().await;
+        let directory =
+            tempfile::tempdir_in(std::env::var_os("TMPDIR").ok_or("task TMPDIR required")?)?;
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))?;
+        let path = directory.path();
+        let executable = std::env::current_exe()?;
+        let sha256 = format!("{:x}", sha2::Sha256::digest(fs::read(&executable)?));
+        let uid = fs::metadata(path)?.uid();
+        let mut config = Config {
+            socket_path: path.join("pool.sock"),
+            database_path: path.join("pool.db"),
+            expected_uid: uid,
+            bridge_registration_socket: path.join("absent-registration.sock"),
+            bridge_core_socket: path.join("absent-core.sock"),
+            bridge_credential_file: path.join("absent-token"),
+            bridge_producer_id: "pool".into(),
+            bridge_audience: "pool".into(),
+            bridge_server_executable: "/fixture/bridge".into(),
+            bridge_server_sha256: "0".repeat(64),
+            bridge_observer_socket: None,
+            bridge_observer_credential_file: None,
+            owner_observer_credential_file: None,
+            run_socket: None,
+            run_peer_uid: None,
+            managed_run_reader: Some(crate::config::ManagedRunReader {
+                executable,
+                sha256,
+                bridge_store_id: "00000000-0000-4000-8000-000000000001".into(),
+                bridge_route_id: "bridge-route".into(),
+                producer: "pool".into(),
+                run_store_id: "store_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                run_route_id: "run-route".into(),
+            }),
+            managed_run_transport: None,
+        };
+        let initial = Store::open(&config.database_path)?;
+        let store_id = initial.managed_store_id()?;
+        let store = Arc::new(Mutex::new(initial));
+        let request = serde_json::json!({"id":"outcome","method":"_managed_intent_outcome_v1","params":{"version":1,"expected_store_id":store_id,"intent_id":"missing","security_digest":"a".repeat(64)}});
+        let result = observer_exchange(&config, &store, request.clone()).await?;
+        assert_eq!(result["id"], "outcome");
+        assert_eq!(result["result"]["state"], "absent");
+        assert!(result["result"]["outcome_digest"].is_null());
+        let seal = serde_json::json!({"id":"seal","method":"_managed_namespace_seal_v1","params":{"version":1,"expected_store_id":store_id,"request_id":"seal-request","bridge_route":{"component_store_id":"00000000-0000-4000-8000-000000000001","route_id":"bridge-route","worker_uid":uid},"producer":"pool","issuer_epoch":"old-epoch","retirement_key":"retire"}});
+        let first = observer_exchange(&config, &store, seal.clone()).await?;
+        assert_eq!(first["result"]["state"], "sealed");
+        let again = observer_exchange(&config, &store, seal.clone()).await?;
+        assert_eq!(first["result"]["seal_id"], again["result"]["seal_id"]);
+        let mut foreign = seal;
+        foreign["params"]["bridge_route"]["route_id"] = serde_json::json!("foreign-route");
+        let denied_route = observer_exchange(&config, &store, foreign).await?;
+        assert_eq!(denied_route["error"]["code"], "route_mismatch");
+        config.managed_run_reader.as_mut().ok_or("reader")?.sha256 = "0".repeat(64);
+        let denied = observer_exchange(&config, &store, request).await?;
+        assert_eq!(denied["error"]["code"], "peer_not_authorized");
+        Ok(())
+    }
+
+    /// A managed session authenticates both processes as the same loaded Pool build.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn managed_session_peer_requires_same_loaded_build()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use tokio::io::AsyncReadExt;
+
+        if let Some(socket) = std::env::var_os("POOL_MANAGED_PEER_FIXTURE") {
+            let uid = std::fs::metadata(&socket)?.uid();
+            let result = connect_managed_peer(Path::new(&socket), uid).await;
+            if std::env::var_os("POOL_MANAGED_PEER_REJECT").is_some() {
+                assert!(matches!(result, Err(Fault::Unauthorized)));
+            } else {
+                let mut stream = result?;
+                stream.write_all(b"fixture").await?;
+                let mut ack = [0];
+                tokio::time::timeout(Duration::from_secs(60), stream.read_exact(&mut ack))
+                    .await??;
+                assert_eq!(ack, [1]);
+            }
+            return Ok(());
+        }
+
+        let _hash_guard = crate::TEST_EXEC_HASH_LOCK.lock().await;
+        let directory =
+            tempfile::tempdir_in(std::env::var_os("TMPDIR").ok_or("task TMPDIR required")?)?;
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))?;
+        let path = directory.path().join("peer.sock");
+        let listener = UnixListener::bind(&path)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        let uid = fs::metadata(&path)?.uid();
+        let original = std::env::current_exe()?;
+        let other_path = directory.path().join("other-pool");
+        fs::hard_link(&original, &other_path)?;
+        for (executable, reject) in [(&original, false), (&other_path, true)] {
+            let mut child = tokio::process::Command::new(executable)
+                .args([
+                    "--exact",
+                    "runtime::tests::managed_session_peer_requires_same_loaded_build",
+                ])
+                .env_clear()
+                .env("POOL_MANAGED_PEER_FIXTURE", &path)
+                .envs(reject.then_some(("POOL_MANAGED_PEER_REJECT", "1")))
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn()?;
+            let (mut stream, _) =
+                tokio::time::timeout(Duration::from_secs(60), listener.accept()).await??;
+            let authenticated = verify_managed_peer(&stream, uid).await;
+            if reject {
+                assert!(matches!(authenticated, Err(Fault::Unauthorized)));
+                let mut byte = [0];
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(60), stream.read(&mut byte)).await??,
+                    0
+                );
+            } else {
+                authenticated?;
+                let mut message = [0; 7];
+                tokio::time::timeout(Duration::from_secs(60), stream.read_exact(&mut message))
+                    .await??;
+                assert_eq!(&message, b"fixture");
+                stream.write_all(&[1]).await?;
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_secs(60), child.wait())
+                    .await??
+                    .success()
+            );
+        }
+        Ok(())
+    }
+
+    /// The full private session connects fake Bridge and Run through real local CAS.
+    #[tokio::test]
+    async fn managed_stdio_session_runs_fresh_post_with_fake_bridge_and_run()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::managed_bridge::{BridgeB1Client, BridgeFailure};
+        use crate::managed_session::{ClientFrame, ServerFrame};
+        use crate::managed_state::tests::{
+            FakeRun, fake_bridge_pin, fake_config, fake_consumed, fake_run_endpoint, fixture,
+            index_managed_member, native_proof,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Clone)]
+        struct FakeServices {
+            binding: crate::managed_state::ManagedBinding,
+            incarnation: crate::managed_state::Incarnation,
+            run: Arc<FakeRun>,
+            calls: Arc<AtomicUsize>,
+        }
+        impl managed_dispatch::IngressClient for FakeServices {
+            fn current<'a>(
+                &'a self,
+                query: &'a crate::managed_run::IngressQuery,
+            ) -> managed_dispatch::Response<
+                'a,
+                crate::managed_run::CurrentAuthority,
+                crate::managed_run::RunError,
+            > {
+                Box::pin(async move {
+                    let index = self.calls.fetch_add(1, Ordering::SeqCst);
+                    if index == 0 {
+                        return Err(crate::managed_run::RunError::NotReady);
+                    }
+                    let mut receipt = self.run.receipt.clone();
+                    receipt.receipt_id = format!("session-receipt-{index}");
+                    query
+                        .fixture_authority(receipt)
+                        .map_err(|_| crate::managed_run::RunError::Unknown)
+                })
+            }
+        }
+        impl managed_dispatch::Client for FakeServices {
+            fn admit<'a>(
+                &'a self,
+                plan: &'a crate::managed_state::AdmissionPlan,
+            ) -> managed_dispatch::Response<
+                'a,
+                crate::managed_run::Admission,
+                crate::managed_run::RunError,
+            > {
+                Box::pin(async move {
+                    Ok(crate::managed_run::Admission {
+                        admission_id: "session-admission".into(),
+                        intent_id: plan.recovery.intent_id.clone(),
+                        security_digest: plan.recovery.security_digest.clone(),
+                        policy: "admission_snapshot".into(),
+                        binding: plan.binding.clone(),
+                        incarnation: self.incarnation.clone(),
+                        successor_proof: self.run.receipt.successor_proof.clone(),
+                        consumed_ref: plan.recovery.consumed_ref.clone(),
+                    })
+                })
+            }
+            fn consensus<'a>(
+                &'a self,
+                pending: crate::managed_state::PendingConsensus,
+                _store: &'a SharedStore,
+                _lease: &'a ManagedLease,
+            ) -> managed_dispatch::Response<'a, crate::managed_state::ConsensusFence> {
+                Box::pin(async move { pending.verify(self.run.as_ref()) })
+            }
+        }
+        impl BridgeB1Client for FakeServices {
+            fn capabilities(&self) -> Result<crate::managed_bridge::Capabilities, BridgeFailure> {
+                Ok(crate::managed_bridge::Capabilities {
+                    store_id: self.binding.bridge_route.component_store_id.clone(),
+                    issuer_epoch: "epoch".into(),
+                    capabilities: vec![
+                        "attempt_launch_v1".into(),
+                        "launch_assertion_v1".into(),
+                        "namespace_retirement_v1".into(),
+                    ],
+                })
+            }
+            fn prepare(
+                &self,
+                request: &crate::managed_bridge::Prepare<'_>,
+            ) -> Result<crate::managed_bridge::Prepared, BridgeFailure> {
+                if request.command_name != "pool_post" || request.invocation_key != "session-inv" {
+                    return Err(BridgeFailure::Refused);
+                }
+                Ok(crate::managed_bridge::Prepared {
+                    store_id: self.binding.bridge_route.component_store_id.clone(),
+                    bridge_context_ref: bridge_sdk::bridge_protocol::Secret::new("session-ref"),
+                    invocation_key: request.invocation_key.into(),
+                    expires_at_ms: 2,
+                })
+            }
+            fn register(
+                &self,
+                request: &crate::managed_bridge::Registration<'_>,
+            ) -> Result<crate::managed_bridge::Registered, BridgeFailure> {
+                if request.bridge_context_ref != "session-ref"
+                    || request.command_name != "pool_post"
+                {
+                    return Err(BridgeFailure::Refused);
+                }
+                Ok(crate::managed_bridge::Registered {
+                    store_id: self.binding.bridge_route.component_store_id.clone(),
+                    assertion_key: bridge_sdk::bridge_protocol::Secret::new("session-assertion"),
+                    invocation_key: request.invocation_key.into(),
+                    issuer_epoch: "epoch".into(),
+                    expires_at_ms: 2,
+                })
+            }
+            fn consume(
+                &self,
+                key: &crate::managed_bridge::ConsumeKey<'_>,
+                assertion: &bridge_sdk::bridge_protocol::Secret,
+            ) -> Result<crate::managed_bridge::Consumed, BridgeFailure> {
+                if assertion.expose() != "session-assertion" {
+                    return Err(BridgeFailure::Refused);
+                }
+                let command = Command::Post(crate::domain::Message {
+                    change: crate::domain::Change {
+                        pool_id: "pool".into(),
+                        expected_revision: 1,
+                        request_key: "session-key".into(),
+                    },
+                    body: "session post".into(),
+                });
+                Ok(fake_consumed(
+                    &self.binding,
+                    &self.incarnation,
+                    key.consume_request_id,
+                    key.invocation_key,
+                    key.security_digest,
+                    &command,
+                ))
+            }
+            fn lookup(
+                &self,
+                _: &str,
+                _: &crate::managed_bridge::ConsumeKey<'_>,
+            ) -> Result<crate::managed_bridge::Consumed, BridgeFailure> {
+                Err(BridgeFailure::Refused)
+            }
+            fn abort(
+                &self,
+                _: &crate::managed_bridge::ConsumeKey<'_>,
+            ) -> Result<crate::managed_bridge::Abort, BridgeFailure> {
+                Err(BridgeFailure::Refused)
+            }
+        }
+        impl managed_dispatch::SessionClient for FakeServices {
+            fn current_pin<'a>(
+                &'a self,
+            ) -> managed_dispatch::Response<'a, crate::managed_state::RunPin> {
+                Box::pin(async move {
+                    let endpoint = fake_run_endpoint(&self.binding);
+                    Ok(crate::managed_state::RunPin {
+                        route: endpoint.route,
+                        socket: endpoint.socket,
+                        executable: endpoint.executable,
+                        executable_sha256: endpoint.executable_sha256,
+                        capabilities: vec![
+                            "attempt_current_ingress_v1".into(),
+                            "attempt_admission_v1".into(),
+                        ],
+                    })
+                })
+            }
+            fn endpoint(&self) -> crate::managed_state::RunEndpointPin {
+                fake_run_endpoint(&self.binding)
+            }
+            fn pool_route(&self) -> crate::managed_state::Route {
+                crate::managed_state::Route {
+                    component_store_id: self.binding.pool_store_id.clone(),
+                    route_id: "pool-route".into(),
+                    worker_uid: self.binding.run_route.worker_uid,
+                }
+            }
+            fn consume(
+                &self,
+                key: &crate::managed_bridge::ConsumeKey<'_>,
+                assertion: &bridge_sdk::bridge_protocol::Secret,
+                server: &str,
+                command: &Command,
+                epoch: &str,
+            ) -> Result<crate::managed_bridge::Consumed, BridgeFailure> {
+                crate::managed_bridge::consume_original(
+                    self, key, assertion, server, command, epoch,
+                )
+            }
+        }
+
+        let (_directory, mut initial, binding, incarnation, run) = fixture();
+        let db = initial.test_db();
+        index_managed_member(db, &binding);
+        let raw: String =
+            db.query_row("SELECT data FROM members WHERE id='member'", [], |row| {
+                row.get(0)
+            })?;
+        let mut member: Binding = serde_json::from_str(&raw)?;
+        member.member.state = crate::domain::MemberState::Active;
+        member.run_id = Some(binding.attempt.execution_id.clone());
+        member.run_sequence = Some(u64::from(binding.attempt.sequence));
+        db.execute(
+            "UPDATE members SET data=?1 WHERE id='member'",
+            [serde_json::to_string(&member)?],
+        )?;
+        let command = Command::Post(crate::domain::Message {
+            change: crate::domain::Change {
+                pool_id: "pool".into(),
+                expected_revision: 1,
+                request_key: "session-key".into(),
+            },
+            body: "session post".into(),
+        });
+        let normalized = serde_json::to_value(&command)?;
+        let proof = native_proof();
+        let pin = fake_bridge_pin(&binding);
+        let services = FakeServices {
+            binding: binding.clone(),
+            incarnation,
+            run: Arc::new(run),
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let mut config = fake_config(&binding);
+        let transport = config.managed_run_transport.as_mut().ok_or("transport")?;
+        transport.frontend_enabled = true;
+        transport.mcp_server = Some("pool".into());
+        let begin = crate::managed_session::Begin {
+            version: 1,
+            bootstrap_id: "session-bootstrap".into(),
+            invocation_key: "session-inv".into(),
+            command: normalized.clone(),
+            proof: proof.clone(),
+            bridge_pin: pin.clone(),
+        };
+        let store = Arc::new(Mutex::new(initial));
+        let activity = Arc::new(ManagedActivity::default());
+        let lease = activity
+            .acquire(ManagedWork::Bootstrap("session-bootstrap".into()))?
+            .ok_or("lease")?;
+        let (mut client, mut server) = UnixStream::pair()?;
+        let task_store = Arc::clone(&store);
+        let task_activity = Arc::clone(&activity);
+        let task_config = config.clone();
+        let task_services = services.clone();
+        let task_command = command.clone();
+        let task_normalized = normalized.clone();
+        let task_pin = pin.clone();
+        let task = tokio::spawn(async move {
+            managed_session_core(
+                &mut server,
+                &task_config,
+                &task_store,
+                &task_activity,
+                begin,
+                task_command,
+                task_normalized,
+                task_pin,
+                lease,
+                task_services,
+            )
+            .await
+        });
+        assert!(matches!(
+            crate::managed_session::receive::<ServerFrame>(&mut client).await?,
+            ServerFrame::Ready
+        ));
+        let epoch = crate::managed_bridge::discover(&services, &pin.route.component_store_id)
+            .map_err(|_| "fake discovery")?;
+        crate::managed_session::send(
+            &mut client,
+            &ClientFrame::Epoch {
+                issuer_epoch: epoch.clone(),
+            },
+        )
+        .await?;
+        assert!(matches!(
+            crate::managed_session::receive::<ServerFrame>(&mut client).await?,
+            ServerFrame::Reserved
+        ));
+        let prepared = services
+            .prepare(&crate::managed_bridge::Prepare {
+                request_id: "prepare",
+                expected_store_id: &pin.route.component_store_id,
+                expected_issuer_epoch: &epoch,
+                invocation_key: "session-inv",
+                command_name: "pool_post",
+                native_proof: &proof,
+            })
+            .map_err(|_| "fake prepare")?;
+        crate::managed_session::send(
+            &mut client,
+            &ClientFrame::Prepared {
+                store_id: prepared.store_id.clone(),
+                bridge_context_ref: prepared.bridge_context_ref.clone(),
+                invocation_key: prepared.invocation_key.clone(),
+                expires_at_ms: prepared.expires_at_ms,
+            },
+        )
+        .await?;
+        let ServerFrame::Context(frozen) =
+            crate::managed_session::receive::<ServerFrame>(&mut client).await?
+        else {
+            return Err("missing frozen context".into());
+        };
+        let (_, digest) = crate::managed_codec::security_digest(
+            &normalized,
+            &serde_json::to_value(&frozen.context)?,
+        )?;
+        assert_eq!(digest, frozen.security_digest);
+        let registration = crate::managed_bridge::Registration {
+            request_id: &frozen.registration_request_id,
+            expected_store_id: &prepared.store_id,
+            bridge_context_ref: prepared.bridge_context_ref.expose(),
+            invocation_key: &prepared.invocation_key,
+            command_name: "pool_post",
+            security_digest: &digest,
+            audience: "pool",
+            nonce: &frozen.context.nonce,
+            native_proof: &proof,
+        };
+        let registered = crate::managed_bridge::register_original(
+            &services,
+            &registration,
+            &prepared,
+            &epoch,
+            &command,
+        )
+        .map_err(|_| "fake register")?;
+        crate::managed_session::send(
+            &mut client,
+            &ClientFrame::Execute {
+                assertion_key: registered.assertion_key,
+            },
+        )
+        .await?;
+        let ServerFrame::Finished(Ok(Reply::Receipt(receipt))) =
+            crate::managed_session::receive::<ServerFrame>(&mut client).await?
+        else {
+            return Err("missing committed receipt".into());
+        };
+        assert_eq!(receipt.event.body, "session post");
+        assert_eq!(receipt.revision, 2);
+        task.await??;
+        assert_eq!(services.calls.load(Ordering::SeqCst), 3);
+        let state = stored(&store, |store| {
+            Ok(store
+                .test_db()
+                .query_row("SELECT state FROM managed_intents", [], |row| {
+                    row.get::<_, String>(0)
+                })?)
+        })
+        .await?;
+        assert_eq!(state, "committed");
+        Ok(())
+    }
+
+    /// A not-ready Run response retries the same staged original observation.
+    #[tokio::test]
+    async fn early_hook_reuses_original_staged_ingress_before_initial_binding()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::managed_state::tests::{
+            fake_bridge_pin, fake_run_endpoint, fixture, native_proof,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct FakeIngress {
+            calls: AtomicUsize,
+            first_query: AtomicUsize,
+            authority: Mutex<Option<crate::managed_run::CurrentAuthority>>,
+        }
+        impl managed_dispatch::IngressClient for FakeIngress {
+            fn current<'a>(
+                &'a self,
+                query: &'a crate::managed_run::IngressQuery,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                crate::managed_run::CurrentAuthority,
+                                crate::managed_run::RunError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move {
+                    let address = query as *const crate::managed_run::IngressQuery as usize;
+                    let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                    if call == 0 {
+                        self.first_query.store(address, Ordering::SeqCst);
+                        return Err(crate::managed_run::RunError::NotReady);
+                    }
+                    assert_eq!(self.first_query.load(Ordering::SeqCst), address);
+                    self.authority
+                        .lock()
+                        .map_err(|_| crate::managed_run::RunError::Unknown)?
+                        .take()
+                        .ok_or(crate::managed_run::RunError::Unknown)
+                })
+            }
+        }
+
+        let (_directory, mut initial, binding, _incarnation, run) = fixture();
+        let db = initial.test_db();
+        db.execute("DELETE FROM managed_bindings WHERE member='member'", [])?;
+        let raw: String =
+            db.query_row("SELECT data FROM members WHERE id='member'", [], |row| {
+                row.get(0)
+            })?;
+        let mut member: Binding = serde_json::from_str(&raw)?;
+        member.run_id = Some(binding.attempt.execution_id.clone());
+        member.run_store_id = Some(binding.attempt.run_store_id.clone());
+        db.execute(
+            "UPDATE members SET data=?1,address=?2 WHERE id='member'",
+            rusqlite::params![serde_json::to_string(&member)?, binding.actor.address],
+        )?;
+        let command = Command::List(crate::domain::List { after: None });
+        let bridge_pin = fake_bridge_pin(&binding);
+        let proof = native_proof();
+        crate::managed_state::reserve_bootstrap(
+            db,
+            &crate::managed_state::BootstrapRequest {
+                namespace_id: "namespace",
+                bootstrap_id: "bootstrap",
+                route: &binding.bridge_route,
+                bridge_pin: &bridge_pin,
+                producer: "pool",
+                issuer_epoch: "epoch",
+                invocation_key: "inv",
+                command: &command,
+                native_proof: &proof,
+            },
+        )?;
+        let dispatch = crate::managed_state::mark_bootstrap_submitted(db, "bootstrap")?;
+        crate::managed_state::record_bootstrap_ref(
+            db,
+            dispatch,
+            &crate::managed_bridge::Prepared {
+                store_id: binding.bridge_route.component_store_id.clone(),
+                bridge_context_ref: bridge_sdk::bridge_protocol::Secret::new("original-ref"),
+                invocation_key: "inv".into(),
+                expires_at_ms: 100,
+            },
+            &bridge_pin,
+        )?;
+        let pin = crate::managed_state::RunPin {
+            route: binding.run_route.clone(),
+            socket: "/fixture/attempt.sock".into(),
+            executable: "/fixture/run".into(),
+            executable_sha256: "a".repeat(64),
+            capabilities: vec!["attempt_current_ingress_v1".into()],
+        };
+        let intent = crate::managed_state::CurrentIntent::Ingress {
+            version: 1,
+            expected_store_id: binding.attempt.run_store_id.clone(),
+            request_id: "current-key".into(),
+            observation_ref: bridge_sdk::bridge_protocol::Secret::new("original-ref"),
+            invocation_key: "inv".into(),
+        };
+        let intent_value = serde_json::to_value(&intent)?;
+        let authority = crate::managed_run::CurrentAuthority::fixture(
+            fake_run_endpoint(&binding),
+            run.receipt.clone(),
+            "inv",
+            "current-key",
+            intent_value.clone(),
+        );
+        let mut foreign = run.receipt.clone();
+        foreign.lineage_root_id = "foreign".into();
+        foreign.bound_execution_id = "foreign".into();
+        foreign.attempt.lineage_root_id = "foreign".into();
+        foreign.attempt.execution_id = "foreign".into();
+        foreign.successor_proof.lineage_root_id = "foreign".into();
+        foreign.successor_proof.bound_execution_id = "foreign".into();
+        foreign.successor_proof.current_execution_id = "foreign".into();
+        foreign.successor_proof.chain[0].execution_id = "foreign".into();
+        let foreign_authority = crate::managed_run::CurrentAuthority::fixture(
+            fake_run_endpoint(&binding),
+            foreign,
+            "inv",
+            "current-key",
+            intent_value,
+        );
+        let input = crate::managed_run::IngressInput {
+            bridge_route: binding.bridge_route.clone(),
+            producer: "pool".into(),
+            observation_ref: bridge_sdk::bridge_protocol::Secret::new("original-ref"),
+            invocation_key: "inv".into(),
+            request_id: "current-key".into(),
+            transport_id: "current-rpc".into(),
+        };
+        let fake = FakeIngress {
+            calls: AtomicUsize::new(0),
+            first_query: AtomicUsize::new(0),
+            authority: Mutex::new(Some(authority)),
+        };
+        let store = Arc::new(Mutex::new(initial));
+        let activity = Arc::new(ManagedActivity::default());
+        let lease = activity
+            .acquire(ManagedWork::Bootstrap("bootstrap".into()))?
+            .ok_or("bootstrap lease")?;
+        let authority = managed_dispatch::ingress(
+            &store,
+            &activity,
+            &lease,
+            "bootstrap".into(),
+            pin,
+            input,
+            &fake,
+        )
+        .await?;
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 2);
+        let bridge_route = binding.bridge_route.clone();
+        let selected = stored_managed(&store, &lease, move |store| {
+            assert_eq!(
+                store
+                    .managed_select_ingress_binding(
+                        &foreign_authority,
+                        &bridge_route,
+                        "pool",
+                        &command
+                    )
+                    .err(),
+                Some(Fault::Forbidden)
+            );
+            store.managed_select_ingress_binding(&authority, &bridge_route, "pool", &command)
+        })
+        .await?;
+        assert_eq!(selected, binding);
+        Ok(())
+    }
+
+    /// A superseded voter is rebound through a separate pinned egress observation before aborting the old CAS.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn consensus_superseded_rebinds_before_rejecting_old_vote()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::managed_state::tests::{
+            consumed_admission, fake_config, fixture_with_uid, index_managed_member,
+            prepare_command, reserve,
+        };
+        use managed_dispatch::Client;
+        use sha2::Digest;
+        let _hash_guard = crate::TEST_EXEC_HASH_LOCK.lock().await;
+        let uid = fs::metadata(std::env::var_os("TMPDIR").ok_or("TMPDIR")?)?.uid();
+        let (directory, mut initial, binding, incarnation, run) = fixture_with_uid(uid);
+        let socket = directory.path().join("attempt.sock");
+        let listener = UnixListener::bind(&socket)?;
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
+        let executable = std::env::current_exe()?;
+        let sha256 = format!("{:x}", sha2::Sha256::digest(fs::read(&executable)?));
+        let endpoint = crate::managed_state::RunEndpointPin {
+            route: binding.run_route.clone(),
+            socket: socket.clone(),
+            executable: executable.clone(),
+            executable_sha256: sha256.clone(),
+        };
+        let db = initial.test_db();
+        db.execute("DELETE FROM managed_run_routes", [])?;
+        crate::managed_state::persist_run_route(db, &endpoint)?;
+        index_managed_member(db, &binding);
+        let raw: String =
+            db.query_row("SELECT data FROM members WHERE id='member'", [], |row| {
+                row.get(0)
+            })?;
+        let mut member: Binding = serde_json::from_str(&raw)?;
+        member.member.state = crate::domain::MemberState::Active;
+        db.execute(
+            "UPDATE members SET data=?1 WHERE id='member'",
+            [serde_json::to_string(&member)?],
+        )?;
+        let raw: String = db.query_row("SELECT data FROM pools WHERE id='pool'", [], |row| {
+            row.get(0)
+        })?;
+        let mut pool: crate::domain::Pool = serde_json::from_str(&raw)?;
+        pool.proposal = Some(crate::domain::Proposal {
+            proposal_id: "proposal".into(),
+            roster_key: "roster".into(),
+            voters: vec!["member".into()],
+            result: "result".into(),
+            criteria: "criteria".into(),
+            snapshot: None,
+            snapshot_bytes: None,
+            state: crate::domain::ProposalState::Open,
+            votes: std::collections::BTreeMap::new(),
+        });
+        db.execute(
+            "INSERT INTO proposals(id,pool,state,data) VALUES('proposal','pool','open',?1)",
+            [serde_json::to_string(
+                pool.proposal.as_ref().ok_or("proposal")?,
+            )?],
+        )?;
+        db.execute(
+            "UPDATE pools SET data=?1 WHERE id='pool'",
+            [serde_json::to_string(&pool)?],
+        )?;
+        let vote = Command::Vote(crate::domain::Vote {
+            change: crate::domain::Change {
+                pool_id: "pool".into(),
+                expected_revision: 1,
+                request_key: "vote-key".into(),
+            },
+            proposal_id: "proposal".into(),
+            roster_key: "roster".into(),
+            choice: crate::domain::Choice::Ready,
+            evidence: "ready".into(),
+            checks: vec![],
+        });
+        let digest = prepare_command(
+            db,
+            &run,
+            &binding,
+            &incarnation,
+            "vote-context",
+            "vote-intent",
+            "vote-inv",
+            &vote,
+        );
+        assert_eq!(
+            reserve(
+                db,
+                &run,
+                &binding,
+                &incarnation,
+                "vote-context",
+                "vote-inv",
+                "vote-intent",
+                &vote,
+                &digest
+            )?,
+            crate::managed_state::IntentReservation::Created
+        );
+        let admission = consumed_admission(
+            db,
+            &run,
+            &binding,
+            &incarnation,
+            "vote-intent",
+            "vote-inv",
+            &digest,
+            &vote,
+        );
+        crate::managed_state::mark_admitted(db, "vote-intent", &digest, &admission)?;
+        let pending = crate::managed_state::snapshot_consensus(db, "vote-intent", &digest)?;
+        let mut successor = binding.attempt.clone();
+        successor.attempt_id = "attempt-2".into();
+        successor.launch_id = "00000000-0000-4000-8000-000000000004".into();
+        let mut next = incarnation.clone();
+        next.pid += 1;
+        next.start_ticks += 1;
+        let mut egress = run.receipt.clone();
+        egress.receipt_id = "egress-r2".into();
+        egress.purpose = "egress".into();
+        egress.attempt = successor.clone();
+        egress.incarnation = next.clone();
+        let store_id = binding.run_route.component_store_id.clone();
+        let server = tokio::spawn(async move {
+            for index in 0..8 {
+                let (mut stream, _) = listener.accept().await.map_err(|_| Fault::Unavailable)?;
+                let request: serde_json::Value =
+                    serde_json::from_slice(&integrations::read_frame(&mut stream).await?)
+                        .map_err(|_| Fault::Invalid)?;
+                let value = match index {
+                    0 | 1 | 3 | 4 | 6 => {
+                        assert_eq!(request["method"], "_attempt_capabilities_v1");
+                        serde_json::json!({"version":1,"store_id":store_id,"capabilities":["attempt_consensus_v1","attempt_current_egress_v1"],"policy":"admission_snapshot"})
+                    }
+                    2 => {
+                        assert_eq!(request["params"]["purpose"], "consensus");
+                        serde_json::json!({"version":1,"store_id":store_id,"state":"superseded","last_attempt":successor,"last_incarnation":next,"successor_proof":egress.successor_proof})
+                    }
+                    5 => {
+                        assert_eq!(request["params"]["purpose"], "egress");
+                        serde_json::json!({"version":1,"store_id":store_id,"state":"current","receipt":egress})
+                    }
+                    _ => {
+                        assert_eq!(request["method"], "_attempt_current_receipt_v1");
+                        serde_json::json!({"version":1,"store_id":store_id,"receipt":egress})
+                    }
+                };
+                let response = serde_json::json!({"id":request["id"],"result":value});
+                stream
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .map_err(|_| Fault::Unavailable)?;
+            }
+            Ok::<(), Fault>(())
+        });
+        let mut config = fake_config(&binding);
+        let transport = config.managed_run_transport.as_mut().ok_or("transport")?;
+        transport.socket = socket;
+        transport.executable = executable;
+        transport.sha256 = sha256;
+        let store = Arc::new(Mutex::new(initial));
+        let activity = Arc::new(ManagedActivity::default());
+        let lease = activity
+            .acquire(ManagedWork::Intent("vote-intent".into()))?
+            .ok_or("lease")?;
+        let client = managed_dispatch::ConfiguredClient { config: &config };
+        assert_eq!(
+            client.consensus(pending, &store, &lease).await.err(),
+            Some(Fault::Stale)
+        );
+        server.await??;
+        let (generation, context, revision) = stored(&store, |store| {
+            Ok(store.test_db().query_row(
+                "SELECT b.generation,c.state,json_extract(p.data,'$.revision') FROM managed_bindings b JOIN managed_contexts c ON c.id='vote-context' JOIN pools p ON p.id=b.pool WHERE b.member='member'",
+                [], |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?)),
+            )?)
+        }).await?;
+        assert_eq!(generation, 2u64.to_be_bytes());
+        assert_eq!(context, "invalidated");
+        assert_eq!(revision, 1);
+        Ok(())
+    }
+
+    /// Managed reads remain on the authenticated bootstrap lease and keep Bridge cleanup pending.
+    #[tokio::test]
+    async fn managed_read_dispatch_uses_lease_and_preserves_bridge_cleanup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::managed_state::tests::{
+            fake_consumed, fixture, fresh_authority, index_managed_member, prepare_command,
+        };
+        let (_directory, mut initial, binding, incarnation, run) = fixture();
+        let db = initial.test_db();
+        index_managed_member(db, &binding);
+        let command: Command = serde_json::from_value(
+            serde_json::json!({"name":"pool_get","arguments":{"pool_id":"pool"}}),
+        )?;
+        let digest = prepare_command(
+            db,
+            &run,
+            &binding,
+            &incarnation,
+            "read-context",
+            "read-intent",
+            "read-inv",
+            &command,
+        );
+        let authority = fresh_authority(db, &binding, "read-context", "read-inv")?;
+        let consumed = fake_consumed(
+            &binding,
+            &incarnation,
+            "read-intent",
+            "read-inv",
+            &digest,
+            &command,
+        );
+        let store = Arc::new(Mutex::new(initial));
+        let activity = Arc::new(ManagedActivity::default());
+        let lease = activity
+            .acquire(ManagedWork::Bootstrap("read-context".into()))?
+            .ok_or("read lease")?;
+        let reply = managed_dispatch::read(
+            &store,
+            &activity,
+            &lease,
+            managed_dispatch::Read {
+                bootstrap_id: "read-context".into(),
+                context_id: "read-context".into(),
+                command,
+                digest: digest.clone(),
+                authorities: vec![authority],
+                consumed,
+            },
+        )
+        .await?;
+        let Reply::View(view) = reply else {
+            return Err("expected participant view".into());
+        };
+        assert_eq!(view.pool.pool_id, "pool");
+        let action = stored_managed(&store, &lease, |store| {
+            store.managed_stage_bootstrap("read-context")
+        })
+        .await?;
+        let crate::managed_state::BootstrapRecoveryAction::BridgeAbort { key, .. } = action else {
+            return Err("expected exact Bridge abort".into());
+        };
+        assert_eq!(key.security_digest, digest);
+        assert_eq!(key.consume_request_id, "read-intent");
+        Ok(())
+    }
+
+    /// Two fresh invocations share one domain key and submit only one Run admission.
+    #[tokio::test]
+    async fn managed_dispatch_concurrent_key_admits_and_commits_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::managed_state::tests::{
+            FakeRun, consumed_admission, fake_consumed, fixture, fresh_authority,
+            index_managed_member, prepare_command,
+        };
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct FakeBridge {
+            receipts: std::collections::BTreeMap<String, crate::managed_bridge::Consumed>,
+        }
+        impl crate::managed_bridge::BridgeB1Client for FakeBridge {
+            fn capabilities(
+                &self,
+            ) -> Result<crate::managed_bridge::Capabilities, crate::managed_bridge::BridgeFailure>
+            {
+                Err(crate::managed_bridge::BridgeFailure::Refused)
+            }
+            fn prepare(
+                &self,
+                _: &crate::managed_bridge::Prepare<'_>,
+            ) -> Result<crate::managed_bridge::Prepared, crate::managed_bridge::BridgeFailure>
+            {
+                Err(crate::managed_bridge::BridgeFailure::Refused)
+            }
+            fn register(
+                &self,
+                _: &crate::managed_bridge::Registration<'_>,
+            ) -> Result<crate::managed_bridge::Registered, crate::managed_bridge::BridgeFailure>
+            {
+                Err(crate::managed_bridge::BridgeFailure::Refused)
+            }
+            fn consume(
+                &self,
+                key: &crate::managed_bridge::ConsumeKey<'_>,
+                _: &bridge_sdk::bridge_protocol::Secret,
+            ) -> Result<crate::managed_bridge::Consumed, crate::managed_bridge::BridgeFailure>
+            {
+                self.receipts
+                    .get(key.consume_request_id)
+                    .cloned()
+                    .ok_or(crate::managed_bridge::BridgeFailure::Refused)
+            }
+            fn lookup(
+                &self,
+                _: &str,
+                _: &crate::managed_bridge::ConsumeKey<'_>,
+            ) -> Result<crate::managed_bridge::Consumed, crate::managed_bridge::BridgeFailure>
+            {
+                Err(crate::managed_bridge::BridgeFailure::Refused)
+            }
+            fn abort(
+                &self,
+                key: &crate::managed_bridge::ConsumeKey<'_>,
+            ) -> Result<crate::managed_bridge::Abort, crate::managed_bridge::BridgeFailure>
+            {
+                let receipt = self
+                    .receipts
+                    .get(key.consume_request_id)
+                    .ok_or(crate::managed_bridge::BridgeFailure::Refused)?;
+                Ok(crate::managed_bridge::Abort {
+                    store_id: key.expected_store_id.into(),
+                    aborted: true,
+                    receipt: Some(receipt.receipt.clone()),
+                })
+            }
+        }
+        struct FakeClient {
+            admission: crate::managed_run::Admission,
+            run: FakeRun,
+            calls: AtomicUsize,
+            fail: AtomicBool,
+            not_ready_once: AtomicBool,
+            entered: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+        }
+        impl managed_dispatch::Client for FakeClient {
+            fn admit<'a>(
+                &'a self,
+                plan: &'a crate::managed_state::AdmissionPlan,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                crate::managed_run::Admission,
+                                crate::managed_run::RunError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    if self.fail.load(Ordering::SeqCst) {
+                        return Err(crate::managed_run::RunError::Unknown);
+                    }
+                    assert_eq!(plan.binding, self.admission.binding);
+                    assert_eq!(plan.recovery.consumed_ref, self.admission.consumed_ref);
+                    if self.not_ready_once.swap(false, Ordering::SeqCst) {
+                        return Err(crate::managed_run::RunError::NotReady);
+                    }
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                    Ok(self.admission.clone())
+                })
+            }
+            fn consensus<'a>(
+                &'a self,
+                pending: crate::managed_state::PendingConsensus,
+                _store: &'a SharedStore,
+                _lease: &'a ManagedLease,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<crate::managed_state::ConsensusFence, Fault>,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move { pending.verify(&self.run) })
+            }
+        }
+
+        let (_directory, mut initial, binding, incarnation, run) = fixture();
+        let db = initial.test_db();
+        index_managed_member(db, &binding);
+        let raw: String =
+            db.query_row("SELECT data FROM members WHERE id='member'", [], |row| {
+                row.get(0)
+            })?;
+        let mut member: Binding = serde_json::from_str(&raw)?;
+        member.member.state = crate::domain::MemberState::Active;
+        db.execute(
+            "UPDATE members SET data=?1 WHERE id='member'",
+            [serde_json::to_string(&member)?],
+        )?;
+        let command = Command::Post(crate::domain::Message {
+            change: crate::domain::Change {
+                pool_id: "pool".into(),
+                expected_revision: 1,
+                request_key: "shared-key".into(),
+            },
+            body: "only once".into(),
+        });
+        let digest1 = prepare_command(
+            db,
+            &run,
+            &binding,
+            &incarnation,
+            "context-1",
+            "intent-1",
+            "inv-1",
+            &command,
+        );
+        let digest2 = prepare_command(
+            db,
+            &run,
+            &binding,
+            &incarnation,
+            "context-2",
+            "intent-2",
+            "inv-2",
+            &command,
+        );
+        let authority1 = fresh_authority(db, &binding, "context-1", "inv-1")?;
+        let authority2 = fresh_authority(db, &binding, "context-2", "inv-2")?;
+        let synthetic1 = fake_consumed(
+            &binding,
+            &incarnation,
+            "intent-1",
+            "inv-1",
+            &digest1,
+            &command,
+        );
+        let synthetic2 = fake_consumed(
+            &binding,
+            &incarnation,
+            "intent-2",
+            "inv-2",
+            &digest2,
+            &command,
+        );
+        let bridge = FakeBridge {
+            receipts: [
+                ("intent-1".into(), synthetic1),
+                ("intent-2".into(), synthetic2),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let consume = |intent: &str, invocation: &str, digest: &str| {
+            let key = crate::managed_bridge::ConsumeKey {
+                abort_request_id: "unused",
+                expected_store_id: &binding.bridge_route.component_store_id,
+                producer: "pool",
+                consume_request_id: intent,
+                invocation_key: invocation,
+                security_digest: digest,
+                audience: "pool",
+            };
+            crate::managed_bridge::consume_original(
+                &bridge,
+                &key,
+                &bridge_sdk::bridge_protocol::Secret::new("fixture-only"),
+                "pool",
+                &command,
+                "epoch",
+            )
+            .map_err(|_| Fault::Unauthorized)
+        };
+        let consumed1 = consume("intent-1", "inv-1", &digest1)?;
+        let consumed2 = consume("intent-2", "inv-2", &digest2)?;
+        let admission = consumed_admission(
+            db,
+            &run,
+            &binding,
+            &incarnation,
+            "intent-1",
+            "inv-1",
+            &digest1,
+            &command,
+        );
+        let route = crate::managed_state::Route {
+            component_store_id: binding.pool_store_id.clone(),
+            route_id: "pool-route".into(),
+            worker_uid: binding.run_route.worker_uid,
+        };
+        let first = managed_dispatch::Mutation {
+            bootstrap_id: "context-1".into(),
+            context_id: "context-1".into(),
+            intent_id: "intent-1".into(),
+            member_id: "member".into(),
+            command: command.clone(),
+            digest: digest1,
+            authority: authority1,
+            consumed: consumed1,
+            pool_route: route.clone(),
+        };
+        let second_digest = digest2.clone();
+        let second = managed_dispatch::Mutation {
+            bootstrap_id: "context-2".into(),
+            context_id: "context-2".into(),
+            intent_id: "intent-2".into(),
+            member_id: "member".into(),
+            command,
+            digest: digest2,
+            authority: authority2,
+            consumed: consumed2,
+            pool_route: route,
+        };
+        let client = Arc::new(FakeClient {
+            admission,
+            run,
+            calls: AtomicUsize::new(0),
+            fail: AtomicBool::new(false),
+            not_ready_once: AtomicBool::new(true),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let store = Arc::new(Mutex::new(initial));
+        let activity = Arc::new(ManagedActivity::default());
+        let first_lease = activity
+            .acquire(ManagedWork::Bootstrap("context-1".into()))?
+            .ok_or("first lease")?;
+        let second_lease = activity
+            .acquire(ManagedWork::Bootstrap("context-2".into()))?
+            .ok_or("second lease")?;
+        let first_store = Arc::clone(&store);
+        let first_activity = Arc::clone(&activity);
+        let first_client = Arc::clone(&client);
+        let task = tokio::spawn(async move {
+            managed_dispatch::mutation(
+                &first_store,
+                &first_activity,
+                &first_lease,
+                first,
+                first_client.as_ref(),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(30), client.entered.notified()).await?;
+        assert_eq!(
+            managed_dispatch::mutation(&store, &activity, &second_lease, second, client.as_ref())
+                .await?,
+            crate::managed_state::IntentReservation::Pending
+        );
+        let action = stored_managed(&store, &second_lease, |store| {
+            store.managed_stage_bootstrap("context-2")
+        })
+        .await?;
+        let crate::managed_state::BootstrapRecoveryAction::BridgeAbort {
+            context_id,
+            pin,
+            key,
+        } = action
+        else {
+            return Err("losing invocation did not retain Bridge recovery".into());
+        };
+        assert_eq!(key.security_digest, second_digest);
+        assert_eq!(key.consume_request_id, "intent-2");
+        let abort = crate::managed_bridge::abort_original(&bridge, &key.borrowed())
+            .map_err(|_| "fake Bridge abort")?;
+        stored_managed(&store, &second_lease, move |store| {
+            store.managed_record_bootstrap_abort(&context_id, &key, &pin, &abort)
+        })
+        .await?;
+        client.release.notify_one();
+        let first_result = task.await??;
+        let crate::managed_state::IntentReservation::Committed(receipt) = first_result else {
+            return Err("expected committed receipt".into());
+        };
+        let reply: Reply = serde_json::from_str(&receipt)?;
+        let Reply::Receipt(reply) = reply else {
+            return Err("expected mutation receipt".into());
+        };
+        assert_eq!(reply.revision, 2);
+        assert_eq!(reply.event.body, "only once");
+        assert_eq!(client.calls.load(Ordering::SeqCst), 2);
+        let event_count = stored(&store, |store| {
+            Ok(store
+                .test_db()
+                .query_row("SELECT count(*) FROM events", [], |row| {
+                    row.get::<_, i64>(0)
+                })?)
+        })
+        .await?;
+        assert_eq!(event_count, 1);
+
+        // An uncertain Run result leaves a durable local abort and retains its
+        // domain key until both original remote fences are recovered.
+        client.fail.store(true, Ordering::SeqCst);
+        let retry_command = Command::Post(crate::domain::Message {
+            change: crate::domain::Change {
+                pool_id: "pool".into(),
+                expected_revision: 2,
+                request_key: "next-key".into(),
+            },
+            body: "not committed".into(),
+        });
+        let next_client = Arc::clone(&client);
+        let next_binding = binding.clone();
+        let next_incarnation = incarnation.clone();
+        let next_command = retry_command.clone();
+        let (next_digest, next_authority, next_consumed) = stored(&store, move |store| {
+            let db = store.test_db();
+            let digest = prepare_command(
+                db,
+                &next_client.run,
+                &next_binding,
+                &next_incarnation,
+                "context-3",
+                "intent-3",
+                "inv-3",
+                &next_command,
+            );
+            let authority = fresh_authority(db, &next_binding, "context-3", "inv-3")?;
+            let consumed = fake_consumed(
+                &next_binding,
+                &next_incarnation,
+                "intent-3",
+                "inv-3",
+                &digest,
+                &next_command,
+            );
+            Ok((digest, authority, consumed))
+        })
+        .await?;
+        let next_lease = activity
+            .acquire(ManagedWork::Bootstrap("context-3".into()))?
+            .ok_or("third lease")?;
+        let next = managed_dispatch::Mutation {
+            bootstrap_id: "context-3".into(),
+            context_id: "context-3".into(),
+            intent_id: "intent-3".into(),
+            member_id: "member".into(),
+            command: retry_command,
+            digest: next_digest,
+            authority: next_authority,
+            consumed: next_consumed,
+            pool_route: crate::managed_state::Route {
+                component_store_id: binding.pool_store_id.clone(),
+                route_id: "pool-route".into(),
+                worker_uid: binding.run_route.worker_uid,
+            },
+        };
+        assert_eq!(
+            managed_dispatch::mutation(&store, &activity, &next_lease, next, client.as_ref())
+                .await
+                .err(),
+            Some(Fault::Unavailable)
+        );
+        let terminal = stored(&store, |store| {
+            Ok(store.test_db().query_row(
+                "SELECT state,effect_free,bridge_resolved,run_resolved,(SELECT count(*) FROM managed_domain_keys WHERE intent_id='intent-3') FROM managed_intents WHERE id='intent-3'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?, row.get::<_, i64>(4)?)),
+            )?)
+        }).await?;
+        assert_eq!(terminal, ("aborted".into(), 1, 0, 0, 1));
+        assert_eq!(client.calls.load(Ordering::SeqCst), 3);
+
+        struct FakeVote<'a> {
+            admission: crate::managed_run::Admission,
+            run: &'a FakeRun,
+        }
+        impl managed_dispatch::Client for FakeVote<'_> {
+            fn admit<'a>(
+                &'a self,
+                plan: &'a crate::managed_state::AdmissionPlan,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                crate::managed_run::Admission,
+                                crate::managed_run::RunError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move {
+                    assert_eq!(plan.binding, self.admission.binding);
+                    Ok(self.admission.clone())
+                })
+            }
+            fn consensus<'a>(
+                &'a self,
+                pending: crate::managed_state::PendingConsensus,
+                _store: &'a SharedStore,
+                _lease: &'a ManagedLease,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<crate::managed_state::ConsensusFence, Fault>,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move { pending.verify(self.run) })
+            }
+        }
+        let vote_client = Arc::clone(&client);
+        let vote_binding = binding.clone();
+        let vote_incarnation = incarnation.clone();
+        let (vote_command, vote_digest, vote_authority, vote_consumed, vote_admission) =
+            stored(&store, move |store| {
+                let db = store.test_db();
+                let raw: String =
+                    db.query_row("SELECT data FROM pools WHERE id='pool'", [], |row| {
+                        row.get(0)
+                    })?;
+                let mut pool: crate::domain::Pool =
+                    serde_json::from_str(&raw).map_err(|_| Fault::Internal)?;
+                pool.proposal = Some(crate::domain::Proposal {
+                    proposal_id: "proposal".into(),
+                    roster_key: "roster".into(),
+                    voters: vec!["member".into()],
+                    result: "result".into(),
+                    criteria: "criteria".into(),
+                    snapshot: None,
+                    snapshot_bytes: None,
+                    state: crate::domain::ProposalState::Open,
+                    votes: std::collections::BTreeMap::new(),
+                });
+                let proposal =
+                    serde_json::to_string(pool.proposal.as_ref().ok_or(Fault::Internal)?)
+                        .map_err(|_| Fault::Internal)?;
+                db.execute(
+                    "INSERT INTO proposals(id,pool,state,data) VALUES('proposal','pool','open',?1)",
+                    [proposal],
+                )?;
+                db.execute(
+                    "UPDATE pools SET data=?1 WHERE id='pool'",
+                    [serde_json::to_string(&pool).map_err(|_| Fault::Internal)?],
+                )?;
+                let vote = Command::Vote(crate::domain::Vote {
+                    change: crate::domain::Change {
+                        pool_id: "pool".into(),
+                        expected_revision: 2,
+                        request_key: "vote-key".into(),
+                    },
+                    proposal_id: "proposal".into(),
+                    roster_key: "roster".into(),
+                    choice: crate::domain::Choice::Ready,
+                    evidence: "verified".into(),
+                    checks: vec![],
+                });
+                let digest = prepare_command(
+                    db,
+                    &vote_client.run,
+                    &vote_binding,
+                    &vote_incarnation,
+                    "vote-context",
+                    "vote-intent",
+                    "vote-inv",
+                    &vote,
+                );
+                let authority = fresh_authority(db, &vote_binding, "vote-context", "vote-inv")?;
+                let consumed = fake_consumed(
+                    &vote_binding,
+                    &vote_incarnation,
+                    "vote-intent",
+                    "vote-inv",
+                    &digest,
+                    &vote,
+                );
+                let admission = consumed_admission(
+                    db,
+                    &vote_client.run,
+                    &vote_binding,
+                    &vote_incarnation,
+                    "vote-intent",
+                    "vote-inv",
+                    &digest,
+                    &vote,
+                );
+                Ok((vote, digest, authority, consumed, admission))
+            })
+            .await?;
+        let vote_lease = activity
+            .acquire(ManagedWork::Bootstrap("vote-context".into()))?
+            .ok_or("vote lease")?;
+        let vote_request = managed_dispatch::Mutation {
+            bootstrap_id: "vote-context".into(),
+            context_id: "vote-context".into(),
+            intent_id: "vote-intent".into(),
+            member_id: "member".into(),
+            command: vote_command,
+            digest: vote_digest,
+            authority: vote_authority,
+            consumed: vote_consumed,
+            pool_route: crate::managed_state::Route {
+                component_store_id: binding.pool_store_id.clone(),
+                route_id: "pool-route".into(),
+                worker_uid: binding.run_route.worker_uid,
+            },
+        };
+        let vote_result = managed_dispatch::mutation(
+            &store,
+            &activity,
+            &vote_lease,
+            vote_request,
+            &FakeVote {
+                admission: vote_admission,
+                run: &client.run,
+            },
+        )
+        .await?;
+        let crate::managed_state::IntentReservation::Committed(vote_receipt) = vote_result else {
+            return Err("expected committed vote".into());
+        };
+        let reply: Reply = serde_json::from_str(&vote_receipt)?;
+        let Reply::Receipt(reply) = reply else {
+            return Err("expected vote receipt".into());
+        };
+        assert_eq!(reply.event.kind, "proposal_accepted");
+        let verified = stored(&store, |store| {
+            Ok(store.test_db().query_row(
+                "SELECT count(*) FROM managed_ballot_provenance",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?)
+        })
+        .await?;
+        assert_eq!(verified, 1);
+
+        struct CancelClient {
+            entered: tokio::sync::Notify,
+        }
+        impl managed_dispatch::Client for CancelClient {
+            fn admit<'a>(
+                &'a self,
+                _plan: &'a crate::managed_state::AdmissionPlan,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                crate::managed_run::Admission,
+                                crate::managed_run::RunError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move {
+                    self.entered.notify_one();
+                    std::future::pending().await
+                })
+            }
+            fn consensus<'a>(
+                &'a self,
+                _pending: crate::managed_state::PendingConsensus,
+                _store: &'a SharedStore,
+                _lease: &'a ManagedLease,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<crate::managed_state::ConsensusFence, Fault>,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async { Err(Fault::Unavailable) })
+            }
+        }
+        let cancel_command = Command::Post(crate::domain::Message {
+            change: crate::domain::Change {
+                pool_id: "pool".into(),
+                expected_revision: 3,
+                request_key: "cancel-key".into(),
+            },
+            body: "never committed".into(),
+        });
+        let cancel_client = Arc::clone(&client);
+        let cancel_binding = binding.clone();
+        let cancel_incarnation = incarnation.clone();
+        let staged_command = cancel_command.clone();
+        let (cancel_digest, cancel_authority, cancel_consumed) = stored(&store, move |store| {
+            let db = store.test_db();
+            let digest = prepare_command(
+                db,
+                &cancel_client.run,
+                &cancel_binding,
+                &cancel_incarnation,
+                "cancel-context",
+                "cancel-intent",
+                "cancel-inv",
+                &staged_command,
+            );
+            let authority = fresh_authority(db, &cancel_binding, "cancel-context", "cancel-inv")?;
+            let consumed = fake_consumed(
+                &cancel_binding,
+                &cancel_incarnation,
+                "cancel-intent",
+                "cancel-inv",
+                &digest,
+                &staged_command,
+            );
+            Ok((digest, authority, consumed))
+        })
+        .await?;
+        let cancel_lease = activity
+            .acquire(ManagedWork::Bootstrap("cancel-context".into()))?
+            .ok_or("cancel lease")?;
+        let request = managed_dispatch::Mutation {
+            bootstrap_id: "cancel-context".into(),
+            context_id: "cancel-context".into(),
+            intent_id: "cancel-intent".into(),
+            member_id: "member".into(),
+            command: cancel_command,
+            digest: cancel_digest.clone(),
+            authority: cancel_authority,
+            consumed: cancel_consumed,
+            pool_route: crate::managed_state::Route {
+                component_store_id: binding.pool_store_id.clone(),
+                route_id: "pool-route".into(),
+                worker_uid: binding.run_route.worker_uid,
+            },
+        };
+        let cancel_run = Arc::new(CancelClient {
+            entered: tokio::sync::Notify::new(),
+        });
+        let task_store = Arc::clone(&store);
+        let task_activity = Arc::clone(&activity);
+        let task_run = Arc::clone(&cancel_run);
+        let task = tokio::spawn(async move {
+            managed_dispatch::mutation(
+                &task_store,
+                &task_activity,
+                &cancel_lease,
+                request,
+                task_run.as_ref(),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(30), cancel_run.entered.notified()).await?;
+        task.abort();
+        let _ = task.await;
+        let recovery = activity
+            .acquire(ManagedWork::Intent("cancel-intent".into()))?
+            .ok_or("cancelled intent lease leaked")?;
+        let action = stored_managed(&store, &recovery, move |store| {
+            store.managed_stage_recovery("cancel-intent", &cancel_digest)
+        })
+        .await?;
+        assert!(matches!(
+            action,
+            crate::managed_state::RecoveryAction::LocallyFenced
+        ));
+        let state = stored(&store, |store| {
+            Ok(store.test_db().query_row(
+                "SELECT state FROM managed_intents WHERE id='cancel-intent'",
+                [],
+                |row| row.get::<_, String>(0),
+            )?)
+        })
+        .await?;
+        assert_eq!(state, "aborted");
+        Ok(())
+    }
+
+    /// A cancelled caller cannot release its lease while its blocking store work is still running.
+    #[tokio::test]
+    async fn managed_lease_survives_cancelled_store_caller()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory =
+            tempfile::tempdir_in(std::env::var_os("TMPDIR").ok_or("task TMPDIR required")?)?;
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))?;
+        let store = Arc::new(Mutex::new(Store::open(&directory.path().join("pool.db"))?));
+        let activity = Arc::new(ManagedActivity::default());
+        let key = ManagedWork::Intent("intent".into());
+        let lease = activity
+            .acquire(key.clone())?
+            .ok_or("intent already active")?;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let task_store = Arc::clone(&store);
+        let task_lease = lease.clone();
+        let task = tokio::spawn(async move {
+            stored_managed(&task_store, &task_lease, move |_| {
+                let _ = started_tx.send(());
+                release_rx.recv().map_err(|_| Fault::Internal)?;
+                Ok(())
+            })
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(30), started_rx).await??;
+        task.abort();
+        let _ = task.await;
+        drop(lease);
+        assert!(activity.acquire(key.clone())?.is_none());
+        release_tx.send(())?;
+        let wait_store = Arc::clone(&store);
+        tokio::task::spawn_blocking(move || {
+            let _store = wait_store.lock().map_err(|_| Fault::Internal)?;
+            Ok::<_, Fault>(())
+        })
+        .await??;
+        assert!(activity.acquire(key)?.is_some());
+        Ok(())
+    }
+
+    /// Recovery locally fences an unregistered prepare without contacting Bridge or Run.
+    #[tokio::test]
+    async fn managed_recovery_abandons_unregistered_without_bridge_io()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory =
+            tempfile::tempdir_in(std::env::var_os("TMPDIR").ok_or("task TMPDIR required")?)?;
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))?;
+        let path = directory.path();
+        let uid = fs::metadata(path)?.uid();
+        let config = Config {
+            socket_path: path.join("pool.sock"),
+            database_path: path.join("pool.db"),
+            expected_uid: uid,
+            bridge_registration_socket: path.join("absent-adapter.sock"),
+            bridge_core_socket: path.join("absent-core.sock"),
+            bridge_credential_file: path.join("absent-token"),
+            bridge_producer_id: "pool".into(),
+            bridge_audience: "pool".into(),
+            bridge_server_executable: path.join("absent-bridge"),
+            bridge_server_sha256: "a".repeat(64),
+            bridge_observer_socket: None,
+            bridge_observer_credential_file: None,
+            owner_observer_credential_file: None,
+            run_socket: None,
+            run_peer_uid: None,
+            managed_run_reader: None,
+            managed_run_transport: None,
+        };
+        let mut initial = Store::open(&config.database_path)?;
+        let route = crate::managed_state::Route {
+            component_store_id: "00000000-0000-4000-8000-000000000001".into(),
+            route_id: "bridge-route".into(),
+            worker_uid: uid,
+        };
+        let pin = crate::managed_bridge::BridgePin {
+            route: route.clone(),
+            producer: "pool".into(),
+            registration_socket: config.bridge_registration_socket.clone(),
+            core_socket: config.bridge_core_socket.clone(),
+            server_executable: config.bridge_server_executable.clone(),
+            server_sha256: config.bridge_server_sha256.clone(),
+            credential_file: config.bridge_credential_file.clone(),
+            credential_sha256: "b".repeat(64),
+        };
+        let command = Command::List(crate::domain::List { after: None });
+        let proof = bridge_sdk::bridge_protocol::CallEvidence::Native {
+            host: bridge_sdk::bridge_protocol::Host::Codex,
+            metadata: serde_json::Map::new(),
+        };
+        crate::managed_state::persist_bridge_route(initial.test_db(), &pin)?;
+        crate::managed_state::reserve_bootstrap(
+            initial.test_db(),
+            &crate::managed_state::BootstrapRequest {
+                namespace_id: "ns",
+                bootstrap_id: "bootstrap",
+                route: &route,
+                bridge_pin: &pin,
+                producer: "pool",
+                issuer_epoch: "opaque-epoch",
+                invocation_key: "inv",
+                command: &command,
+                native_proof: &proof,
+            },
+        )?;
+        drop(crate::managed_state::mark_bootstrap_submitted(
+            initial.test_db(),
+            "bootstrap",
+        )?);
+        let store = Arc::new(Mutex::new(initial));
+        let (_stop, stopped) = watch::channel(false);
+        let activity = Arc::new(ManagedActivity::default());
+        let lease = activity
+            .acquire(ManagedWork::Bootstrap("bootstrap".into()))?
+            .ok_or("bootstrap already active")?;
+        let held = lease.clone();
+        drop(lease);
+        recover_managed(&config, &store, &stopped, &activity).await?;
+        let active_state = stored(&store, |store| {
+            Ok(store.test_db().query_row(
+                "SELECT state FROM managed_bootstrap WHERE id='bootstrap'",
+                [],
+                |row| row.get::<_, String>(0),
+            )?)
+        })
+        .await?;
+        assert_eq!(active_state, "submitted");
+        drop(held);
+        // The bounded cursor wraps after skipping the occupied entry.
+        recover_managed(&config, &store, &stopped, &activity).await?;
+        recover_managed(&config, &store, &stopped, &activity).await?;
+        let state = stored(&store, |store| {
+            let row: (String, Option<String>) = store.test_db().query_row(
+                "SELECT state,abort_receipt FROM managed_bootstrap WHERE id='bootstrap'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            Ok(row)
+        })
+        .await?;
+        assert_eq!(state, ("terminal".into(), None));
+        Ok(())
+    }
+
     /// Owner proof is read-only, correlated to the binding, and fenced by Pool revision.
     #[tokio::test]
     async fn owner_run_proof_observes_binding_without_authorizing_and_rechecks_revision()
@@ -4396,11 +7399,15 @@ mod tests {
             bridge_credential_file: path.join("absent-token"),
             bridge_producer_id: "fixture".into(),
             bridge_audience: "fixture".into(),
+            bridge_server_executable: "/fixture/bridge".into(),
+            bridge_server_sha256: "0".repeat(64),
             bridge_observer_socket: None,
             bridge_observer_credential_file: None,
             owner_observer_credential_file: Some(token),
             run_socket: Some(path.join("run.sock")),
             run_peer_uid: None,
+            managed_run_reader: None,
+            managed_run_transport: None,
         };
         let socket = config.run_socket.as_ref().ok_or("missing Run socket")?;
         let listener = UnixListener::bind(socket)?;
@@ -4719,15 +7726,24 @@ mod tests {
             bridge_credential_file: directory.path().join("absent-token"),
             bridge_producer_id: "fixture".into(),
             bridge_audience: "fixture-backend".into(),
+            bridge_server_executable: "/fixture/bridge".into(),
+            bridge_server_sha256: "0".repeat(64),
             bridge_observer_socket: None,
             bridge_observer_credential_file: None,
             owner_observer_credential_file: None,
             run_socket: None,
             run_peer_uid: None,
+            managed_run_reader: None,
+            managed_run_transport: None,
         };
         let (stop, stopped) = watch::channel(false);
         stop.send(true)?;
-        let mut worker = tokio::spawn(work(config, Arc::clone(&store), stopped));
+        let mut worker = tokio::spawn(work(
+            config,
+            Arc::clone(&store),
+            stopped,
+            Arc::new(ManagedActivity::default()),
+        ));
         match tokio::time::timeout(Duration::from_secs(2), &mut worker).await {
             Ok(result) => result??,
             Err(error) => {

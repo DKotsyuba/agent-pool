@@ -11,9 +11,10 @@ its EOF never starts, stops or replaces the resident.
 - `domain.rs` defines strict flat commands, safe public views and private outbox work.
 - `store.rs` owns the single SQLite writer and synchronous transactions. A process
   lifetime file lock excludes a second writer. WAL, full synchronization, foreign
-  keys and schema version 5 are explicit. Future schema versions refuse to open.
-  Schema v1–v4 upgrades transactionally to v5 before use; older binaries must
-  refuse v5 because they cannot preserve replacement intents and stable slots.
+  keys and schema version 8 are explicit. Future schema versions refuse to open.
+  Schema v1–v7 upgrades transactionally to v8 before use; older binaries must
+  refuse v8 because they cannot preserve newer durable state. The v5 replacement
+  and stable-slot migration and v6 inventory revision fence remain in that upgrade.
 - `runtime.rs` supervises bounded frontend connections, one serial effect worker
   and rotating observation batches. Blocking database work never spans provider I/O.
 - `integrations.rs` uses Bridge's public SDK and Run's public NDJSON JSON-RPC API.
@@ -38,14 +39,13 @@ pool. Closing a pool never clears that role. Current actor/address reservations
 are globally unique. An invitation reserves a new opaque member ID; only a fresh
 verified `pool_join` binds the actor and confirms the current onboarding revision.
 Run retention can remove a lineage tail and a later resume can reuse its sequence;
-a sampled address also does not identify the current attempt. Until a generic
-attempt-bound proof is available, Run admissions are retained but their member
-binding, participant calls and fresh deliveries fail closed as unknown. Existing
-managed mappings are likewise not used as authority, and their runtime projection
-is unknown. Stored Run-managed ballots are exposed with `validity:unknown` and do
-not count toward a new acceptance; already accepted historical decisions remain
-unchanged. Bridge-only participants remain available. The required generic Run
-identity/proof work is pending; admission is not proof that onboarding succeeded.
+a sampled address also does not identify the current attempt. Managed calls need
+the original Bridge observation and the pinned Run proof described below. Managed
+join remains closed, admission is not proof that onboarding succeeded, and fresh
+managed delivery is unavailable. Unverified historical mappings are not authority
+and their runtime projection is unknown. Old Run-managed ballots remain
+`validity:unknown` and cannot count toward a new acceptance; already accepted
+historical decisions remain unchanged. Bridge-only participants remain available.
 A removed incarnation loses all access and is never reused.
 
 Participant output contains local member IDs, names, assignments, states and safe
@@ -276,7 +276,11 @@ local candidate is not a remotely available release.
 
 Configuration is explicit; see `config.example.toml`. Provision the protected
 producer/audience and MCP profile through the existing deployment authority. The
-Pool producer needs SelfActor registration, its assertion audience, direct-address
+configuration also requires `bridge_server_executable` and `bridge_server_sha256`;
+there is no inferred managed-server pin. The B1 SDK checks that exact loaded build
+on the same socket before sending any request or credential. Changing an existing
+configuration to include these fields is an operator action, not an installation.
+The Pool producer needs SelfActor registration, its assertion audience, direct-address
 Message delivery with KeepAll, kind `agent_pool`, and delivery scopes. Observation
 uses a separate opt-in credential. Missing Run leaves external-agent pools usable.
 Run defaults to the same-user private socket policy. Linux can opt into a different
@@ -302,7 +306,7 @@ a native actor, leader, membership or assertion consumption.
 
 `agent-pool observe --config /absolute/config.toml` accepts exactly one bounded
 UTF-8 JSON line on stdin followed by EOF, and emits one JSON line. Input is
-`{"schema_version":1,"operation":"identity|list|get","params":{...}}`.
+`{"schema_version":1,"operation":"identity|list|get|inventory_snapshot","params":{...}}`.
 `identity` requires `{}`; `list` accepts `after` (last pool ID). `get` requires
 `pool_id`, accepts numeric `after` (default 0), `section` (default `overview`),
 `proposal_id`, `member_id`, `field`, `include_bindings` (default false), and optional
@@ -327,7 +331,7 @@ not count. Read the next `checks_count` matching `vote_check` events through
 `event_id_exact` for event navigation, including IDs beyond JavaScript's exact
 number range. `check` and `vote_event_id` are omitted from unrelated events.
 
-Success is `{schema_version:1,kind:"identity|pool_page|pool_detail|run_proof",data:...}`.
+Success is `{schema_version:1,kind:"identity|pool_page|pool_detail|run_proof|inventory_snapshot",data:...}`.
 Failure has the same family (or `error` for undecodable input), `error` instead
 of `data`, and fixed `code`, `outcome` (`blocked|unavailable`), `detail` fields.
 Inventory data has `pools:[{pool,leader_id}]`; detail has `section`, `view`
@@ -336,6 +340,132 @@ Both page families include `cursor` (string; get also accepts exact decimal text
 `has_more`, `returned`, `observed_at_unix_ms`, `source_timestamp`, `coverage`.
 Identity contains product, compiled package version, embedded qualification,
 capabilities and observed time, without claiming an installed/source revision.
+
+### Source-wide inventory snapshot v1
+
+Identity advertises `inventory_snapshot_v1`. This owner-only operation is distinct
+from `list`: it returns exact source-wide retained totals and a page of complete
+current rosters from one SQLite read transaction. It never calls Run or Bridge.
+For example, request:
+
+```json
+{"schema_version":1,"operation":"inventory_snapshot","params":{"filter":"all","limit":1}}
+```
+
+The following abbreviated identifiers illustrate the exact JSON shape (actual IDs
+are opaque). Unlike totals and source revision, `limit` and `returned` are JSON
+integers; all counts and the source revision are canonical decimal strings:
+
+```json
+{"schema_version":1,"kind":"inventory_snapshot","data":{"source":{"store_id":"store-uuid","read_epoch":"epoch-uuid","revision":"42"},"totals":{"total":"2","open":null,"completed":null,"unknown":"2","closed":"1"},"coverage":"Retained Pool rows only; completion classification unsupported, all retained pools unknown. Closed is independent of completion. Pages and totals share one Pool SQLite snapshot; no cross-service or clone/restore anti-rollback guarantee.","pools":[{"pool":{"pool_id":"pool-a","name":"Example","purpose":"Goal","revision":1,"closed":false,"proposal":null},"leader_id":"leader-id","roster":[{"member_id":"member-id","name":"Worker","role":"Implement","task":"Check","state":"active","runtime":"unknown"}]}],"returned":1,"has_more":true,"next_cursor":{"version":1,"source":{"store_id":"store-uuid","read_epoch":"epoch-uuid","revision":"42"},"filter":"all","limit":1,"after":"pool-a"},"observed_at_unix_ms":1730000000000}}
+```
+
+`filter` is required and is `all`, `closed`, or `not_closed`; it selects page
+rows only. `limit` is required and is an integer 1–10. `cursor` is omitted or
+null on the first page; pass the entire previous `next_cursor` and the same
+filter and limit on the next request. Do not construct or alter cursors. Order
+is ascending pool ID; `after` is exclusive. A cursor is an explicit binding,
+not an authentication token. Source, epoch, revision, filter, limit and a retained
+matching boundary are checked on continuation. Any mismatch is `stale`; restart
+at the first page. Invalid arguments and unknown cursor versions are `invalid`.
+An empty page has `returned:0`, `has_more:false`, `next_cursor:null`; a nonempty
+terminal page also has a null cursor. Every page may fail as a whole with an
+`unavailable` error if its complete encoded envelope exceeds 1 MiB. No row or
+roster is silently cut to fit. For example, an empty response's data has
+`"pools":[],"returned":0,"has_more":false,"next_cursor":null`.
+
+Continuing the illustrative first page uses:
+
+```json
+{"schema_version":1,"operation":"inventory_snapshot","params":{"filter":"all","limit":1,"cursor":{"version":1,"source":{"store_id":"store-uuid","read_epoch":"epoch-uuid","revision":"42"},"filter":"all","limit":1,"after":"pool-a"}}}
+```
+
+For example, if the store changed, the response is
+`{"schema_version":1,"kind":"inventory_snapshot","error":{"code":"stale","outcome":"blocked","detail":"Observation refused; check request and separately provisioned owner read grant."}}`.
+There is no `data` branch in an error; restart the inventory instead of mixing
+pages from different source revisions.
+
+Totals count retained rows across the whole store, independent of the filter.
+There is currently no formal completion ledger: `open` and `completed` are null,
+and `unknown` equals `total`, including closed, accepted, failed and waiting
+pools. `closed` counts the independent closure flag and never implies completion.
+After a completion ledger is implemented, OPEN is every retained pool without
+atomic settlement; COMPLETED is only a durable settlement, not acceptance, closure,
+Run success or delivery. Retention-deleted rows are outside all these counts.
+
+Each row contains the existing pool metadata projection (purpose may be a marked
+preview with `purpose_bytes`; proposal and criteria are omitted), the stable
+leader ID separately, and the complete current roster in stable slot order.
+The roster includes pending and active incarnations, not removed ones or the
+leader. It uses the existing member fields and excludes private bindings; managed
+Run members retain `runtime:"unknown"`. This operation does not authenticate
+attempts or change the fail-closed managed participant guard.
+
+Schema v6 adds a random durable `store_id` and a signed-64-bit nonnegative source
+revision, initially `"0"` on migration. Transactional triggers increment the
+revision on inserts, updates and deletes of durable state tables; even private or
+background changes can invalidate a cursor. An overflow aborts the write. A fresh
+random `read_epoch` is created each time the Store opens. Neither reopening nor
+the revision is a wall-clock timestamp. Clone/restore can preserve a store ID and
+roll back its revision, so this is not anti-rollback or a cross-service snapshot.
+
+### Managed attempt binding (P-context and P1)
+
+The optional `managed_run_reader` grant configures a separate same-UID Run reader
+by absolute executable, SHA-256, exact Run store/route and Bridge store/route/
+producer. Its private `_managed_intent_outcome_v1` and
+`_managed_namespace_seal_v1` calls verify the connected kernel peer and loaded
+executable before accessing the Store. A namespace seal fences later local work;
+it reports `draining` until tracked abort and settlement recovery is durable.
+The exact proposed wire is in the shared `contracts/pool-p1-wire.md`.
+
+Schema v7 adds separate managed binding generations, binding epochs, original
+contexts and rebind records; v8 adds managed intents, domain-key reservations and
+ballot provenance. Legacy members and ballots do not acquire verified provenance
+by migration. The optional `managed_run_transport` pins the Run attempt endpoint
+and its route independently of the legacy Run socket. `frontend_enabled` defaults
+to false; enabling it requires the matching reader grant and the exact `mcp_server`
+name in the Bridge tool mapping. The managed frontend is stdio-only. It and the
+resident use the same Pool executable and authenticate each other on their private
+connection; configure Bridge's frontend and consumer pins to the same Pool path
+and SHA-256. Bridge must independently establish their different process roles.
+Bridge may return `relaunch_required` when the resident predates managed-role
+initialization. Pool preserves that typed refusal and tells the caller to relaunch
+the resident, while retaining original request keys for recovery. It never
+restarts the resident itself.
+
+For a managed call the frontend prepares the original B1 context. The resident
+persists the pinned routes and original key, then asks Run for rootless ingress
+currentness with that context reference and invocation key. Run resolves the
+original observation and returns actor, full incarnation, attempt and a
+root-to-current proof. Pool selects its member by that lineage and applies any
+generation-fenced rebind before freezing the full command and context digest.
+The original frontend registers it; the resident consumes it and obtains fresh
+Run currentness before reserving a domain key. A definitive early-hook
+`attempt_not_ready` retries the original request for a bounded local interval.
+Lost prepare replies are abandoned behind a local continuation fence; if
+registration or consumption may have been submitted, exact-key abort recovery
+uses the original digest. Expiry is not an admission or abort proof.
+
+The admission dispatcher retains the original intent and Run pin, commits the
+domain mutation after admission and local CAS, and reconciles uncertain work by
+exact key. A bounded rotating recovery worker uses per-key activity leases shared
+with live operations. A consumed read or fresh replay with no new intent remains
+pending until its original Bridge abort is durably recorded. Immediate managed
+list and get projections recheck the captured binding in the same transaction;
+managed long polls are not implemented.
+
+Consensus captures voter identities in a SQLite read snapshot, checks all voters
+against Run without holding that transaction, then applies generation and roster
+CAS. A superseded verified voter triggers a separately capability-gated Run egress
+rebind before the old consensus attempt is aborted. A nonfinal vote can be
+recorded without changing other ballots or evaluating acceptance. Egress
+currentness uses its own Run capability and provides no delivery or owner handoff.
+The existing managed join and incomplete-tool guards remain closed, and no managed
+capability is advertised. This code has synthetic coverage; actual Run/Bridge
+endpoints, installed providers and managed-harness role qualification have not
+been qualified together. The grant installs no service, endpoint, credential or
+release.
 
 ### Run execution evidence v1
 
@@ -411,7 +541,7 @@ delivery are separate facts. Inventory orders by pool ID; archive orders by
 retained proposal insertion sequence; other sections preserve existing cursor
 semantics. Pages observe current state independently; mutable offset sections
 require the revision fence on continuation.
-Store schema v5 has no historical timestamps: `source_timestamp:null` and
+Store schema v8 has no historical timestamps: `source_timestamp:null` and
 coverage text disclose that absence. Complete encoded envelopes including the
 newline are capped at 1 MiB; oversized results fail explicitly without partial
 publication or silently advancing a cursor. Resident exchanges use the existing

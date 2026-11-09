@@ -196,6 +196,10 @@ pub fn templates() -> Vec<(&'static str, &'static str)> {
         ("pool_error", "ERROR {{ code }}. {{ recovery }}\n"),
         ("pool_view", include_str!("../templates/pool_view.j2")),
         ("pool_receipt", include_str!("../templates/pool_receipt.j2")),
+        (
+            "pool_pending",
+            "PENDING pool {{ pool_id }} request {{ request_key }}. Retry the identical request key with fresh proof.\n",
+        ),
         ("pool_list", include_str!("../templates/pool_list.j2")),
         ("pool_private", include_str!("../templates/pool_private.j2")),
     ]
@@ -255,6 +259,11 @@ struct ListView<'a> {
     /// Whether more accessible pools remain.
     has_more: bool,
 }
+#[derive(Serialize)]
+struct PendingView<'a> {
+    pool_id: &'a str,
+    request_key: &'a str,
+}
 /// Renders typed immutable outcomes; failures preserve committed identity and exact-retry semantics.
 pub fn present(reply: Result<Reply, Fault>, templates: &Templates) -> CallToolResult {
     let error = reply.is_err();
@@ -262,10 +271,12 @@ pub fn present(reply: Result<Reply, Fault>, templates: &Templates) -> CallToolRe
         Ok(Reply::View(v))=>templates.render("pool_view",v),
         Ok(Reply::OwnerView{view,bindings})=>templates.render("pool_view",view).and_then(|mut text|{text.push_str(&templates.render("pool_private",&PrivateView{bindings})?);if text.len()>16384{Err("presentation_failed")}else{Ok(text)}}),
         Ok(Reply::Receipt(r))=>templates.render("pool_receipt",r),
+        Ok(Reply::Pending{pool_id,request_key})=>templates.render("pool_pending",&PendingView{pool_id,request_key}),
         Ok(Reply::List{pools,next_after,has_more})=>templates.render("pool_list",&ListView{pools,next_after,has_more:*has_more}),
         Err(code)=>templates.render("pool_error",&ErrorView{code:*code,recovery:match code{
             Fault::Stale=>"Read pool_get for current revision and proposal/roster identity before a new intent.",
             Fault::Unavailable=>"A previous write may have committed. Inspect pool_get or repeat only the identical request_key and intent.",
+            Fault::RelaunchRequired=>"Relaunch the Pool resident after Bridge managed mode is enabled. Preserve the original request_key for recovery.",
             Fault::Unauthorized=>"Fresh native identity is required; no pool command was authorized.",
             Fault::Forbidden=>"The current authenticated caller cannot perform this action.",
             Fault::Conflict=>"A role, membership or idempotency conflict prevents this intent.",
@@ -276,8 +287,10 @@ pub fn present(reply: Result<Reply, Fault>, templates: &Templates) -> CallToolRe
     };
     let text=rendered.unwrap_or_else(|_|match reply{
         Ok(Reply::Receipt(r))=>format!("COMMITTED pool {} revision={} event={}; presentation degraded. Use pool_get; do not create a new request_key.",r.pool_id,r.revision,r.event.event_id),
+        Ok(Reply::Pending{pool_id,request_key})=>format!("PENDING pool {pool_id} request {request_key}; presentation degraded. Retry the identical key with fresh proof."),
         Ok(Reply::View(v))|Ok(Reply::OwnerView{view:v,..})=>format!("READ COMPLETED pool {} revision={}; presentation degraded, content omitted. Retry the same section and cursor; no mutation occurred.",v.pool.pool_id,v.pool.revision),
         Ok(Reply::List{..})=>"READ COMPLETED; presentation degraded, content omitted. Retry the same list cursor.".into(),
+        Err(Fault::RelaunchRequired)=>"ERROR relaunch_required; relaunch the Pool resident after Bridge managed mode is enabled. Preserve the original request_key for recovery.".into(),
         Err(code)=>format!("ERROR {code}; presentation degraded. No success confirmed; preserve the original request_key for reconciliation."),
     });
     result(text, error)
@@ -353,5 +366,37 @@ mod tests {
             serde_json::to_string(&present(Ok(Reply::Receipt(Box::new(r))), &broken)).unwrap();
         assert!(fallback.contains("COMMITTED pool pool-id revision=9 event=7"));
         assert!(fallback.contains("do not create a new request_key"));
+    }
+
+    #[test]
+    fn pending_keeps_exact_replay_key_even_when_rendering_fails() {
+        let broken = Templates::new(&[("pool_pending", "{{ missing }}")]).unwrap();
+        let result = present(
+            Ok(Reply::Pending {
+                pool_id: "pool-1".into(),
+                request_key: "request-1".into(),
+            }),
+            &broken,
+        );
+        let value = serde_json::to_string(&result).unwrap();
+        assert!(value.contains("PENDING pool pool-1 request request-1"));
+        assert_eq!(result.is_error, Some(false));
+    }
+
+    #[test]
+    fn relaunch_required_reports_recovery_even_when_rendering_fails() {
+        let normal = Templates::new(&templates()).unwrap();
+        let broken = Templates::new(&[("pool_error", "{{ missing }}")]).unwrap();
+        for templates in [&normal, &broken] {
+            let result = present(Err(Fault::RelaunchRequired), templates);
+            let value = serde_json::to_string(&result).unwrap();
+            assert!(value.contains("relaunch_required"));
+            assert!(
+                value.contains("Relaunch the Pool resident")
+                    || value.contains("relaunch the Pool resident")
+            );
+            assert!(value.contains("original request_key"));
+            assert_eq!(result.is_error, Some(true));
+        }
     }
 }

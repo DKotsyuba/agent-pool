@@ -16,11 +16,11 @@ clap = { version = "4.5", features = ["derive"] }
 minijinja = { version = "=2.24.0", default-features = false, features = ["serde", "fuel"] }
 rmcp = { version = "=3.4.0", default-features = false, features = ["server", "transport-io"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "=1.0.154", features = ["float_roundtrip"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "net", "sync", "signal", "time", "process"] }
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
 uuid = { version = "=1.26.1", features = ["v4"] }
-bridge-sdk = { git = "https://github.com/DKotsyuba/agent-bridge.git", rev = "ae32d1c3c012cc1e40c6d60c9adcad7005298688" }
+bridge-sdk = { path = "/home/pluto/projects/tmp/codex-agent-codex/agent-mcp/bridge/sdk-snapshots/38b4f655a0711b59/crates/bridge-sdk" }
 sha2 = "0.10"
 fs2 = "0.4"
 toml = "0.8"

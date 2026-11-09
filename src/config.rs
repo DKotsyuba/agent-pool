@@ -31,6 +31,10 @@ pub struct Config {
     pub bridge_producer_id: String,
     /// Exact configured audience required on every consumed assertion.
     pub bridge_audience: String,
+    /// Absolute canonical Bridge managed server executable, explicitly pinned by the operator.
+    pub bridge_server_executable: PathBuf,
+    /// Lowercase SHA-256 of that exact Bridge managed server build.
+    pub bridge_server_sha256: String,
     /// Optional separately authorized Bridge host-observation endpoint.
     pub bridge_observer_socket: Option<PathBuf>,
     /// Optional owner-only credential carrying the separate observation grant.
@@ -41,6 +45,57 @@ pub struct Config {
     pub run_socket: Option<PathBuf>,
     /// Optional trusted Linux Run server UID; absent keeps the same-user private socket policy.
     pub run_peer_uid: Option<u32>,
+    /// Optional separately provisioned Run reader for managed outcome and namespace operations.
+    pub managed_run_reader: Option<ManagedRunReader>,
+    /// Optional separately provisioned private Run attempt transport; absence disables it.
+    pub managed_run_transport: Option<ManagedRunTransport>,
+}
+/// Exact same-UID Run reader build and Bridge namespace grant for private P1 reads.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedRunReader {
+    /// Absolute executable path; its loaded inode and hash are checked for every request.
+    pub executable: PathBuf,
+    /// Lowercase SHA-256 of the provisioned reader executable.
+    pub sha256: String,
+    /// Bridge store UUID whose namespaces this reader may seal.
+    pub bridge_store_id: String,
+    /// Exact configured Bridge route ID.
+    pub bridge_route_id: String,
+    /// Exact configured Bridge producer name.
+    pub producer: String,
+    /// Exact Run store identity whose admission outcomes this reader may query.
+    pub run_store_id: String,
+    /// Exact configured Run route identity.
+    pub run_route_id: String,
+}
+/// Pinned same-UID Run attempt endpoint and cross-service route identities.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedRunTransport {
+    /// Explicitly select the managed stdio frontend; absent keeps legacy routing.
+    #[serde(default)]
+    pub frontend_enabled: bool,
+    /// Exact MCP server name registered in Bridge's managed tool mapping.
+    pub mcp_server: Option<String>,
+    /// Absolute Run `attempt.sock`, distinct from the legacy Run socket.
+    pub socket: PathBuf,
+    /// Absolute canonical Run broker executable.
+    pub executable: PathBuf,
+    /// Lowercase SHA-256 of that broker build.
+    pub sha256: String,
+    /// Durable Run store ID.
+    pub run_store_id: String,
+    /// Original Run route ID.
+    pub run_route_id: String,
+    /// Pool route ID provisioned in Run.
+    pub pool_route_id: String,
+    /// Durable Bridge store UUID.
+    pub bridge_store_id: String,
+    /// Original Bridge route ID.
+    pub bridge_route_id: String,
+    /// Bridge producer identity pinned on both sides.
+    pub producer: String,
 }
 impl Config {
     /// Reads a bounded TOML file and rejects relative paths, unknown keys and incomplete grants.
@@ -55,6 +110,7 @@ impl Config {
             &config.bridge_registration_socket,
             &config.bridge_core_socket,
             &config.bridge_credential_file,
+            &config.bridge_server_executable,
         ]
         .into_iter()
         .chain(config.bridge_observer_socket.iter())
@@ -76,11 +132,96 @@ impl Config {
             || config.bridge_audience.len() > 256
             || config.bridge_producer_id.chars().any(char::is_control)
             || config.bridge_audience.chars().any(char::is_control)
+            || config.bridge_server_sha256.len() != 64
+            || !config
+                .bridge_server_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             || config.bridge_observer_socket.is_some()
                 != config.bridge_observer_credential_file.is_some()
             || config.run_peer_uid.is_some() && config.run_socket.is_none()
             || config.run_peer_uid.is_some() && !cfg!(target_os = "linux")
             || config.run_peer_uid == Some(u32::MAX)
+        {
+            return Err(Fault::Invalid);
+        }
+        if let Some(reader) = &config.managed_run_reader {
+            let valid_string = |value: &str| {
+                !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+            };
+            if !cfg!(target_os = "linux")
+                || !reader.executable.is_absolute()
+                || reader
+                    .executable
+                    .components()
+                    .any(|part| matches!(part, std::path::Component::ParentDir))
+                || reader.sha256.len() != 64
+                || !reader
+                    .sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                || !uuid::Uuid::parse_str(&reader.bridge_store_id)
+                    .is_ok_and(|id| id.to_string() == reader.bridge_store_id)
+                || !valid_string(&reader.bridge_route_id)
+                || !valid_string(&reader.producer)
+                || crate::domain::store_id(&reader.run_store_id).is_err()
+                || !valid_string(&reader.run_route_id)
+            {
+                return Err(Fault::Invalid);
+            }
+        }
+        if let Some(transport) = &config.managed_run_transport {
+            if transport.frontend_enabled
+                && (config.managed_run_reader.is_none()
+                    || transport.mcp_server.as_ref().is_none_or(|server| {
+                        server.is_empty()
+                            || server.len() > 128
+                            || !server
+                                .bytes()
+                                .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+                    }))
+            {
+                return Err(Fault::Invalid);
+            }
+            let valid_string = |value: &str| {
+                !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+            };
+            let valid_path = |path: &Path| {
+                path.is_absolute()
+                    && !path
+                        .components()
+                        .any(|part| matches!(part, std::path::Component::ParentDir))
+            };
+            if !cfg!(target_os = "linux")
+                || !valid_path(&transport.socket)
+                || transport
+                    .socket
+                    .file_name()
+                    .is_none_or(|name| name != "attempt.sock")
+                || !valid_path(&transport.executable)
+                || transport.sha256.len() != 64
+                || !transport
+                    .sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                || crate::domain::store_id(&transport.run_store_id).is_err()
+                || !uuid::Uuid::parse_str(&transport.bridge_store_id)
+                    .is_ok_and(|id| id.to_string() == transport.bridge_store_id)
+                || !valid_string(&transport.run_route_id)
+                || !valid_string(&transport.pool_route_id)
+                || !valid_string(&transport.bridge_route_id)
+                || transport.producer != config.bridge_producer_id
+            {
+                return Err(Fault::Invalid);
+            }
+        }
+        if let (Some(reader), Some(transport)) =
+            (&config.managed_run_reader, &config.managed_run_transport)
+            && (reader.run_store_id != transport.run_store_id
+                || reader.run_route_id != transport.run_route_id
+                || reader.bridge_store_id != transport.bridge_store_id
+                || reader.bridge_route_id != transport.bridge_route_id
+                || reader.producer != transport.producer)
         {
             return Err(Fault::Invalid);
         }
@@ -300,9 +441,20 @@ bridge_core_socket = "/core.sock"
 bridge_credential_file = "/token"
 bridge_producer_id = "fixture"
 bridge_audience = "fixture"
+bridge_server_executable = "/fixture/bridge"
+bridge_server_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 "#;
         fs::write(&path, base)?;
         assert!(Config::load(&path)?.run_peer_uid.is_none());
+        fs::write(
+            &path,
+            base.replace("bridge_server_executable = \"/fixture/bridge\"\n", ""),
+        )?;
+        assert!(matches!(Config::load(&path), Err(Fault::Invalid)));
+        fs::write(&path, base.replace("/fixture/bridge", "relative-bridge"))?;
+        assert!(matches!(Config::load(&path), Err(Fault::Invalid)));
+        fs::write(&path, base.replace(&"0".repeat(64), &"A".repeat(64)))?;
+        assert!(matches!(Config::load(&path), Err(Fault::Invalid)));
         fs::write(&path, format!("{base}\nrun_peer_uid = 1000\n"))?;
         assert!(matches!(Config::load(&path), Err(Fault::Invalid)));
         fs::write(
@@ -319,6 +471,64 @@ bridge_audience = "fixture"
         } else {
             assert!(matches!(Config::load(&path), Err(Fault::Invalid)));
         }
+        let managed = r#"
+[managed_run_transport]
+socket = "/run/attempt.sock"
+executable = "/fixture/run"
+sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+run_store_id = "store_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+run_route_id = "run-route"
+pool_route_id = "pool-route"
+bridge_store_id = "00000000-0000-4000-8000-000000000001"
+bridge_route_id = "bridge-route"
+producer = "fixture"
+"#;
+        fs::write(&path, format!("{base}\n{managed}"))?;
+        if cfg!(target_os = "linux") {
+            assert!(Config::load(&path)?.managed_run_transport.is_some());
+        } else {
+            assert!(matches!(Config::load(&path), Err(Fault::Invalid)));
+        }
+        let enabled = managed.replace(
+            "[managed_run_transport]",
+            "[managed_run_transport]\nfrontend_enabled = true\nmcp_server = \"pool\"",
+        );
+        fs::write(&path, format!("{base}\n{enabled}"))?;
+        assert!(matches!(Config::load(&path), Err(Fault::Invalid)));
+        let reader = r#"
+[managed_run_reader]
+executable = "/fixture/run"
+sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+run_store_id = "store_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+run_route_id = "run-route"
+bridge_store_id = "00000000-0000-4000-8000-000000000001"
+bridge_route_id = "bridge-route"
+producer = "fixture"
+"#;
+        fs::write(&path, format!("{base}\n{enabled}\n{reader}"))?;
+        if cfg!(target_os = "linux") {
+            assert!(
+                Config::load(&path)?
+                    .managed_run_transport
+                    .is_some_and(|value| value.frontend_enabled)
+            );
+        }
+        fs::write(
+            &path,
+            format!(
+                "{base}\n{}",
+                managed.replace("/run/attempt.sock", "/run/legacy.sock")
+            ),
+        )?;
+        assert!(matches!(Config::load(&path), Err(Fault::Invalid)));
+        fs::write(
+            &path,
+            format!(
+                "{base}\n{}",
+                managed.replace("producer = \"fixture\"", "producer = \"other\"")
+            ),
+        )?;
+        assert!(matches!(Config::load(&path), Err(Fault::Invalid)));
         Ok(())
     }
 
