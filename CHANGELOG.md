@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.1.0
+
+First release, 2026-11-10. Attempt-bound managed ingress and egress with
+operator re-pin, E11 namespace retirement, formal Pool completion, and P3
+managed enrollment and conditioned replacement, paired with Agent Bridge v0.7.0.
+
 ### Added
 
 - P3 managed enrollment (schema v15): with the explicit
