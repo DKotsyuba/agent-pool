@@ -104,6 +104,41 @@ pub(crate) fn republish(db: &mut Connection, effect_id: &str) -> Result<Option<S
     Ok(fresh)
 }
 
+/// At most one successor per original: a liveness-aborted effect that is itself
+/// a successor is republished again only when the member's binding generation
+/// has moved past the generation it was frozen for (a rebind or new launch
+/// legitimately allows one new attempt for the new generation).
+fn republish_allowed(tx: &Connection, effect_id: &str) -> Result<bool, Fault> {
+    let successor: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM managed_delivery_liveness WHERE republished_as=?1)",
+        [effect_id],
+        |row| row.get(0),
+    )?;
+    if !successor {
+        return Ok(true);
+    }
+    let intent: String = tx.query_row(
+        "SELECT intent FROM managed_delivery_outbox WHERE effect_id=?1",
+        [effect_id],
+        |row| row.get(0),
+    )?;
+    let frozen_generation = decode::<OutboxIntentV1>(&intent)?
+        .target_binding
+        .binding_generation;
+    let current: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT b.generation FROM managed_bindings b JOIN managed_delivery_seeds s ON s.member_id=b.member AND s.pool_id=b.pool WHERE s.effect_id=?1",
+            [effect_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(current) = current else {
+        return Ok(false);
+    };
+    let bytes: [u8; 8] = current.as_slice().try_into().map_err(|_| Fault::Internal)?;
+    Ok(u64::from_be_bytes(bytes) > frozen_generation)
+}
+
 /// The successor insert itself, inside the caller's transaction. `record_result`
 /// calls it in the same transaction that records the durable `aborted`, so a
 /// crash or a capacity refusal can never leave an aborted original without its
@@ -127,6 +162,16 @@ fn republish_in(tx: &Connection, effect_id: &str) -> Result<Option<String>, Faul
     }
     if state(tx, effect_id)? != Some(State::Aborted) {
         return Err(Fault::Stale);
+    }
+    if !republish_allowed(tx, effect_id)? {
+        // A successor that is itself liveness-aborted in the same binding
+        // generation is a deterministic refusal, not a transient stall: keep
+        // the event visibly not delivered instead of looping.
+        tx.execute(
+            "UPDATE managed_delivery_outbox SET attention='delivery_refused_outcome_unknown' WHERE effect_id=?1",
+            [effect_id],
+        )?;
+        return Ok(None);
     }
     let seed = seed(tx, effect_id)?;
     let scope_state: String = tx.query_row(
@@ -523,6 +568,8 @@ pub(crate) fn owner_attention(
                 | "invalid_request"
                 | "capacity"
                 | "conflict"
+                | "delivery_refused_attempt_mismatch"
+                | "delivery_refused_outcome_unknown"
         )
     }) {
         return Err(Fault::Internal);
@@ -1141,6 +1188,7 @@ pub(crate) fn record_result(
                         | "conflict"
                         | "attempt_not_ready"
                         | "qualification_pending"
+                        | "attempt_mismatch"
                 )
         }
         (ManagedOwnerStateV1::Unknown, None, None, Some("native_uncertain" | "channel_failed")) => {
@@ -1190,6 +1238,17 @@ pub(crate) fn record_result(
         }
         ManagedOwnerStateV1::KnownUnsent if current == State::Unknown => {
             ("unknown", "unknown", Some("outcome_unknown"))
+        }
+        // Deterministic refusal: Run pinned to another Bridge build answers the
+        // same way for this generation, so it is terminal and never retried.
+        ManagedOwnerStateV1::KnownUnsent
+            if result.reason.as_deref() == Some("attempt_mismatch") =>
+        {
+            (
+                "not_delivered",
+                "cancelled",
+                Some("delivery_refused_attempt_mismatch"),
+            )
         }
         ManagedOwnerStateV1::KnownUnsent => ("known_unsent", "custody", result.reason.as_deref()),
     };
@@ -1629,6 +1688,41 @@ pub(crate) mod tests {
             .unwrap();
         store
             .egress_freeze(&target, &authority, &run_pin, bridge, "pool")
+            .unwrap()
+    }
+    /// Freeze on the member's CURRENT attempt, so the binding generation is unchanged.
+    pub(crate) fn freeze_current(
+        store: &mut Store,
+        binding: &ManagedBinding,
+        incarnation: &Incarnation,
+        id: &str,
+    ) -> Frozen {
+        let prefix = format!("pool/{}/", binding.pool_store_id);
+        let target = store.egress_target(id, &prefix).unwrap();
+        let run_pin = pin(&target.binding);
+        let (request_id, run_pin, _) = store.egress_probe(&target, &run_pin).unwrap();
+        let query = store
+            .egress_stage(id, &run_pin, &target.binding.attempt, &request_id, "rpc")
+            .unwrap();
+        store.egress_probe_inflight(id, &request_id, true).unwrap();
+        let mut current = receipt(
+            &target.binding,
+            incarnation,
+            &target.binding.attempt.execution_id,
+            target.binding.attempt.sequence,
+            &format!("receipt-{id}"),
+        );
+        current.attempt = target.binding.attempt.clone();
+        current.successor_proof.chain.remove(0);
+        let authority = query.fixture_authority(current).unwrap();
+        store
+            .egress_freeze(
+                &target,
+                &authority,
+                &run_pin,
+                &fake_bridge_pin(binding),
+                "pool",
+            )
             .unwrap()
     }
     pub(crate) fn result(
@@ -2421,6 +2515,167 @@ pub(crate) mod tests {
                 )
                 .unwrap(),
             1
+        );
+    }
+    /// Count (effects, seeds with the event of `effect_id`) to prove no loop.
+    fn effects_for_event(store: &mut Store, effect_id: &str) -> i64 {
+        store.test_db().query_row(
+            "SELECT count(*) FROM managed_delivery_seeds WHERE event_key=(SELECT event_key FROM managed_delivery_seeds WHERE effect_id=?1)",
+            [effect_id],
+            |row| row.get(0),
+        ).unwrap()
+    }
+    fn successor_of(store: &mut Store, effect_id: &str) -> Option<String> {
+        store
+            .test_db()
+            .query_row(
+                "SELECT republished_as FROM managed_delivery_liveness WHERE effect_id=?1",
+                [effect_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+    /// Publish, lose the outcome, liveness-abort and record the durable `aborted`.
+    fn liveness_abort(store: &mut Store, frozen: &Frozen) {
+        let id = frozen.seed.effect_id.clone();
+        begin_publish(store.test_db(), &id).unwrap();
+        attention(store.test_db(), &id, "outcome_unknown").unwrap();
+        begin_liveness_abort(store.test_db(), &id).unwrap();
+        let aborted = result(frozen, ManagedOwnerStateV1::Aborted, None);
+        assert_eq!(
+            record_result(store.test_db(), &id, None, &aborted, true).unwrap(),
+            State::Aborted
+        );
+    }
+
+    #[test]
+    fn e12_successor_liveness_aborted_again_is_not_republished() {
+        let (_directory, mut store, binding, incarnation, _run) = fixture();
+        index_managed_member(store.test_db(), &binding);
+        add_seed(&mut store, &binding, "orig", "hello", false);
+        let first = freeze_next(&mut store, &binding, &incarnation, "orig", "next", 2);
+        liveness_abort(&mut store, &first);
+        let successor = successor_of(&mut store, "orig").unwrap();
+        assert_eq!(effects_for_event(&mut store, "orig"), 2);
+        // Same generation: the successor is frozen on the same attempt.
+        let second = freeze_current(&mut store, &binding, &incarnation, &successor);
+        assert_eq!(second.intent.target_binding.binding_generation, 2);
+        liveness_abort(&mut store, &second);
+        assert_eq!(successor_of(&mut store, &successor), None);
+        assert_eq!(
+            effects_for_event(&mut store, "orig"),
+            2,
+            "exactly two effects: the original and its one successor"
+        );
+        assert_eq!(
+            owner_attention(store.test_db(), &successor)
+                .unwrap()
+                .0
+                .as_deref(),
+            Some("delivery_refused_outcome_unknown")
+        );
+        assert_eq!(
+            state(store.test_db(), &successor).unwrap(),
+            Some(State::Aborted)
+        );
+        let live: i64 = store.test_db().query_row(
+            "SELECT count(*) FROM managed_delivery_outbox WHERE state NOT IN ('aborted','accepted','not_delivered')",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(live, 0, "nothing left to republish");
+        // A replayed republish is idempotent and still refuses.
+        assert_eq!(republish(store.test_db(), &successor).unwrap(), None);
+        assert_eq!(effects_for_event(&mut store, "orig"), 2);
+    }
+
+    #[test]
+    fn e12_successor_aborted_after_a_new_generation_gets_one_more_attempt() {
+        let (_directory, mut store, binding, incarnation, _run) = fixture();
+        index_managed_member(store.test_db(), &binding);
+        add_seed(&mut store, &binding, "orig", "hello", false);
+        let first = freeze_next(&mut store, &binding, &incarnation, "orig", "next", 2);
+        liveness_abort(&mut store, &first);
+        let successor = successor_of(&mut store, "orig").unwrap();
+        let second = freeze_current(&mut store, &binding, &incarnation, &successor);
+        // A new launch rebinds the member to generation 3 before the abort lands.
+        add_seed(&mut store, &binding, "later", "newer", false);
+        let later = freeze_next(&mut store, &binding, &incarnation, "later", "next-2", 3);
+        assert_eq!(later.intent.target_binding.binding_generation, 3);
+        liveness_abort(&mut store, &second);
+        let third = successor_of(&mut store, &successor).unwrap();
+        assert_ne!(third, successor);
+        assert_eq!(effects_for_event(&mut store, "orig"), 3);
+        // Frozen for generation 3 and aborted again: bounded, no further attempt.
+        let fourth = freeze_current(&mut store, &binding, &incarnation, &third);
+        assert_eq!(fourth.intent.target_binding.binding_generation, 3);
+        liveness_abort(&mut store, &fourth);
+        assert_eq!(successor_of(&mut store, &third), None);
+        assert_eq!(effects_for_event(&mut store, "orig"), 3);
+        assert_eq!(
+            owner_attention(store.test_db(), &third)
+                .unwrap()
+                .0
+                .as_deref(),
+            Some("delivery_refused_outcome_unknown")
+        );
+    }
+
+    #[test]
+    fn attempt_mismatch_is_terminal_for_its_generation_and_a_rebind_delivers_new_events() {
+        let (_directory, mut store, binding, incarnation, _run) = fixture();
+        index_managed_member(store.test_db(), &binding);
+        add_seed(&mut store, &binding, "stale", "hello", false);
+        let frozen = freeze_next(&mut store, &binding, &incarnation, "stale", "next", 2);
+        let (_, dispatch) = begin_publish(store.test_db(), "stale").unwrap();
+        let mismatch = result(
+            &frozen,
+            ManagedOwnerStateV1::KnownUnsent,
+            Some("attempt_mismatch"),
+        );
+        assert_eq!(
+            record_result(store.test_db(), "stale", Some(&dispatch), &mismatch, false).unwrap(),
+            State::NotDelivered
+        );
+        assert_eq!(
+            owner_attention(store.test_db(), "stale")
+                .unwrap()
+                .0
+                .as_deref(),
+            Some("delivery_refused_attempt_mismatch")
+        );
+        // Neither a resend of the same key nor an E12 successor is possible.
+        assert_eq!(
+            begin_publish(store.test_db(), "stale").err(),
+            Some(Fault::Stale)
+        );
+        assert_eq!(republish(store.test_db(), "stale").unwrap(), None);
+        assert_eq!(effects_for_event(&mut store, "stale"), 1);
+        let cancelled: String = store
+            .test_db()
+            .query_row("SELECT state FROM effects WHERE id='stale'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(cancelled, "cancelled");
+        // A rebind to a new generation delivers a new event normally, once.
+        add_seed(&mut store, &binding, "fresh", "newer", false);
+        let fresh = freeze_next(&mut store, &binding, &incarnation, "fresh", "next-2", 3);
+        assert_eq!(fresh.intent.target_binding.binding_generation, 3);
+        let (_, sent) = begin_publish(store.test_db(), "fresh").unwrap();
+        let accepted = result(&fresh, ManagedOwnerStateV1::Accepted, None);
+        assert_eq!(
+            record_result(store.test_db(), "fresh", Some(&sent), &accepted, false).unwrap(),
+            State::Accepted
+        );
+        assert_eq!(
+            begin_publish(store.test_db(), "fresh").err(),
+            Some(Fault::Stale)
+        );
+        assert_eq!(effects_for_event(&mut store, "fresh"), 1);
+        assert_eq!(
+            state(store.test_db(), "stale").unwrap(),
+            Some(State::NotDelivered)
         );
     }
 }

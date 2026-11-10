@@ -794,6 +794,17 @@ The `aborted` result and the successor (with its `managed_delivery_liveness`
 link, schema v15) commit in one transaction: a crash cannot separate them, and
 a successor refused for outbox capacity rolls the result back, keeping the
 original fenced `abort_pending` until a later same-key abort succeeds.
+The republish is bounded: only an original (or a successor frozen for a newer
+binding generation than the one just aborted) is republished after a liveness
+abort. A successor that is liveness-aborted again in the same binding
+generation is not republished: its event stays not delivered with owner
+attention `delivery_refused_outcome_unknown`, so there are at most two effects
+for the event until a rebind or new launch advances the generation (which
+allows one new attempt for that generation). A `known_unsent` result with
+reason `attempt_mismatch` (Run pinned to another Bridge build) is terminal for
+that generation: the effect becomes `not_delivered` with attention
+`delivery_refused_attempt_mismatch`, is never resent or republished, and later
+events deliver normally once a rebind produces a new generation.
 Removal or replacement before freezing makes an ordinary seed not delivered.
 A final notice is the exception: it may be frozen for the exact removed
 membership's previously bound lineage, with a fresh Run receipt and a same-lineage

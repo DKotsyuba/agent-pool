@@ -35,6 +35,10 @@
 - Erratum E12 egress liveness: an unknown managed publish whose exact lookups
   stay non-decisive is aborted for the exact original effect after bounded
   backoff; only a durable `aborted` creates one new effect for the same event.
+  A successor aborted again in the same binding generation is not republished
+  (`delivery_refused_outcome_unknown`), and `known_unsent` `attempt_mismatch` is
+  terminal `not_delivered` (`delivery_refused_attempt_mismatch`) for its
+  generation, so a Run pinned to an older Bridge build cannot cause a loop.
 - Mutations refused because a pool is formally completed keep the `closed`
   code but no longer claim the pool was explicitly closed.
 - `bind_run` never overwrites a terminal (`refused`, `cancelled`,
