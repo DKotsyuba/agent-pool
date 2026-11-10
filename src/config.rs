@@ -101,6 +101,12 @@ pub struct ManagedRunTransport {
     pub bridge_route_id: String,
     /// Bridge producer identity pinned on both sides.
     pub producer: String,
+    /// Explicitly route owner start, batch and replacement through P3 managed
+    /// enrollment; omission keeps the switch off and new enrollment closed.
+    #[serde(default)]
+    pub enrollment_enabled: bool,
+    /// Exact Run managed role selected for every P3 enrollment job.
+    pub managed_role: Option<String>,
 }
 impl Config {
     /// Reads a bounded TOML file and rejects relative paths, unknown keys and incomplete grants.
@@ -201,6 +207,18 @@ impl Config {
                                 .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
                     }))
             {
+                return Err(Fault::Invalid);
+            }
+            if transport.enrollment_enabled
+                && (!transport.frontend_enabled
+                    || transport
+                        .managed_role
+                        .as_deref()
+                        .is_none_or(|role| crate::domain::identifier(role).is_err()))
+            {
+                return Err(Fault::Invalid);
+            }
+            if !transport.enrollment_enabled && transport.managed_role.is_some() {
                 return Err(Fault::Invalid);
             }
             let valid_string = |value: &str| {
@@ -555,6 +573,33 @@ producer = "fixture"
                     .managed_run_transport
                     .is_some_and(|value| value.frontend_enabled)
             );
+        }
+        // P3 enrollment fails closed: it needs the managed frontend and an exact
+        // role, and a role without the explicit switch is refused.
+        let enrolled = enabled.replace(
+            "frontend_enabled = true",
+            "frontend_enabled = true\nenrollment_enabled = true\nmanaged_role = \"managed\"",
+        );
+        fs::write(&path, format!("{base}\n{enrolled}\n{reader}"))?;
+        if cfg!(target_os = "linux") {
+            assert!(
+                Config::load(&path)?
+                    .managed_run_transport
+                    .is_some_and(|value| value.enrollment_enabled
+                        && value.managed_role.as_deref() == Some("managed"))
+            );
+        }
+        for refused in [
+            enrolled.replace("\nmanaged_role = \"managed\"", ""),
+            enrolled.replace("managed_role = \"managed\"", "managed_role = \"bad role\""),
+            enrolled.replace("frontend_enabled = true\n", ""),
+            enabled.replace(
+                "frontend_enabled = true",
+                "frontend_enabled = true\nmanaged_role = \"managed\"",
+            ),
+        ] {
+            fs::write(&path, format!("{base}\n{refused}\n{reader}"))?;
+            assert!(matches!(Config::load(&path), Err(Fault::Invalid)));
         }
         fs::write(
             &path,

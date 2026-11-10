@@ -10,6 +10,8 @@ mod completion_saga;
 mod completion_tests;
 mod config;
 mod domain;
+#[cfg(test)]
+mod enrollment_tests;
 mod integrations;
 #[allow(
     dead_code,
@@ -22,6 +24,7 @@ mod managed_bridge;
 )]
 mod managed_codec;
 mod managed_egress;
+mod managed_enrollment;
 mod managed_ingress;
 #[allow(
     dead_code,

@@ -93,13 +93,13 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "pool_start_agent",
-            "Owner reserves a pending member and requests one Run agent with retained history. Run must support read-only batch receipt lookup. Managed binding remains unavailable until attempt-bound identity is proven; lost responses never authorize a replacement agent.",
+            "Owner reserves a pending member and requests one Run agent with retained history. With P3 enrollment enabled, spec.profile must equal the configured managed role; the receipt's created_id is the enrollment ID (read it with pool_enrollment_get). The member joins only after a qualified Run attestation and its own verified pool_join; lost responses never authorize a new start.",
             mutation(start.clone(), &["name", "role", "task", "spec"]),
             false,
         ),
         tool(
             "pool_start_batch",
-            "Reserve an ordered group and request atomic Run admission with durable history pins. The receipt confirms the Pool intent only. Managed binding remains unavailable until attempt-bound identity is proven; unresolved admission blocks roster changes and closure.",
+            "Reserve an ordered group of 1-20 and request atomic Run admission with durable history pins. The receipt confirms the Pool intent only; with P3 enrollment enabled its created_id is the enrollment ID and qualification/join progress per member. Each member activates only through its own verified pool_join.",
             mutation(
                 json!({"members":{"type":"array","minItems":1,"maxItems":20,"items":object(start, &["name","role","task","spec"])}}),
                 &["members"],
@@ -108,7 +108,7 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "pool_replace",
-            "Request replacement of a Run-managed member after its latest lineage is terminal and fully cleaned. The old roster remains until an exact conditioned Run receipt commits; an unknown outcome keeps it frozen. Omit spec to reuse the original start.",
+            "Request replacement of a Run-managed member after its latest lineage is terminal and fully cleaned. A new lineage and new member ID are admitted on that exact precondition; the old member stays current until the qualified candidate is switched in one transaction. An unknown outcome keeps the roster frozen. Omit spec to reuse the original start.",
             mutation(
                 json!({"member_id":string(128),"spec":{"type":["object","null"],"description":"Optional ordinary Run start specification, at most 64 KiB."}}),
                 &["member_id"],
@@ -137,6 +137,30 @@ pub fn definitions() -> Vec<Value> {
             "pool_release_history",
             "After closing a pool, record an explicit intent to release one member's retained Run history. Release is not executed until Run can prove its persistent store identity; once executed it permits pruning and cannot be undone.",
             mutation(json!({"member_id":string(128)}), &["member_id"]),
+            false,
+        ),
+        tool(
+            "pool_enrollment_get",
+            "Owner reads one managed enrollment: per-member admission, qualification, binding, join state and recovery reason. Read-only; never starts or retries.",
+            object(
+                json!({"pool_id":string(128),"enrollment_id":string(128)}),
+                &["pool_id", "enrollment_id"],
+            ),
+            true,
+        ),
+        tool(
+            "pool_enrollment_resolve",
+            "Owner closes a definitively admitted but unbound enrollment as retain_unassigned. Keeps the Run roots and pins, cancels no process, fences the pending memberships and restores the old member's slot for a failed replacement.",
+            object(
+                json!({"pool_id":string(128),"enrollment_id":string(128),"expected_enrollment_revision":{"type":"integer","minimum":1},"request_key":string(128),"disposition":{"type":"string","enum":["retain_unassigned"]}}),
+                &[
+                    "pool_id",
+                    "enrollment_id",
+                    "expected_enrollment_revision",
+                    "request_key",
+                    "disposition",
+                ],
+            ),
             false,
         ),
         tool(
@@ -202,11 +226,18 @@ pub fn templates() -> Vec<(&'static str, &'static str)> {
         ),
         ("pool_list", include_str!("../templates/pool_list.j2")),
         ("pool_private", include_str!("../templates/pool_private.j2")),
+        (
+            "pool_enrollment",
+            include_str!("../templates/pool_enrollment.j2"),
+        ),
     ]
 }
-/// Keeps managed Run tools release-blocking until attempt-bound identity proof is implemented.
+/// Release-blocking unimplemented tools. P3 single start, batch and
+/// replacement were removed individually after their named end-to-end rows
+/// (p3_single_enrollment, p3_batch_enrollment, p3_replace_end_to_end) passed;
+/// installed-provider qualification remains a separate release gate.
 pub fn incomplete() -> Vec<&'static str> {
-    vec!["pool_start_agent", "pool_start_batch", "pool_replace"]
+    Vec::new()
 }
 /// Handles credential-free identity only; Pool commands route through the authenticated resident.
 pub async fn call(
@@ -273,6 +304,7 @@ pub fn present(reply: Result<Reply, Fault>, templates: &Templates) -> CallToolRe
         Ok(Reply::Receipt(r))=>templates.render("pool_receipt",r),
         Ok(Reply::Pending{pool_id,request_key})=>templates.render("pool_pending",&PendingView{pool_id,request_key}),
         Ok(Reply::List{pools,next_after,has_more})=>templates.render("pool_list",&ListView{pools,next_after,has_more:*has_more}),
+        Ok(Reply::Enrollment(view))=>templates.render("pool_enrollment",view),
         Err(code)=>templates.render("pool_error",&ErrorView{code:*code,recovery:match code{
             Fault::Stale=>"Read pool_get for current revision and proposal/roster identity before a new intent.",
             Fault::Unavailable=>"A previous write may have committed. Inspect pool_get or repeat only the identical request_key and intent.",
@@ -290,6 +322,7 @@ pub fn present(reply: Result<Reply, Fault>, templates: &Templates) -> CallToolRe
         Ok(Reply::Pending{pool_id,request_key})=>format!("PENDING pool {pool_id} request {request_key}; presentation degraded. Retry the identical key with fresh proof."),
         Ok(Reply::View(v))|Ok(Reply::OwnerView{view:v,..})=>format!("READ COMPLETED pool {} revision={}; presentation degraded, content omitted. Retry the same section and cursor; no mutation occurred.",v.pool.pool_id,v.pool.revision),
         Ok(Reply::List{..})=>"READ COMPLETED; presentation degraded, content omitted. Retry the same list cursor.".into(),
+        Ok(Reply::Enrollment(view))=>format!("READ COMPLETED enrollment {} state={} revision={}; presentation degraded. Retry the same read; no Run call or retry was made.",view.enrollment_id,view.state,view.revision),
         Err(Fault::RelaunchRequired)=>"ERROR relaunch_required; relaunch the Pool resident after Bridge managed mode is enabled. Preserve the original request_key for recovery.".into(),
         Err(code)=>format!("ERROR {code}; presentation degraded. No success confirmed; preserve the original request_key for reconciliation."),
     });
@@ -311,11 +344,8 @@ mod tests {
     #[test]
     fn tool_catalog_is_closed() {
         let defs = definitions();
-        assert_eq!(defs.len(), 20);
-        assert_eq!(
-            incomplete(),
-            ["pool_start_agent", "pool_start_batch", "pool_replace"]
-        );
+        assert_eq!(defs.len(), 22);
+        assert!(incomplete().is_empty());
         for d in defs {
             assert_eq!(d["inputSchema"]["additionalProperties"], false);
             assert_eq!(d["inputSchema"]["type"], "object");
@@ -366,6 +396,45 @@ mod tests {
             serde_json::to_string(&present(Ok(Reply::Receipt(Box::new(r))), &broken)).unwrap();
         assert!(fallback.contains("COMMITTED pool pool-id revision=9 event=7"));
         assert!(fallback.contains("do not create a new request_key"));
+    }
+
+    /// The owner enrollment projection renders per-job facts and degrades safely.
+    #[test]
+    fn enrollment_view_renders_and_degrades() {
+        use crate::domain::{EnrollmentJobView, EnrollmentView};
+        let view = EnrollmentView {
+            pool_id: "pool".into(),
+            enrollment_id: "enrollment".into(),
+            mode: "start".into(),
+            revision: 3,
+            state: "admitted".into(),
+            attention: None,
+            replaces: None,
+            jobs: vec![EnrollmentJobView {
+                index: 0,
+                member_id: "member".into(),
+                state: "bound_pending_join".into(),
+                lineage_root_id: Some("ag-root".into()),
+                pin_id: Some("pin".into()),
+                binding_generation: Some(1),
+                attention: Some("qualification_pending".into()),
+            }],
+        };
+        let t = Templates::new(&templates()).unwrap();
+        let text =
+            serde_json::to_string(&present(Ok(Reply::Enrollment(Box::new(view.clone()))), &t))
+                .unwrap();
+        assert!(
+            text.contains("ENROLLMENT enrollment pool pool mode=start state=admitted revision=3")
+        );
+        assert!(text.contains("member=member state=bound_pending_join root=ag-root pin=pin generation=1 attention=qualification_pending"));
+        let broken = Templates::new(&[("pool_enrollment", "{{ missing }}")]).unwrap();
+        let degraded =
+            serde_json::to_string(&present(Ok(Reply::Enrollment(Box::new(view))), &broken))
+                .unwrap();
+        assert!(
+            degraded.contains("READ COMPLETED enrollment enrollment state=admitted revision=3")
+        );
     }
 
     #[test]

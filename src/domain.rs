@@ -400,6 +400,37 @@ pub enum Choice {
     /// The member withdraws their previous readiness or block.
     Revoke,
 }
+/// Owner read of one P3 managed enrollment; never starts, retries or contacts Run.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnrollmentGet {
+    /// Pool that owns the enrollment.
+    pub pool_id: String,
+    /// Exact enrollment ID returned by the owner start, batch or replacement receipt.
+    pub enrollment_id: String,
+}
+/// Explicit terminal owner disposition of a definitively admitted enrollment.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Disposition {
+    /// Keep every unbound admitted root and pin as owner-visible unassigned history.
+    RetainUnassigned,
+}
+/// Owner closes an admitted-but-unbound enrollment without cancelling any process.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnrollmentResolve {
+    /// Pool that owns the enrollment.
+    pub pool_id: String,
+    /// Exact enrollment ID.
+    pub enrollment_id: String,
+    /// Enrollment revision displayed by pool_enrollment_get.
+    pub expected_enrollment_revision: u64,
+    /// Caller-selected replay key for this disposition.
+    pub request_key: String,
+    /// Only `retain_unassigned` is defined.
+    pub disposition: Disposition,
+}
 /// Tool-selected command; identity is deliberately absent from this wire model.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "name", content = "arguments")]
@@ -461,6 +492,12 @@ pub enum Command {
     /// Records a vote and accepts only unanimous current readiness.
     #[serde(rename = "pool_vote")]
     Vote(Vote),
+    /// Owner reads one managed enrollment.
+    #[serde(rename = "pool_enrollment_get")]
+    EnrollmentGet(EnrollmentGet),
+    /// Owner resolves one admitted but unbound managed enrollment.
+    #[serde(rename = "pool_enrollment_resolve")]
+    EnrollmentResolve(EnrollmentResolve),
 }
 impl Command {
     /// Returns common write preconditions, absent for creation and reads.
@@ -581,6 +618,19 @@ impl Command {
                 Ok(())
             }
             Self::CancelReplacement(x) => identifier(&x.operation_id),
+            Self::EnrollmentGet(x) => {
+                identifier(&x.pool_id)?;
+                identifier(&x.enrollment_id)
+            }
+            Self::EnrollmentResolve(x) => {
+                identifier(&x.pool_id)?;
+                identifier(&x.enrollment_id)?;
+                identifier(&x.request_key)?;
+                if x.expected_enrollment_revision == 0 {
+                    return Err(Fault::Invalid);
+                }
+                Ok(())
+            }
             Self::MemberUpdate(x) => {
                 identifier(&x.member_id)?;
                 assignment(&x.name, &x.role, &x.task)
@@ -1014,6 +1064,48 @@ pub enum Reply {
     },
     /// Durable mutation acknowledgment.
     Receipt(Box<Receipt>),
+    /// Owner-only bounded managed enrollment projection.
+    Enrollment(Box<EnrollmentView>),
+}
+/// Owner-only projection of one managed enrollment; no credential, socket or session address.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EnrollmentView {
+    /// Owning pool.
+    pub pool_id: String,
+    /// Stable enrollment operation ID.
+    pub enrollment_id: String,
+    /// `start` or `replace`.
+    pub mode: String,
+    /// Enrollment revision required by pool_enrollment_resolve.
+    pub revision: u64,
+    /// reserved, submit_possible, admitted, refused, aborted, switched, abandoned or resolved.
+    pub state: String,
+    /// Fixed bounded recovery reason, when one applies.
+    pub attention: Option<String>,
+    /// Exact old member of a replacement.
+    pub replaces: Option<String>,
+    /// Ordered per-job admission, qualification, binding and join state.
+    pub jobs: Vec<EnrollmentJobView>,
+}
+/// One reserved member's separately recorded facts.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EnrollmentJobView {
+    /// Zero-based request order.
+    pub index: usize,
+    /// Reserved Pool membership ID.
+    pub member_id: String,
+    /// reserved, admitted, bound_pending_join, active, unassigned or retired.
+    pub state: String,
+    /// Run lineage root, once admission is known.
+    pub lineage_root_id: Option<String>,
+    /// Run history pin, once admission is known.
+    pub pin_id: Option<String>,
+    /// Pool binding generation installed from a qualified current attestation.
+    pub binding_generation: Option<u64>,
+    /// Fixed bounded qualification or recovery reason.
+    pub attention: Option<String>,
 }
 
 /// Private membership record stored separately from its public projection.

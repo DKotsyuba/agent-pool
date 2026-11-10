@@ -321,7 +321,7 @@
       "openWorldHint": true,
       "readOnlyHint": false
     },
-    "description": "Owner reserves a pending member and requests one Run agent with retained history. Run must support read-only batch receipt lookup. Managed binding remains unavailable until attempt-bound identity is proven; lost responses never authorize a replacement agent.",
+    "description": "Owner reserves a pending member and requests one Run agent with retained history. With P3 enrollment enabled, spec.profile must equal the configured managed role; the receipt's created_id is the enrollment ID (read it with pool_enrollment_get). The member joins only after a qualified Run attestation and its own verified pool_join; lost responses never authorize a new start.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -379,7 +379,7 @@
       "openWorldHint": true,
       "readOnlyHint": false
     },
-    "description": "Reserve an ordered group and request atomic Run admission with durable history pins. The receipt confirms the Pool intent only. Managed binding remains unavailable until attempt-bound identity is proven; unresolved admission blocks roster changes and closure.",
+    "description": "Reserve an ordered group of 1-20 and request atomic Run admission with durable history pins. The receipt confirms the Pool intent only; with P3 enrollment enabled its created_id is the enrollment ID and qualification/join progress per member. Each member activates only through its own verified pool_join.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -451,7 +451,7 @@
       "openWorldHint": true,
       "readOnlyHint": false
     },
-    "description": "Request replacement of a Run-managed member after its latest lineage is terminal and fully cleaned. The old roster remains until an exact conditioned Run receipt commits; an unknown outcome keeps it frozen. Omit spec to reuse the original start.",
+    "description": "Request replacement of a Run-managed member after its latest lineage is terminal and fully cleaned. A new lineage and new member ID are admitted on that exact precondition; the old member stays current until the qualified candidate is switched in one transaction. An unknown outcome keeps the roster frozen. Omit spec to reuse the original start.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -673,6 +673,84 @@
       "type": "object"
     },
     "name": "pool_release_history"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Owner reads one managed enrollment: per-member admission, qualification, binding, join state and recovery reason. Read-only; never starts or retries.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "enrollment_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "pool_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "pool_id",
+        "enrollment_id"
+      ],
+      "type": "object"
+    },
+    "name": "pool_enrollment_get"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Owner closes a definitively admitted but unbound enrollment as retain_unassigned. Keeps the Run roots and pins, cancels no process, fences the pending memberships and restores the old member's slot for a failed replacement.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "disposition": {
+          "enum": [
+            "retain_unassigned"
+          ],
+          "type": "string"
+        },
+        "enrollment_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "expected_enrollment_revision": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "pool_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "request_key": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "pool_id",
+        "enrollment_id",
+        "expected_enrollment_revision",
+        "request_key",
+        "disposition"
+      ],
+      "type": "object"
+    },
+    "name": "pool_enrollment_resolve"
   },
   {
     "annotations": {

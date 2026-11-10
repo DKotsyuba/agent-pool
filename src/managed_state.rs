@@ -1,7 +1,8 @@
 //! Durable, fail-closed Pool-side primitives for managed-attempt admission.
 //!
 //! The managed frontend reaches these primitives through the resident. Only an
-//! authenticated Run adapter constructs receipts; managed enrollment stays closed.
+//! authenticated Run adapter constructs receipts. P3 enrollment opens join only
+//! for owner-admitted roots (see `managed_enrollment`).
 use crate::domain::{Command, Fault, identifier};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -858,7 +859,7 @@ pub(crate) fn rebind_final_authenticated(
 }
 
 #[cfg(test)]
-fn rebind(
+pub(crate) fn rebind(
     db: &mut Connection,
     run: &impl RunAuthority,
     old: &ManagedBinding,
@@ -2500,6 +2501,21 @@ pub(crate) mod tests {
         pub(crate) receipt: CurrentReceipt,
         observation: VoterObservation,
     }
+    impl FakeRun {
+        /// A live Run authority for exactly one supplied receipt.
+        pub(crate) fn with_receipt(receipt: CurrentReceipt) -> Self {
+            let observation = VoterObservation {
+                state: VoterState::Live,
+                last_attempt: Some(receipt.attempt.clone()),
+                last_incarnation: Some(receipt.incarnation.clone()),
+                successor_proof: Some(receipt.successor_proof.clone()),
+            };
+            Self {
+                receipt,
+                observation,
+            }
+        }
+    }
     impl RunAuthority for FakeRun {
         fn current_receipt(
             &self,
@@ -2729,6 +2745,8 @@ pub(crate) mod tests {
                 bridge_store_id: binding.bridge_route.component_store_id.clone(),
                 bridge_route_id: binding.bridge_route.route_id.clone(),
                 producer: "pool".into(),
+                enrollment_enabled: false,
+                managed_role: None,
             }),
         }
     }
@@ -4595,7 +4613,7 @@ pub(crate) mod tests {
                 false
             )
             .err(),
-            Some(Fault::Unavailable)
+            Some(Fault::Forbidden)
         );
         let actor = crate::domain::Actor::verified(
             binding.actor.address.clone(),
@@ -8006,7 +8024,11 @@ pub(crate) fn select_ingress_binding(
 ) -> Result<ManagedBinding, Fault> {
     if matches!(
         command,
-        Command::Join(_) | Command::Start(_) | Command::StartBatch(_) | Command::Replace(_)
+        Command::Start(_)
+            | Command::StartBatch(_)
+            | Command::Replace(_)
+            | Command::EnrollmentGet(_)
+            | Command::EnrollmentResolve(_)
     ) {
         return Err(Fault::Unavailable);
     }
@@ -8036,16 +8058,28 @@ pub(crate) fn select_ingress_binding(
         Command::Create(_) => return Err(Fault::Forbidden),
         _ => Some(command.change().ok_or(Fault::Invalid)?.pool_id.as_str()),
     };
-    let mut statement = db.prepare(
-        "SELECT data FROM members WHERE current=1 AND (actor=?1 OR (actor IS NULL AND address=?2)) ORDER BY id LIMIT 2",
-    )?;
-    let candidates = statement
-        .query_map(params![actor.key, actor.address], |row| {
-            row.get::<_, String>(0)
-        })?
-        .map(|row| decoded::<crate::domain::Binding>(&row?))
-        .collect::<Result<Vec<_>, Fault>>()?;
-    drop(statement);
+    let find = |db: &Connection| -> Result<Vec<crate::domain::Binding>, Fault> {
+        let mut statement = db.prepare(
+            "SELECT data FROM members WHERE current=1 AND (actor=?1 OR (actor IS NULL AND address=?2)) ORDER BY id LIMIT 2",
+        )?;
+        statement
+            .query_map(params![actor.key, actor.address], |row| {
+                row.get::<_, String>(0)
+            })?
+            .map(|row| decoded::<crate::domain::Binding>(&row?))
+            .collect::<Result<Vec<_>, Fault>>()
+    };
+    let mut candidates = find(db)?;
+    if candidates.is_empty() {
+        // P3 rootless first hook: an owner-admitted pending root installs
+        // generation 1 under the same CAS as background reconciliation.
+        if let Some(binding) =
+            crate::managed_enrollment::bootstrap_ingress(db, authority, bridge_route, target_pool)?
+        {
+            return Ok(binding);
+        }
+        candidates = find(db)?;
+    }
     let [member] = candidates.as_slice() else {
         return Err(Fault::Forbidden);
     };

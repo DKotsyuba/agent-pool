@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 /// Current Pool schema step; steps 12-14 belong to the completion ledger.
-pub(crate) const SCHEMA_VERSION: i64 = 14;
+pub(crate) const SCHEMA_VERSION: i64 = 15;
 /// Version of the frozen record body and its canonical integrity preimage.
 pub(crate) const RECORD_VERSION: u32 = 1;
 /// Published integrity algorithm label: SHA-256 over domain, NUL and canonical C.
@@ -37,7 +37,7 @@ const CONTENT_CHUNK: usize = 16384;
 
 /// Test fixtures simulate a pre-completion store by removing exactly this step.
 #[cfg(test)]
-pub(crate) const TEST_DROP_SCHEMA: &str = "DROP TABLE completed_admissions; DROP TABLE completion_observations; DROP TABLE completion_records; DROP TABLE completion_sagas;";
+pub(crate) const TEST_DROP_SCHEMA: &str = "DROP TABLE managed_route_attention; DROP TABLE managed_enrollment_jobs; DROP TABLE managed_enrollments; DROP TABLE completed_admissions; DROP TABLE completion_observations; DROP TABLE completion_records; DROP TABLE completion_sagas;";
 
 /// Installs saga, record and observation tables with immutability triggers.
 /// Pre-feature pools receive no record: they are classified open, never inferred completed.

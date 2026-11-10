@@ -1,0 +1,7 @@
+ENROLLMENT {{ enrollment_id }} pool {{ pool_id }} mode={{ mode }} state={{ state }} revision={{ revision }}{% if attention %} attention={{ attention }}{% endif %}{% if replaces %} replaces={{ replaces }}{% endif %}
+
+{% for job in jobs %}
+job {{ job.index }} member={{ job.member_id }} state={{ job.state }}{% if job.lineage_root_id %} root={{ job.lineage_root_id }}{% endif %}{% if job.pin_id %} pin={{ job.pin_id }}{% endif %}{% if job.binding_generation %} generation={{ job.binding_generation }}{% endif %}{% if job.attention %} attention={{ job.attention }}{% endif %}
+
+{% endfor %}
+Read-only: no Run call or retry was made. Admission, binding, delivery and join are separate facts; only the member's own verified pool_join activates it.

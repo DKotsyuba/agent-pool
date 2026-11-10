@@ -57,3 +57,8 @@ bridge_server_sha256 = "00000000000000000000000000000000000000000000000000000000
 # bridge_store_id = "00000000-0000-4000-8000-000000000001"
 # bridge_route_id = "bridge-route"
 # producer = "agent-pool"
+# P3 owner enrollment of NEW Run-managed lineages. Off by default; requires the
+# managed frontend above and Run's managed_enrollment_v1 capability. When on,
+# pool_start_agent, pool_start_batch and pool_replace use the exact managed role.
+# enrollment_enabled = false
+# managed_role = "managed"

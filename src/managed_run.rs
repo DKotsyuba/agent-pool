@@ -992,6 +992,221 @@ impl RunPeer {
         }
         Ok(stream)
     }
+    /// One authenticated framed exchange; returns the correlated result or closed error.
+    async fn roundtrip(
+        &self,
+        id: &str,
+        method: &str,
+        params: &Value,
+    ) -> Result<Result<Value, WireError>, RunError> {
+        if !wire_text(id) {
+            return Err(RunError::Invalid);
+        }
+        let mut encoded =
+            serde_json::to_vec(&serde_json::json!({"id":id,"method":method,"params":params}))
+                .map_err(|_| RunError::Invalid)?;
+        if encoded.len() >= MAX_FRAME {
+            return Err(RunError::Invalid);
+        }
+        encoded.push(b'\n');
+        tokio::time::timeout(RUN_EXCHANGE_TIMEOUT, async {
+            let mut stream = self.connect().await?;
+            stream
+                .write_all(&encoded)
+                .await
+                .map_err(|_| RunError::Unknown)?;
+            let bytes = read_frame(&mut stream)
+                .await
+                .map_err(|_| RunError::Unknown)?;
+            if bytes.len() >= MAX_FRAME {
+                return Err(RunError::Unknown);
+            }
+            let decoded = crate::managed_codec::parse_raw(&bytes).map_err(|_| RunError::Unknown)?;
+            let object = decoded.as_object().ok_or(RunError::Unknown)?;
+            if object.contains_key("result") == object.contains_key("error")
+                || object.get("result").is_some_and(Value::is_null)
+                || object.get("error").is_some_and(Value::is_null)
+            {
+                return Err(RunError::Unknown);
+            }
+            let reply: Envelope = serde_json::from_value(decoded).map_err(|_| RunError::Unknown)?;
+            if reply.id != id {
+                return Err(RunError::Unknown);
+            }
+            if let Some(error) = reply.error {
+                return Ok(Err(error));
+            }
+            reply.result.map(Ok).ok_or(RunError::Unknown)
+        })
+        .await
+        .map_err(|_| RunError::Unknown)?
+    }
+    /// P3 enrollment exchange with a closed result key set and typed error classes.
+    async fn enrollment_exchange<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: &Value,
+        required: &[&str],
+    ) -> Result<T, crate::managed_enrollment::Failure> {
+        use crate::managed_enrollment::Failure;
+        let outcome = self
+            .roundtrip(&crate::domain::id(), method, params)
+            .await
+            .map_err(|_| Failure::Unknown)?;
+        let result = match outcome {
+            Ok(result) => result,
+            Err(error) => {
+                if error.version != 1
+                    || error.store_id != self.route.component_store_id
+                    || error.request_id.is_some()
+                    || error.actor_recovery.is_some()
+                    || error.actor_recovery_version.is_some()
+                    || error.incarnation.is_some()
+                    || error.launch_id.is_some()
+                {
+                    return Err(Failure::Unknown);
+                }
+                return Err(Failure::classify(&error.code, &error.recovery));
+            }
+        };
+        let fields = result.as_object().ok_or(Failure::Unknown)?;
+        let mut expected: Vec<&str> = vec!["version", "store_id"];
+        expected.extend_from_slice(required);
+        if fields.len() != expected.len() || expected.iter().any(|key| !fields.contains_key(*key)) {
+            return Err(Failure::Unknown);
+        }
+        if fields.get("version") != Some(&serde_json::json!(1))
+            || fields.get("store_id").and_then(Value::as_str)
+                != Some(self.route.component_store_id.as_str())
+        {
+            return Err(Failure::Unknown);
+        }
+        serde_json::from_value(result).map_err(|_| Failure::Unknown)
+    }
+    /// Discover managed enrollment and the receipt verification capability on the pinned route.
+    pub async fn enrollment_enabled(&self) -> Result<(), crate::managed_enrollment::Failure> {
+        use crate::managed_enrollment::{CAPABILITY, Failure};
+        let caps = self
+            .capabilities(&crate::domain::id())
+            .await
+            .map_err(|_| Failure::Unknown)?;
+        if [CAPABILITY, "attempt_current_egress_v1"]
+            .iter()
+            .all(|needed| caps.capabilities.iter().any(|item| item == needed))
+        {
+            Ok(())
+        } else {
+            Err(Failure::Refused("capability_missing"))
+        }
+    }
+    /// Submit (or replay) the exact frozen enrollment parameters.
+    pub async fn enrollment_submit(
+        &self,
+        params: &Value,
+    ) -> Result<crate::managed_enrollment::StartReceipt, crate::managed_enrollment::Failure> {
+        self.enrollment_exchange(
+            "_managed_start_batch_v1",
+            params,
+            &["request_id", "receipt_id", "fingerprint", "state", "jobs"],
+        )
+        .await
+    }
+    /// Exact-key read-only lookup; `absent` is a snapshot, not an abort fence.
+    pub async fn enrollment_lookup(
+        &self,
+        key: &crate::managed_enrollment::Key,
+    ) -> Result<crate::managed_enrollment::Lookup, crate::managed_enrollment::Failure> {
+        self.enrollment_exchange(
+            "_managed_start_lookup_v1",
+            &key.params(),
+            &[
+                "request_id",
+                "fingerprint",
+                "state",
+                "receipt",
+                "jobs_state",
+            ],
+        )
+        .await
+    }
+    /// Exact-key abort; an admitted key returns its original receipt, never a cancellation.
+    pub async fn enrollment_abort(
+        &self,
+        key: &crate::managed_enrollment::Key,
+    ) -> Result<crate::managed_enrollment::Lookup, crate::managed_enrollment::Failure> {
+        self.enrollment_exchange(
+            "_managed_start_abort_v1",
+            &key.params(),
+            &[
+                "request_id",
+                "fingerprint",
+                "state",
+                "receipt",
+                "jobs_state",
+            ],
+        )
+        .await
+    }
+    /// Qualified current attestation under the original admission, re-read by receipt lookup.
+    pub async fn enrollment_current(
+        &self,
+        key: &crate::managed_enrollment::Key,
+        member_id: &str,
+        current_request_id: &str,
+    ) -> Result<crate::managed_enrollment::Attested, crate::managed_enrollment::Failure> {
+        use crate::managed_enrollment::{Attested, Failure, Qualification};
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Current {
+            #[serde(rename = "version")]
+            _version: u8,
+            #[serde(rename = "store_id")]
+            _store_id: String,
+            request_id: String,
+            member_id: String,
+            state: String,
+            admission_receipt_id: String,
+            receipt: CurrentReceipt,
+            qualification: Qualification,
+        }
+        let mut params = key.params();
+        params["member_id"] = Value::String(member_id.into());
+        params["current_request_id"] = Value::String(current_request_id.into());
+        let current: Current = self
+            .enrollment_exchange(
+                "_managed_enrollment_current_v1",
+                &params,
+                &[
+                    "request_id",
+                    "member_id",
+                    "state",
+                    "admission_receipt_id",
+                    "receipt",
+                    "qualification",
+                ],
+            )
+            .await?;
+        if current.request_id != key.request_id
+            || current.member_id != member_id
+            || current.state != "current"
+            || current.receipt.purpose != "egress"
+            || !wire_text(&current.admission_receipt_id)
+        {
+            return Err(Failure::Unknown);
+        }
+        let authority = self
+            .verify_current_receipt(&crate::domain::id(), current.receipt)
+            .await
+            .map_err(|error| match error {
+                RunError::Refused => Failure::Refused("capability_missing"),
+                _ => Failure::Unknown,
+            })?;
+        Ok(Attested {
+            authority,
+            qualification: current.qualification,
+            admission_receipt_id: current.admission_receipt_id,
+        })
+    }
     /// Exact operation and transport ID are internal constants/inputs; never echo unsafe diagnostics.
     async fn exchange<T: DeserializeOwned>(
         &self,
@@ -2202,6 +2417,175 @@ mod tests {
         let original = peer.current_ingress(&ingress).await.unwrap();
         assert_eq!(original.receipt(), &expected_ingress);
         assert_eq!(original.invocation(), Some("original-invocation"));
+        server.await.unwrap();
+    }
+
+    /// P3 enrollment wire: exact params and fingerprint, closed reply key sets,
+    /// receipt re-read before authority, and typed error classes.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn p3_enrollment_wire_exact_keys_and_typed_errors() {
+        use crate::managed_enrollment::{Failure, Key};
+        use crate::managed_state::SuccessorLink;
+        let _hash_guard = crate::TEST_EXEC_HASH_LOCK.lock().await;
+        let root = std::env::var_os("TMPDIR").unwrap();
+        let dir = tempfile::tempdir_in(root).unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = dir.path().join("attempt.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let sha256 = format!("{:x}", Sha256::digest(fs::read(&executable).unwrap()));
+        let uid = fs::metadata(dir.path()).unwrap().uid();
+        let peer = local_peer(socket, uid, executable, sha256);
+        let store_id = peer.route.component_store_id.clone();
+        let root_id = "ag-20261110-120000-0000000001".to_owned();
+        let params = serde_json::json!({"version":1,"expected_store_id":store_id,"pool_store_id":peer.pool_route.component_store_id,"pool_id":"pool","request_id":"agent-pool.enroll.1","mode":"start","jobs":[{"member_id":"member","selector":{"version":1,"role_name":"managed"},"spec":{"provider":"codex","model":"m","profile":"managed","task":"t","workdir":"/w","explicit_finish":true,"write":false}}],"preconditions":[]});
+        let fingerprint = crate::managed_enrollment::fingerprint(&params).unwrap();
+        let receipt = serde_json::json!({"version":1,"store_id":store_id,"request_id":"agent-pool.enroll.1","receipt_id":"receipt-1","fingerprint":fingerprint,"state":"admitted","jobs":[{"index":0,"member_id":"member","lineage_root_id":root_id,"execution_id":root_id,"sequence":1,"execution_ref":format!("ex1_{}","a".repeat(64)),"pin_id":"pin_550e8400e29b41d4a716446655440000","managed_role_name":"managed","role_digest":"c".repeat(64)}]});
+        let current = CurrentReceipt {
+            receipt_id: "current-1".into(),
+            purpose: "egress".into(),
+            lineage_root_id: root_id.clone(),
+            bound_execution_id: root_id.clone(),
+            attempt: AttemptRef {
+                run_store_id: store_id.clone(),
+                lineage_root_id: root_id.clone(),
+                execution_id: root_id.clone(),
+                sequence: 1,
+                attempt_id: "attempt".into(),
+                launch_id: "00000000-0000-4000-8000-000000000003".into(),
+            },
+            incarnation: Incarnation {
+                host_id: "host".into(),
+                boot_id: "00000000-0000-4000-8000-000000000004".into(),
+                pid_namespace_inode: 1,
+                uid,
+                pid: 123,
+                start_ticks: 1,
+            },
+            actor: ManagedActor {
+                address: "host/codex/store/session".into(),
+                role: "root".into(),
+                native_id: "session".into(),
+                epoch: 1,
+            },
+            successor_proof: SuccessorProof {
+                lineage_root_id: root_id.clone(),
+                bound_execution_id: root_id.clone(),
+                current_execution_id: root_id.clone(),
+                chain: vec![SuccessorLink {
+                    execution_id: root_id.clone(),
+                    parent_execution_id: None,
+                    sequence: 1,
+                }],
+            },
+        };
+        let key = Key {
+            expected_store_id: store_id.clone(),
+            pool_store_id: peer.pool_route.component_store_id.clone(),
+            request_id: "agent-pool.enroll.1".into(),
+            fingerprint: fingerprint.clone(),
+        };
+        let expected_current = current.clone();
+        let server_params = params.clone();
+        let server_key = key.params();
+        let server_receipt = receipt.clone();
+        let server = tokio::spawn(async move {
+            for index in 0..11 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request: Value =
+                    serde_json::from_slice(&read_frame(&mut stream).await.unwrap()).unwrap();
+                let error = |code: &str, recovery: &str| serde_json::json!({"id":request["id"],"error":{"version":1,"store_id":store_id,"code":code,"recovery":recovery}});
+                let ok = |result: Value| serde_json::json!({"id":request["id"],"result":result});
+                let response = match index {
+                    0 | 5 => {
+                        assert_eq!(request["method"], "_attempt_capabilities_v1");
+                        ok(
+                            serde_json::json!({"version":1,"store_id":store_id,"capabilities":["attempt_current_egress_v1","managed_enrollment_v1"],"policy":"admission_snapshot"}),
+                        )
+                    }
+                    1 => {
+                        assert_eq!(request["method"], "_managed_start_batch_v1");
+                        assert_eq!(request["params"], server_params);
+                        ok(server_receipt.clone())
+                    }
+                    2 => {
+                        assert_eq!(request["method"], "_managed_start_lookup_v1");
+                        assert_eq!(request["params"], server_key);
+                        ok(
+                            serde_json::json!({"version":1,"store_id":store_id,"request_id":"agent-pool.enroll.1","fingerprint":server_key["fingerprint"],"state":"absent","receipt":null,"jobs_state":[]}),
+                        )
+                    }
+                    3 => {
+                        assert_eq!(request["method"], "_managed_start_abort_v1");
+                        assert_eq!(request["params"], server_key);
+                        ok(
+                            serde_json::json!({"version":1,"store_id":store_id,"request_id":"agent-pool.enroll.1","fingerprint":server_key["fingerprint"],"state":"admitted","receipt":server_receipt,"jobs_state":[{"index":0,"member_id":"member","state":"qualification_pending","failure_code":null,"last_attempt":null,"incarnation":null,"qualification":null}]}),
+                        )
+                    }
+                    4 => {
+                        assert_eq!(request["method"], "_managed_enrollment_current_v1");
+                        let mut expected = server_key.clone();
+                        expected["member_id"] = "member".into();
+                        expected["current_request_id"] = "current-request".into();
+                        assert_eq!(request["params"], expected);
+                        ok(
+                            serde_json::json!({"version":1,"store_id":store_id,"request_id":"agent-pool.enroll.1","member_id":"member","state":"current","admission_receipt_id":"receipt-1","receipt":current,"qualification":{"launch_id":current.attempt.launch_id,"role_digest":"c".repeat(64),"config_digest":"d".repeat(64),"inventory_digest":"e".repeat(64)}}),
+                        )
+                    }
+                    6 => {
+                        assert_eq!(request["method"], "_attempt_current_receipt_v1");
+                        assert_eq!(request["params"]["receipt_id"], "current-1");
+                        ok(serde_json::json!({"version":1,"store_id":store_id,"receipt":current}))
+                    }
+                    7 => error("role_mismatch", "none"),
+                    8 => error("request_in_progress", "same_key_lookup"),
+                    9 => error("attempt_not_ready", "same_key_lookup"),
+                    _ => ok(
+                        serde_json::json!({"version":1,"store_id":store_id,"request_id":"agent-pool.enroll.1","fingerprint":server_key["fingerprint"],"state":"absent","receipt":null,"jobs_state":[],"extra":true}),
+                    ),
+                };
+                stream
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        peer.enrollment_enabled().await.unwrap();
+        let admitted = peer.enrollment_submit(&params).await.unwrap();
+        assert_eq!(serde_json::to_value(&admitted).unwrap(), receipt);
+        let absent = peer.enrollment_lookup(&key).await.unwrap();
+        assert_eq!(absent.state, "absent");
+        assert!(absent.receipt.is_none());
+        let aborted = peer.enrollment_abort(&key).await.unwrap();
+        assert_eq!(aborted.state, "admitted");
+        assert_eq!(aborted.receipt.as_ref(), Some(&admitted));
+        let attested = peer
+            .enrollment_current(&key, "member", "current-request")
+            .await
+            .unwrap();
+        assert_eq!(attested.authority.receipt(), &expected_current);
+        assert_eq!(attested.admission_receipt_id, "receipt-1");
+        assert_eq!(
+            peer.enrollment_submit(&params).await.err(),
+            Some(Failure::Refused("role_mismatch"))
+        );
+        assert_eq!(
+            peer.enrollment_lookup(&key).await.err(),
+            Some(Failure::InProgress)
+        );
+        assert_eq!(
+            peer.enrollment_current(&key, "member", "current-request")
+                .await
+                .err(),
+            Some(Failure::NotReady)
+        );
+        assert_eq!(
+            peer.enrollment_lookup(&key).await.err(),
+            Some(Failure::Unknown),
+            "an unknown reply field is never accepted"
+        );
         server.await.unwrap();
     }
 }

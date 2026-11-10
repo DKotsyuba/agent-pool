@@ -2181,14 +2181,14 @@ fn p3_completion_migration_history_and_downgrade() {
     drop(Store::open(&path).unwrap());
     rusqlite::Connection::open(&path)
         .unwrap()
-        .execute_batch("DROP TABLE completed_admissions; PRAGMA user_version=13;")
+        .execute_batch("DROP TABLE managed_route_attention; DROP TABLE managed_enrollment_jobs; DROP TABLE managed_enrollments; DROP TABLE completed_admissions; PRAGMA user_version=13;")
         .unwrap();
     drop(Store::open(&path).unwrap());
     let db = rusqlite::Connection::open(&path).unwrap();
     assert_eq!(
         db.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
             .unwrap(),
-        14
+        completion::SCHEMA_VERSION
     );
     assert_eq!(
         db.query_row::<i64, _, _>("SELECT count(*) FROM sqlite_master WHERE name IN ('completed_admissions','completed_admission_immutable','completed_admission_retained')", [], |r| r.get(0))
@@ -2215,7 +2215,7 @@ fn review_v13_migration_preserves_prepared_retirement_and_rolls_back_on_failure(
             }
         }
         db.execute_batch(
-            "DROP TABLE completed_admissions; PRAGMA user_version=12; DROP TRIGGER inventory_rev_completion_sagas_INSERT;",
+            "DROP TABLE managed_route_attention; DROP TABLE managed_enrollment_jobs; DROP TABLE managed_enrollments; DROP TABLE completed_admissions; PRAGMA user_version=12; DROP TRIGGER inventory_rev_completion_sagas_INSERT;",
         )
         .unwrap();
     }

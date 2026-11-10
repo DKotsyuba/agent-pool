@@ -156,9 +156,24 @@ pub(crate) fn normalize_command(input: Value) -> Result<(Command, Value), Fault>
         "pool_send_member" => &["member_id", "body"],
         "pool_propose" => &["result", "criteria", "snapshot"],
         "pool_vote" => &["proposal_id", "roster_key", "choice", "evidence", "checks"],
+        "pool_enrollment_get" => &["pool_id", "enrollment_id"],
+        "pool_enrollment_resolve" => &[
+            "pool_id",
+            "enrollment_id",
+            "expected_enrollment_revision",
+            "request_key",
+            "disposition",
+        ],
         _ => return Err(Fault::Invalid),
     };
-    let has_change = !matches!(name, "pool_create" | "pool_list" | "pool_get");
+    let has_change = !matches!(
+        name,
+        "pool_create"
+            | "pool_list"
+            | "pool_get"
+            | "pool_enrollment_get"
+            | "pool_enrollment_resolve"
+    );
     if args.keys().any(|key| {
         !extras.contains(&key.as_str())
             && !(has_change

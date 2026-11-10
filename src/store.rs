@@ -28,6 +28,8 @@ pub struct Store {
     managed_scope_cursor: i64,
     /// Changes on every store open, invalidating cursors across resident restarts.
     read_epoch: String,
+    /// Configured P3 enrollment route; absent keeps owner starts on the legacy path.
+    enrollment: Option<crate::managed_enrollment::EnrollmentRoute>,
 }
 /// Durable result of recording one verified Run admission receipt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1079,6 +1081,42 @@ impl Store {
         )
     }
     /// Avoid contacting providers when no namespace can need retirement.
+    /// Whether a failed E11 issuer discovery's backoff has elapsed.
+    pub(crate) fn managed_discovery_due(&self, now: i64) -> Result<bool, Fault> {
+        Ok(self.db.query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM managed_route_attention WHERE subject='namespace_discovery' AND next_attempt>?1)",
+            [now],
+            |row| row.get(0),
+        )?)
+    }
+    /// Record a durable, owner-visible discovery failure with capped exponential backoff.
+    pub(crate) fn managed_discovery_failed(&mut self, code: &str, now: i64) -> Result<(), Fault> {
+        let attempts: i64 = self
+            .db
+            .query_row(
+                "SELECT attempts FROM managed_route_attention WHERE subject='namespace_discovery'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0_i64)
+            .saturating_add(1);
+        let shift = u32::try_from((attempts - 1).clamp(0, 6)).map_err(|_| Fault::Internal)?;
+        let delay = 5_i64.saturating_mul(1_i64 << shift).min(300);
+        self.db.execute(
+            "INSERT INTO managed_route_attention(subject,attention,attempts,next_attempt) VALUES('namespace_discovery',?1,?2,?3) ON CONFLICT(subject) DO UPDATE SET attention=excluded.attention,attempts=excluded.attempts,next_attempt=excluded.next_attempt",
+            params![code, attempts, now.saturating_add(delay)],
+        )?;
+        Ok(())
+    }
+    /// A successful authenticated discovery clears the attention.
+    pub(crate) fn managed_discovery_succeeded(&mut self) -> Result<(), Fault> {
+        self.db.execute(
+            "DELETE FROM managed_route_attention WHERE subject='namespace_discovery'",
+            [],
+        )?;
+        Ok(())
+    }
     pub(crate) fn managed_has_namespace_retirement_work(&self) -> Result<bool, Fault> {
         self.db.query_row("SELECT EXISTS(SELECT 1 FROM managed_namespaces WHERE state='open') OR EXISTS(SELECT 1 FROM managed_namespace_retirements WHERE state='requested')", [], |row| row.get(0)).map_err(Into::into)
     }
@@ -1135,6 +1173,24 @@ impl Store {
                                 .push(format!("completion_attention_{code}"));
                         }
                     }
+                    let discovery: Option<String> = self
+                        .db
+                        .query_row(
+                            "SELECT attention FROM managed_route_attention WHERE subject='namespace_discovery'",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    if let Some(code) = discovery.filter(|code| {
+                        matches!(
+                            code.as_str(),
+                            "route_unavailable" | "route_changed" | "relaunch_required"
+                        )
+                    }) {
+                        identity
+                            .capabilities
+                            .push(format!("namespace_retirement_attention_{code}"));
+                    }
                 }
                 Ok(data)
             }
@@ -1146,6 +1202,9 @@ impl Store {
             }
             Operation::CompletionGet(args) => Ok(Data::Completion(Box::new(
                 crate::completion::page(&self.db, args)?,
+            ))),
+            Operation::EnrollmentGet(args) => Ok(Data::Enrollment(Box::new(
+                crate::managed_enrollment::view(&self.db, &args.pool_id, &args.enrollment_id)?,
             ))),
             Operation::List(args) => {
                 let mut stmt = self
@@ -1377,6 +1436,13 @@ PRAGMA user_version=5;")?;
             migrate_completed_admissions(&db)?;
             db.execute_batch("PRAGMA user_version=14;")?;
         }
+        // Version 15 adds the P3 owner enrollment journal and per-job facts,
+        // plus durable route attention for E11 issuer discovery.
+        if version < 15 {
+            crate::managed_enrollment::migrate(&db)?;
+            db.execute_batch("CREATE TABLE managed_route_attention(subject TEXT PRIMARY KEY CHECK(subject='namespace_discovery'),attention TEXT NOT NULL,attempts INTEGER NOT NULL CHECK(attempts>0),next_attempt INTEGER NOT NULL CHECK(next_attempt>=0));")?;
+            db.execute_batch("PRAGMA user_version=15;")?;
+        }
         if version < crate::completion::SCHEMA_VERSION {
             db.execute_batch("COMMIT;")?;
         }
@@ -1398,7 +1464,16 @@ PRAGMA user_version=5;")?;
             managed_bootstrap_cursor: 0,
             managed_scope_cursor: 0,
             read_epoch: id(),
+            enrollment: None,
         })
+    }
+    /// Selects P3 managed enrollment for later owner start, batch and replacement commands.
+    /// The route is frozen into each enrollment; absence keeps new enrollment closed.
+    pub(crate) fn configure_enrollment(
+        &mut self,
+        route: Option<crate::managed_enrollment::EnrollmentRoute>,
+    ) {
+        self.enrollment = route;
     }
     /// Authenticates current membership before replay lookup, then executes a non-join command.
     /// Joins must use execute_join with the provider-prevalidated binding; no unfenced join path exists.
@@ -1411,7 +1486,7 @@ PRAGMA user_version=5;")?;
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let reply = execute(&tx, actor, command)?;
+        let reply = execute(&tx, actor, command, self.enrollment.as_ref())?;
         tx.commit()?;
         Ok(reply)
     }
@@ -1435,7 +1510,7 @@ PRAGMA user_version=5;")?;
         if !active || current != *expected {
             return Err(Fault::Stale);
         }
-        let reply = execute(&tx, actor, command)?;
+        let reply = execute(&tx, actor, command, None)?;
         tx.commit()?;
         Ok(reply)
     }
@@ -2333,6 +2408,15 @@ PRAGMA user_version=5;")?;
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let e = effect(&tx, effect_id)?;
+        // A terminal effect (including a retained late `reconciliation_needed`
+        // receipt) or a completed pool is never overwritten by a later binding.
+        if matches!(
+            e.state.as_str(),
+            "refused" | "cancelled" | RECONCILIATION_NEEDED
+        ) || crate::completion::completed(&tx, &e.pool_id)?
+        {
+            return Err(Fault::Conflict);
+        }
         let (mut b, current) = binding_any(&tx, e.member_id.as_deref().ok_or(Fault::Internal)?)?;
         if b.run_id.is_none() {
             return Err(Fault::Conflict);
@@ -2597,8 +2681,13 @@ fn observe_history(
     Ok(Data::Detail(Box::new(detail)))
 }
 /// Applies a typed command inside the caller's single SQLite transaction.
-fn execute(db: &Connection, actor: &Actor, command: &Command) -> Result<Reply, Fault> {
-    execute_authorized(db, actor, command, None, false)
+fn execute(
+    db: &Connection,
+    actor: &Actor,
+    command: &Command,
+    enrollment: Option<&crate::managed_enrollment::EnrollmentRoute>,
+) -> Result<Reply, Fault> {
+    execute_authorized(db, actor, command, None, false, enrollment)
 }
 
 /// Apply an already admitted participant mutation under its exact frozen binding.
@@ -2617,6 +2706,7 @@ pub(crate) fn apply_managed_mutation(
             | Command::Propose(_)
             | Command::Vote(_)
             | Command::Remove(_)
+            | Command::Join(_)
     ) {
         return Err(Fault::Unavailable);
     }
@@ -2637,6 +2727,13 @@ pub(crate) fn apply_managed_mutation(
         &binding.actor.native_id,
         &binding.actor.role,
     )?;
+    // P3: only an owner-enrolled root with a qualified enrollment binding may
+    // join; a pending enrollee may do nothing else before that join.
+    if matches!(command, Command::Join(_)) {
+        crate::managed_enrollment::join_gate(db, binding)?;
+    } else if crate::managed_enrollment::pending_enrollee(db, &binding.member_id)? {
+        return Err(Fault::Forbidden);
+    }
     if db.is_autocommit() {
         return Err(Fault::Internal);
     }
@@ -2649,7 +2746,13 @@ pub(crate) fn apply_managed_mutation(
         "INSERT INTO temp.managed_delivery_origin(singleton,namespace_id) VALUES(1,?1)",
         [&namespace],
     )?;
-    let result = execute_authorized(db, &actor, command, Some(binding), checked_consensus);
+    let result = execute_authorized(db, &actor, command, Some(binding), checked_consensus, None)
+        .and_then(|reply| {
+            if matches!(command, Command::Join(_)) {
+                crate::managed_enrollment::mark_joined(db, &binding.member_id)?;
+            }
+            Ok(reply)
+        });
     db.execute(
         "DELETE FROM temp.managed_delivery_origin WHERE singleton=1",
         [],
@@ -2668,9 +2771,24 @@ fn execute_authorized(
     command: &Command,
     managed: Option<&crate::managed_state::ManagedBinding>,
     checked_consensus: bool,
+    enrollment: Option<&crate::managed_enrollment::EnrollmentRoute>,
 ) -> Result<Reply, Fault> {
     if let Command::Create(c) = command {
         return create(db, actor, c, command);
+    }
+    if managed.is_some()
+        && matches!(
+            command,
+            Command::EnrollmentGet(_) | Command::EnrollmentResolve(_)
+        )
+    {
+        return Err(Fault::Forbidden);
+    }
+    if let Command::EnrollmentGet(request) = command {
+        return crate::managed_enrollment::owner_get(db, actor, request);
+    }
+    if let Command::EnrollmentResolve(request) = command {
+        return crate::managed_enrollment::owner_resolve(db, actor, request, command);
     }
     if let Command::List(c) = command {
         return list(db, actor, c);
@@ -2793,6 +2911,7 @@ fn execute_authorized(
         )
     };
     let mut created = None;
+    let mut managed_created: Option<String> = None;
     let mut created_ids = Vec::new();
     let mut target = None;
     let mut direct_address = None;
@@ -2803,6 +2922,7 @@ fn execute_authorized(
     let mut message_parts = Vec::new();
     let mut release_pin = None;
     let mut replacement = None;
+    let mut managed_replacement = None;
     let (kind, body, system) = match command {
         Command::Update(x) => {
             p.name = x.name.clone();
@@ -2884,6 +3004,22 @@ fn execute_authorized(
                 true,
             )
         }
+        Command::Replace(x) if enrollment.is_some() => {
+            let route = enrollment.ok_or(Fault::Internal)?;
+            let old = roster
+                .iter()
+                .find(|binding| binding.member.member_id == x.member_id)
+                .ok_or(Fault::Forbidden)?
+                .clone();
+            managed_replacement =
+                Some(managed_replacement_freeze(db, &p, &roster, route, &old, x)?);
+            target = Some(x.member_id.clone());
+            (
+                "replacement_requested",
+                "Replacement requested; the current member remains until a qualified new lineage is attested and switched.".into(),
+                true,
+            )
+        }
         Command::Replace(x) => {
             let old = roster
                 .iter()
@@ -2945,13 +3081,36 @@ fn execute_authorized(
             )
         }
         Command::CancelReplacement(x) => {
-            target = Some(cancel_unsubmitted_replacement(db, pid, &x.operation_id)?);
-            (
-                "replacement_cancelled",
-                "Replacement cancelled before Run admission; the original member remains current."
-                    .into(),
-                true,
-            )
+            match crate::managed_enrollment::cancel_replacement(db, pid, &x.operation_id)? {
+                Some((member, false)) => {
+                    target = Some(member);
+                    created = Some(x.operation_id.clone());
+                    (
+                        "replacement_cancel_requested",
+                        "Replacement outcome is uncertain; Pool requested the original-key Run abort. The roster stays frozen until a tombstone or the original admission is observed."
+                            .into(),
+                        true,
+                    )
+                }
+                Some((member, true)) => {
+                    target = Some(member);
+                    (
+                        "replacement_cancelled",
+                        "Replacement cancelled before Run admission; the original member remains current."
+                            .into(),
+                        true,
+                    )
+                }
+                None => {
+                    target = Some(cancel_unsubmitted_replacement(db, pid, &x.operation_id)?);
+                    (
+                        "replacement_cancelled",
+                        "Replacement cancelled before Run admission; the original member remains current."
+                            .into(),
+                        true,
+                    )
+                }
+            }
         }
         Command::MemberUpdate(x) => {
             let b = roster
@@ -3282,6 +3441,34 @@ fn execute_authorized(
                 intro,
                 Some(event.event_id),
             )?;
+        } else if let (Some(spec), Some(route)) = (start_spec.as_ref(), enrollment) {
+            queue_delivery(
+                db,
+                pid,
+                Some(member_id),
+                "",
+                &scope(member_id),
+                intro.clone(),
+                Some(event.event_id),
+            )?;
+            let job = crate::managed_enrollment::ReservedJob {
+                member_id: member_id.to_owned(),
+                original: spec.clone(),
+                submitted: crate::managed_enrollment::managed_spec(spec, &route.role, &intro)?,
+            };
+            let enrollment_id = crate::managed_enrollment::reserve(
+                db,
+                route,
+                pid,
+                &actor.key,
+                &replay_scope,
+                &c.request_key,
+                &digest,
+                std::slice::from_ref(&job),
+                None,
+            )?;
+            created_ids.push(member_id.to_owned());
+            managed_created = Some(enrollment_id);
         } else if let Some(spec) = start_spec {
             let request_key = format!("agent-pool.{pid}.{member_id}");
             let jobs = vec![BatchJob {
@@ -3305,7 +3492,45 @@ fn execute_authorized(
             )?;
         }
     }
-    if let Command::StartBatch(batch) = command {
+    if let (Command::StartBatch(batch), Some(route)) = (command, enrollment) {
+        let mut jobs = Vec::with_capacity(batch.members.len());
+        for (member_id, member) in created_ids.iter().zip(&batch.members) {
+            let binding = roster
+                .iter()
+                .find(|b| &b.member.member_id == member_id)
+                .ok_or(Fault::Internal)?;
+            let intro = onboarding(&p, &roster, &binding.member)?;
+            queue_delivery(
+                db,
+                pid,
+                Some(member_id),
+                "",
+                &scope(member_id),
+                intro.clone(),
+                Some(event.event_id),
+            )?;
+            jobs.push(crate::managed_enrollment::ReservedJob {
+                member_id: member_id.clone(),
+                original: member.spec.clone(),
+                submitted: crate::managed_enrollment::managed_spec(
+                    &member.spec,
+                    &route.role,
+                    &intro,
+                )?,
+            });
+        }
+        created = Some(crate::managed_enrollment::reserve(
+            db,
+            route,
+            pid,
+            &actor.key,
+            &replay_scope,
+            &c.request_key,
+            &digest,
+            &jobs,
+            None,
+        )?);
+    } else if let Command::StartBatch(batch) = command {
         let request_key = format!("agent-pool.batch.{}", id());
         let mut jobs = Vec::with_capacity(batch.members.len());
         for (member_id, member) in created_ids.iter().zip(&batch.members) {
@@ -3334,6 +3559,28 @@ fn execute_authorized(
                 route: None,
             },
         )?);
+    }
+    if let (Some(freeze), Some(route)) = (managed_replacement, enrollment) {
+        let job = crate::managed_enrollment::ReservedJob {
+            member_id: freeze.candidate.member.member_id.clone(),
+            original: freeze.original.clone(),
+            submitted: freeze.freeze.submitted.clone(),
+        };
+        created_ids.push(job.member_id.clone());
+        created = Some(crate::managed_enrollment::reserve(
+            db,
+            route,
+            pid,
+            &actor.key,
+            &replay_scope,
+            &c.request_key,
+            &digest,
+            std::slice::from_ref(&job),
+            Some(&freeze.freeze),
+        )?);
+    }
+    if let Some(enrollment_id) = managed_created.take() {
+        created = Some(enrollment_id);
     }
     if let Some((request_key, old, new, job, route)) = replacement {
         let old_member_id = old.member.member_id.clone();
@@ -3372,13 +3619,22 @@ fn execute_authorized(
     if p.closed {
         crate::managed_egress::retire_final_scope(db, &p.pool_id)?;
     }
+    let managed_status = enrollment.is_some()
+        && matches!(
+            command,
+            Command::Start(_) | Command::StartBatch(_) | Command::Replace(_)
+        );
     let reply = Reply::Receipt(Box::new(Receipt {
         pool_id: pid.into(),
         revision: p.revision,
         created_id: created,
         created_ids,
         event,
-        status: "committed; delivery pending".into(),
+        status: if managed_status {
+            "committed; managed enrollment pending".into()
+        } else {
+            "committed; delivery pending".into()
+        },
     }));
     remember(db, &replay_scope, &c.request_key, &digest, &reply)?;
     Ok(reply)
@@ -3853,7 +4109,7 @@ fn view(
     }
 }
 /// Loads a pool and owner without exposing whether an inaccessible identifier exists.
-fn pool(db: &Connection, id: &str) -> Result<(Pool, String), Fault> {
+pub(crate) fn pool(db: &Connection, id: &str) -> Result<(Pool, String), Fault> {
     let row: Option<(String, String)> = db
         .query_row("SELECT data,owner FROM pools WHERE id=?1", [id], |r| {
             Ok((r.get(0)?, r.get(1)?))
@@ -3863,7 +4119,7 @@ fn pool(db: &Connection, id: &str) -> Result<(Pool, String), Fault> {
     Ok((decode(&data)?, owner))
 }
 /// Replaces only the bounded current pool snapshot.
-fn save_pool(db: &Connection, p: &Pool) -> Result<(), Fault> {
+pub(crate) fn save_pool(db: &Connection, p: &Pool) -> Result<(), Fault> {
     db.execute(
         "UPDATE pools SET data=?2 WHERE id=?1",
         params![p.pool_id, encode(p)?],
@@ -3879,14 +4135,14 @@ fn save_pool(db: &Connection, p: &Pool) -> Result<(), Fault> {
     Ok(())
 }
 /// Loads current members in stable slot order, preserving a replaced member's position.
-fn bindings(db: &Connection, pool: &str) -> Result<Vec<Binding>, Fault> {
+pub(crate) fn bindings(db: &Connection, pool: &str) -> Result<Vec<Binding>, Fault> {
     let mut stmt = db.prepare("SELECT m.data FROM members m LEFT JOIN member_slots s ON s.member=m.id WHERE m.pool=?1 AND m.current=1 ORDER BY COALESCE(s.slot,m.id),m.id")?;
     stmt.query_map([pool], |r| r.get::<_, String>(0))?
         .map(|r| decode(&r?))
         .collect()
 }
 /// Loads an exact retained incarnation and whether it still has access.
-fn binding_any(db: &Connection, id: &str) -> Result<(Binding, bool), Fault> {
+pub(crate) fn binding_any(db: &Connection, id: &str) -> Result<(Binding, bool), Fault> {
     let (s, current): (String, bool) =
         db.query_row("SELECT data,current FROM members WHERE id=?1", [id], |r| {
             Ok((r.get(0)?, r.get(1)?))
@@ -3894,7 +4150,7 @@ fn binding_any(db: &Connection, id: &str) -> Result<(Binding, bool), Fault> {
     Ok((decode(&s)?, current))
 }
 /// Writes private binding and indexed uniqueness columns together.
-fn save_binding(db: &Connection, b: &Binding, current: bool) -> Result<(), Fault> {
+pub(crate) fn save_binding(db: &Connection, b: &Binding, current: bool) -> Result<(), Fault> {
     db.execute("INSERT INTO members(id,pool,actor,address,current,data) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(id) DO UPDATE SET actor=excluded.actor,address=excluded.address,current=excluded.current,data=excluded.data",params![b.member.member_id,b.pool_id,b.actor,b.address,current,encode(b)?])?;
     Ok(())
 }
@@ -3947,8 +4203,119 @@ fn content_slice(source: &str, offset: usize) -> Result<(String, usize), Fault> 
     }
     Ok((source[offset..end].to_owned(), end))
 }
+/// A managed replacement prepared inside the owner's authorized transaction.
+struct ManagedReplacement {
+    /// Frozen old source, slot, candidate and submitted spec.
+    freeze: crate::managed_enrollment::ReplacementFreeze,
+    /// Reserved candidate membership, not yet in the roster.
+    candidate: Binding,
+    /// Retained owner spec for any later replacement of the candidate.
+    original: serde_json::Value,
+}
+/// Freezes one P3 replacement: the old member stays current; the candidate is a
+/// new membership ID for a new lineage that will be conditioned on the old tip.
+fn managed_replacement_freeze(
+    db: &Connection,
+    p: &Pool,
+    roster: &[Binding],
+    route: &crate::managed_enrollment::EnrollmentRoute,
+    old: &Binding,
+    x: &Replace,
+) -> Result<ManagedReplacement, Fault> {
+    let store = route.run.route.component_store_id.as_str();
+    if route.status.is_none() || old.run_store_id.as_deref() != Some(store) {
+        return Err(Fault::Unavailable);
+    }
+    let agent_id = old.run_id.as_deref().ok_or(Fault::Unavailable)?;
+    let sequence = old.run_sequence.ok_or(Fault::Unavailable)?;
+    let reference = old.run_execution_ref.as_deref().ok_or(Fault::Unavailable)?;
+    let pin = old.run_pin_id.as_deref().ok_or(Fault::Unavailable)?;
+    let sequence = u32::try_from(sequence).map_err(|_| Fault::Unavailable)?;
+    if !crate::run_status::valid_agent_id(agent_id)
+        || sequence == 0
+        || execution_ref(reference).is_err()
+        || pin_id(pin).is_err()
+    {
+        return Err(Fault::Unavailable);
+    }
+    let spec = match &x.spec {
+        Some(spec) => spec.clone(),
+        None => {
+            let managed: Option<String> = db
+                .query_row(
+                    "SELECT original_spec FROM managed_enrollment_jobs WHERE member=?1",
+                    [&old.member.member_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match managed {
+                Some(original) => decode(&original)?,
+                None => original_start_spec(db, &p.pool_id, &old.member.member_id, Some(store))?
+                    .ok_or(Fault::Unavailable)?,
+            }
+        }
+    };
+    let candidate = new_binding(
+        p,
+        &old.member.name,
+        &old.member.role,
+        &old.member.task,
+        None,
+    );
+    let mut next_roster = roster.to_vec();
+    let position = next_roster
+        .iter()
+        .position(|binding| binding.member.member_id == old.member.member_id)
+        .ok_or(Fault::Internal)?;
+    next_roster[position] = candidate.clone();
+    let intro = format!(
+        "{}\nThis replacement member becomes current only after Pool verifies its qualified launch; until then pool_get and pool_join return not ready.\n",
+        onboarding(p, &next_roster, &candidate.member)?
+    );
+    let submitted = crate::managed_enrollment::managed_spec(&spec, &route.role, &intro)?;
+    let slot: String = db.query_row(
+        "SELECT COALESCE((SELECT slot FROM member_slots WHERE member=?1),?1)",
+        [&old.member.member_id],
+        |row| row.get(0),
+    )?;
+    let generation: Option<Vec<u8>> = db
+        .query_row(
+            "SELECT generation FROM managed_bindings WHERE member=?1",
+            [&old.member.member_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let generation = generation
+        .map(|value| {
+            <[u8; 8]>::try_from(value.as_slice())
+                .map(u64::from_be_bytes)
+                .map_err(|_| Fault::Internal)
+        })
+        .transpose()?;
+    Ok(ManagedReplacement {
+        freeze: crate::managed_enrollment::ReplacementFreeze {
+            old: old.clone(),
+            generation,
+            slot,
+            candidate: candidate.clone(),
+            target: crate::run_status::Target {
+                agent_id: agent_id.to_owned(),
+                sequence,
+                execution_ref: reference.to_owned(),
+                pin_id: pin.to_owned(),
+            },
+            store_id: store.to_owned(),
+            submitted,
+        },
+        candidate,
+        original: spec,
+    })
+}
 /// Keeps roster edits from invalidating a still-recoverable group admission or replacement.
 fn batch_pending(db: &Connection, pool_id: &str) -> Result<bool, Fault> {
+    if crate::managed_enrollment::replacement_open(db, pool_id)? {
+        return Ok(true);
+    }
     let mut stmt = db.prepare("SELECT data FROM effects WHERE pool=?1 AND state IN ('queued','inflight','unknown','custody')")?;
     for row in stmt.query_map([pool_id], |r| r.get::<_, String>(0))? {
         let effect: Effect = decode(&row?)?;
@@ -3962,6 +4329,9 @@ fn batch_pending(db: &Connection, pool_id: &str) -> Result<bool, Fault> {
 }
 /// An admission that can still change the roster prevents the completion CAS.
 pub(crate) fn completion_admission_pending(db: &Connection, pool_id: &str) -> Result<bool, Fault> {
+    if crate::managed_enrollment::admission_open(db, pool_id)? {
+        return Ok(true);
+    }
     let mut stmt = db.prepare("SELECT data FROM effects WHERE pool=?1 AND state IN ('queued','inflight','unknown','custody')")?;
     for row in stmt.query_map([pool_id], |r| r.get::<_, String>(0))? {
         let effect: Effect = decode(&row?)?;
@@ -4088,6 +4458,9 @@ fn completed_admission_notice(db: &Connection, effect: &Effect) -> Result<(), Fa
 }
 /// Prevents decisions and enrollment from changing the frozen replacement roster.
 fn replacement_pending(db: &Connection, pool_id: &str) -> Result<bool, Fault> {
+    if crate::managed_enrollment::replacement_open(db, pool_id)? {
+        return Ok(true);
+    }
     let mut stmt = db.prepare("SELECT data FROM effects WHERE pool=?1 AND state IN ('queued','inflight','unknown','custody')")?;
     for row in stmt.query_map([pool_id], |row| row.get::<_, String>(0))? {
         let effect: Effect = decode(&row?)?;
@@ -4494,7 +4867,7 @@ fn owner_address(db: &Connection, owner: &str) -> Result<String, Fault> {
     )
 }
 /// Makes only an unfinished proposal stale; accepted results remain immutable.
-fn stale(p: &mut Pool) {
+pub(crate) fn stale(p: &mut Pool) {
     if let Some(x) = p.proposal.as_mut()
         && x.state == ProposalState::Open
     {
@@ -4502,8 +4875,12 @@ fn stale(p: &mut Pool) {
     }
 }
 /// Retires access and locally queued work without claiming recall of inflight provider effects.
-fn remove_binding(db: &Connection, b: &Binding, p: &Pool) -> Result<(), Fault> {
+pub(crate) fn remove_binding(db: &Connection, b: &Binding, p: &Pool) -> Result<(), Fault> {
     save_binding(db, b, false)?;
+    // A removed P3 enrollee keeps its admitted root and pin as unassigned or
+    // retired history; it is never bound or activated afterwards.
+    db.execute("UPDATE managed_enrollment_jobs SET state='retired' WHERE member=?1 AND state IN ('bound_pending_join','active')",[&b.member.member_id])?;
+    db.execute("UPDATE managed_enrollment_jobs SET state='unassigned',attention='member_removed' WHERE member=?1 AND state='admitted'",[&b.member.member_id])?;
     db.execute(
         "UPDATE effects SET state='cancelled' WHERE member=?1 AND state IN ('queued','awaiting_binding')",
         [&b.member.member_id],
@@ -4566,7 +4943,12 @@ pub(crate) fn completion_effects(
     Ok((effect_id, text))
 }
 /// Sends exactly one independent membership-ending notice, with no remaining roster or private data.
-fn final_notice(db: &Connection, p: &Pool, b: &Binding, event_id: u64) -> Result<(), Fault> {
+pub(crate) fn final_notice(
+    db: &Connection,
+    p: &Pool,
+    b: &Binding,
+    event_id: u64,
+) -> Result<(), Fault> {
     let possible_start:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM effects WHERE member=?1 AND state IN ('inflight','unknown','custody'))",[&b.member.member_id],|r|r.get(0))?;
     if b.address.is_some() || b.run_id.is_some() || possible_start {
         let address = b.address.as_deref().unwrap_or("");
@@ -4586,11 +4968,11 @@ fn final_notice(db: &Connection, p: &Pool, b: &Binding, event_id: u64) -> Result
     Ok(())
 }
 /// Stable producer-private Bridge scope for one never-reused membership incarnation.
-fn scope(member: &str) -> String {
+pub(crate) fn scope(member: &str) -> String {
     format!("agent-pool:member:{member}")
 }
 /// Appends safe event data and returns its actual monotonic SQLite cursor.
-fn append_event(
+pub(crate) fn append_event(
     db: &Connection,
     p: &Pool,
     kind: &str,
@@ -4738,7 +5120,7 @@ fn queue(db: &Connection, pool: &str, member: Option<&str>, work: Work) -> Resul
     Ok(e.effect_id)
 }
 /// Enqueues a bounded exact payload; over-budget output aborts the entire originating transaction.
-fn queue_delivery(
+pub(crate) fn queue_delivery(
     db: &Connection,
     pool: &str,
     member: Option<&str>,
@@ -4776,7 +5158,7 @@ fn queue_delivery(
     Ok(())
 }
 /// Sends safe system/message events to current members, excluding the caller's redundant wakeup.
-fn system_deliveries(
+pub(crate) fn system_deliveries(
     db: &Connection,
     p: &Pool,
     e: &Event,
@@ -4864,7 +5246,7 @@ fn notification(p: &Pool, roster: &[Binding], e: &Event) -> Result<String, Fault
     }
 }
 /// Creates mandatory onboarding with communication rules and a version-specific join instruction.
-fn onboarding(p: &Pool, roster: &[Binding], member: &Member) -> Result<String, Fault> {
+pub(crate) fn onboarding(p: &Pool, roster: &[Binding], member: &Member) -> Result<String, Fault> {
     let (preview, length) = purpose_preview(&p.purpose);
     let purpose = if length.is_some() {
         format!("{preview} (full purpose: pool_get section=content field=purpose)")
@@ -4946,7 +5328,12 @@ fn effect(db: &Connection, id: &str) -> Result<Effect, Fault> {
     Ok(e)
 }
 /// Returns an exact retained receipt or rejects idempotency-key reuse with different intent.
-fn replay(db: &Connection, scope: &str, key: &str, digest: &str) -> Result<Option<Reply>, Fault> {
+pub(crate) fn replay(
+    db: &Connection,
+    scope: &str,
+    key: &str,
+    digest: &str,
+) -> Result<Option<Reply>, Fault> {
     let row: Option<(String, String)> = db
         .query_row(
             "SELECT digest,receipt FROM requests WHERE scope=?1 AND key=?2",
@@ -4961,7 +5348,7 @@ fn replay(db: &Connection, scope: &str, key: &str, digest: &str) -> Result<Optio
     }
 }
 /// Saves one complete safe receipt in the same transaction as its effect intents.
-fn remember(
+pub(crate) fn remember(
     db: &Connection,
     scope: &str,
     key: &str,
@@ -7463,7 +7850,7 @@ mod tests {
             s.db.transaction_with_behavior(TransactionBehavior::Immediate)
                 .unwrap();
         assert!(matches!(
-            execute(&tx, &owner, &explicit),
+            execute(&tx, &owner, &explicit, None),
             Ok(Reply::Receipt(_))
         ));
         tx.rollback().unwrap();

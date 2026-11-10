@@ -37,6 +37,8 @@ pub enum Operation {
     ManagedCapacity(IdentityParams),
     /// One bounded section of an exact immutable completion record.
     CompletionGet(crate::completion::GetRequest),
+    /// One P3 managed enrollment's bounded per-job facts; never contacts Run.
+    EnrollmentGet(domain::EnrollmentGet),
     /// One independently paged section; mappings require an explicit opt-in.
     Get(Get),
 }
@@ -256,6 +258,10 @@ impl Request {
         match &self.operation {
             Operation::Identity(_) | Operation::ManagedCapacity(_) => Ok(()),
             Operation::CompletionGet(args) => args.validate(),
+            Operation::EnrollmentGet(args) => {
+                domain::identifier(&args.pool_id)?;
+                domain::identifier(&args.enrollment_id)
+            }
             Operation::List(args) => domain::Command::List(args.clone()).validate(),
             Operation::InventorySnapshot(args) => {
                 if !(1..=10).contains(&args.limit) {
@@ -305,6 +311,7 @@ impl Request {
             Operation::InventorySnapshot(_) => "inventory_snapshot",
             Operation::ManagedCapacity(_) => "managed_capacity",
             Operation::CompletionGet(_) => "completion_page",
+            Operation::EnrollmentGet(_) => "enrollment",
             Operation::Get(ref args) if args.section == "run_proof" => "run_proof",
             Operation::Get(_) => "pool_detail",
         }
@@ -363,6 +370,8 @@ pub enum Data {
     RunProof(#[serde(deserialize_with = "crate::integrations::json_object")] Box<RunProof>),
     /// One verified, cursor-fenced completion record page.
     Completion(Box<crate::completion::Page>),
+    /// One owner-visible managed enrollment projection.
+    Enrollment(Box<domain::EnrollmentView>),
 }
 /// Whether the status source returned a validated snapshot for this membership.
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -619,6 +628,7 @@ impl Envelope {
                 "managed_capacity_v1".into(),
                 "completion_record_v1".into(),
                 "inventory_completion_v1".into(),
+                "managed_enrollment_v1".into(),
             ],
             observed_at_unix_ms: now()?,
         }))
@@ -717,6 +727,7 @@ pub async fn frontend(request: Request, path: &Path) -> Result<Envelope, Fault> 
                     | ("pool_detail", Data::Detail(_))
                     | ("run_proof", Data::RunProof(_))
                     | ("completion_page", Data::Completion(_))
+                    | ("enrollment", Data::Enrollment(_))
             )
         }) {
             return Err(Fault::Unavailable);

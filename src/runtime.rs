@@ -664,6 +664,504 @@ mod managed_dispatch {
     }
 }
 
+/// P3 owner enrollment reconciliation. Every key and payload is durable before
+/// Run I/O; recovery uses only the original key, never a new start.
+pub(crate) mod enrollment_dispatch {
+    use super::*;
+    use crate::managed_enrollment::{
+        self as journal, Attested, EnrollmentRoute, Failure, Key, Lookup, OldStatus, StartReceipt,
+        Switch,
+    };
+    use crate::managed_run::RunPeer;
+    use crate::run_status::Target;
+    use serde_json::Value;
+    use std::{future::Future, pin::Pin};
+
+    pub(crate) type Response<'a, T> = Pin<Box<dyn Future<Output = Result<T, Failure>> + Send + 'a>>;
+
+    /// Authenticated Run enrollment operations and the old-lineage status read.
+    pub(crate) trait Client: Send + Sync {
+        /// Currently configured route identity, compared with every frozen key.
+        fn route(&self) -> EnrollmentRoute;
+        /// Whether NEW admissions are switched on.
+        fn switch_enabled(&self) -> bool;
+        fn enabled(&self) -> Response<'_, ()>;
+        fn submit<'a>(&'a self, params: &'a Value) -> Response<'a, StartReceipt>;
+        fn lookup<'a>(&'a self, key: &'a Key) -> Response<'a, Lookup>;
+        fn abort<'a>(&'a self, key: &'a Key) -> Response<'a, Lookup>;
+        fn current<'a>(
+            &'a self,
+            key: &'a Key,
+            member: &'a str,
+            request: &'a str,
+        ) -> Response<'a, Attested>;
+        fn status<'a>(
+            &'a self,
+            store: &'a str,
+            target: &'a Target,
+        ) -> Pin<Box<dyn Future<Output = OldStatus> + Send + 'a>>;
+    }
+
+    /// The configured route for NEW enrollments; absent when not fully provisioned.
+    pub(crate) fn configured_route(config: &Config, pool_store: &str) -> Option<EnrollmentRoute> {
+        let transport = config.managed_run_transport.as_ref()?;
+        let peer = RunPeer::from_config(config, pool_store).ok()?;
+        Some(EnrollmentRoute {
+            run: peer.endpoint_pin(),
+            pool_route: peer.pool_route.clone(),
+            bridge_route: peer.bridge_route.clone(),
+            producer: peer.producer.clone(),
+            role: transport.managed_role.clone().unwrap_or_default(),
+            status: configured_run_route(config).ok(),
+        })
+    }
+
+    /// Production client over the pinned Run attempt endpoint and public status socket.
+    pub(crate) struct Live {
+        config: Config,
+        peer: RunPeer,
+        route: EnrollmentRoute,
+    }
+    impl Live {
+        pub(crate) fn new(config: &Config, pool_store: &str) -> Option<Self> {
+            Some(Self {
+                config: config.clone(),
+                peer: RunPeer::from_config(config, pool_store).ok()?,
+                route: configured_route(config, pool_store)?,
+            })
+        }
+    }
+    impl Client for Live {
+        fn route(&self) -> EnrollmentRoute {
+            self.route.clone()
+        }
+        fn switch_enabled(&self) -> bool {
+            self.config
+                .managed_run_transport
+                .as_ref()
+                .is_some_and(|transport| transport.enrollment_enabled)
+        }
+        fn enabled(&self) -> Response<'_, ()> {
+            Box::pin(async move { self.peer.enrollment_enabled().await })
+        }
+        fn submit<'a>(&'a self, params: &'a Value) -> Response<'a, StartReceipt> {
+            Box::pin(async move { self.peer.enrollment_submit(params).await })
+        }
+        fn lookup<'a>(&'a self, key: &'a Key) -> Response<'a, Lookup> {
+            Box::pin(async move { self.peer.enrollment_lookup(key).await })
+        }
+        fn abort<'a>(&'a self, key: &'a Key) -> Response<'a, Lookup> {
+            Box::pin(async move { self.peer.enrollment_abort(key).await })
+        }
+        fn current<'a>(
+            &'a self,
+            key: &'a Key,
+            member: &'a str,
+            request: &'a str,
+        ) -> Response<'a, Attested> {
+            Box::pin(async move { self.peer.enrollment_current(key, member, request).await })
+        }
+        fn status<'a>(
+            &'a self,
+            store: &'a str,
+            target: &'a Target,
+        ) -> Pin<Box<dyn Future<Output = OldStatus> + Send + 'a>> {
+            Box::pin(async move {
+                let pinned = self.route.status.as_ref();
+                if !configured_run_route(&self.config).is_ok_and(|configured| {
+                    pinned.is_some_and(|route| {
+                        configured.socket == route.socket
+                            && configured.expected_uid == route.expected_uid
+                            && configured.peer_uid == route.peer_uid
+                    })
+                }) {
+                    return OldStatus::Unavailable;
+                }
+                let Ok(snapshot) =
+                    integrations::run_status(&self.config, store, std::slice::from_ref(target))
+                        .await
+                else {
+                    return OldStatus::Unavailable;
+                };
+                let Some(item) = snapshot.items().next() else {
+                    return OldStatus::Unavailable;
+                };
+                match item.replacement_precondition() {
+                    Some(target) => OldStatus::Ready(target),
+                    None if item.replacement_not_ready() => OldStatus::NotReady,
+                    None => OldStatus::Unavailable,
+                }
+            })
+        }
+    }
+
+    /// Fixed bounded diagnostic of one Run job snapshot.
+    fn job_reason(state: &journal::JobState) -> &'static str {
+        match (state.state.as_str(), state.failure_code.as_deref()) {
+            (_, Some("preparation_rejected")) => "preparation_rejected",
+            (_, Some("supervisor_spawn_failed")) => "supervisor_spawn_failed",
+            (_, Some(_)) => "execution_failed",
+            ("not_started", None) => "not_started",
+            ("starting", None) => "starting",
+            ("qualification_pending", None) => "qualification_pending",
+            ("qualified", None) => "attempt_not_ready",
+            ("terminal", None) => "terminal",
+            _ => "unknown",
+        }
+    }
+
+    fn lookup_matches(enrollment: &journal::Enrollment, lookup: &Lookup) -> bool {
+        lookup.version == 1
+            && lookup.store_id == enrollment.route.run.route.component_store_id
+            && lookup.request_id == enrollment.request_id
+            && Some(&lookup.fingerprint) == enrollment.fingerprint.as_ref()
+            && match lookup.state.as_str() {
+                "admitted" => lookup.receipt.is_some(),
+                "absent" | "aborted" => lookup.receipt.is_none() && lookup.jobs_state.is_empty(),
+                _ => false,
+            }
+    }
+
+    async fn note(store: &SharedStore, id: &str, code: &'static str) -> Result<(), Fault> {
+        let id = id.to_owned();
+        stored(store, move |store| {
+            journal::note(store.completion_db(), &id, code)
+        })
+        .await
+    }
+
+    async fn note_job(
+        store: &SharedStore,
+        id: &str,
+        index: usize,
+        code: &'static str,
+    ) -> Result<(), Fault> {
+        let id = id.to_owned();
+        stored(store, move |store| {
+            journal::note_job(store.completion_db(), &id, index, code)
+        })
+        .await
+    }
+
+    async fn apply_lookup(
+        store: &SharedStore,
+        enrollment: &journal::Enrollment,
+        lookup: Lookup,
+    ) -> Result<bool, Fault> {
+        if !lookup_matches(enrollment, &lookup) {
+            note(store, &enrollment.id, "outcome_unknown").await?;
+            return Ok(false);
+        }
+        let id = enrollment.id.clone();
+        match (lookup.state.as_str(), lookup.receipt) {
+            ("admitted", Some(receipt)) => {
+                let recorded = stored(store, move |store| {
+                    journal::record_admission(store.completion_db(), &id, &receipt)
+                })
+                .await;
+                if recorded.is_err() {
+                    note(store, &enrollment.id, "receipt_mismatch").await?;
+                }
+                Ok(false)
+            }
+            ("aborted", None) => {
+                stored(store, move |store| {
+                    journal::record_aborted(store.completion_db(), &id)
+                })
+                .await?;
+                Ok(false)
+            }
+            _ => Ok(true),
+        }
+    }
+
+    async fn submit<C: Client>(
+        store: &SharedStore,
+        client: &C,
+        enrollment: &journal::Enrollment,
+        first: bool,
+    ) -> Result<(), Fault> {
+        let params = enrollment.params.as_ref().ok_or(Fault::Internal)?;
+        let id = enrollment.id.clone();
+        match client.submit(params).await {
+            Ok(receipt) => {
+                let recorded = stored(store, move |store| {
+                    journal::record_admission(store.completion_db(), &id, &receipt)
+                })
+                .await;
+                if recorded.is_err() {
+                    note(store, &enrollment.id, "receipt_mismatch").await?;
+                }
+            }
+            Err(Failure::Refused(code)) => {
+                stored(store, move |store| {
+                    journal::record_refusal(store.completion_db(), &id, code, first)
+                })
+                .await?;
+            }
+            Err(Failure::Aborted) => {
+                stored(store, move |store| {
+                    journal::record_aborted(store.completion_db(), &id)
+                })
+                .await?;
+            }
+            Err(failure) => note(store, &enrollment.id, failure.code()).await?,
+        }
+        Ok(())
+    }
+
+    /// Advance one enrollment at most one Run step per call.
+    pub(crate) async fn drive<C: Client>(
+        store: &SharedStore,
+        client: &C,
+        id: &str,
+    ) -> Result<(), Fault> {
+        let load_id = id.to_owned();
+        let (mut enrollment, jobs) = stored(store, move |store| {
+            journal::load(store.completion_db(), &load_id)
+        })
+        .await?;
+        if !client.route().same_identity(&enrollment.route) {
+            return note(store, id, "route_changed").await;
+        }
+        match enrollment.state.as_str() {
+            "reserved" => {
+                if !client.switch_enabled() {
+                    let id = id.to_owned();
+                    return stored(store, move |store| {
+                        journal::refuse_unsubmitted(
+                            store.completion_db(),
+                            &id,
+                            "capability_missing",
+                        )
+                    })
+                    .await;
+                }
+                if let (Some(replacement), None) =
+                    (enrollment.replacement.clone(), enrollment.params.as_ref())
+                {
+                    let id = id.to_owned();
+                    match client
+                        .status(&replacement.store_id, &replacement.target)
+                        .await
+                    {
+                        OldStatus::Ready(precondition) => {
+                            stored(store, move |store| {
+                                journal::freeze_precondition(
+                                    store.completion_db(),
+                                    &id,
+                                    &precondition,
+                                )
+                            })
+                            .await?;
+                        }
+                        OldStatus::NotReady => {
+                            return stored(store, move |store| {
+                                journal::refuse_unsubmitted(
+                                    store.completion_db(),
+                                    &id,
+                                    "precondition_failed",
+                                )
+                            })
+                            .await;
+                        }
+                        OldStatus::Unavailable => return note(store, &id, "run_unavailable").await,
+                    }
+                    let load_id = enrollment.id.clone();
+                    enrollment = stored(store, move |store| {
+                        journal::load(store.completion_db(), &load_id)
+                    })
+                    .await?
+                    .0;
+                }
+                match client.enabled().await {
+                    Ok(()) => {}
+                    Err(Failure::Refused(_)) => {
+                        let id = id.to_owned();
+                        return stored(store, move |store| {
+                            journal::refuse_unsubmitted(
+                                store.completion_db(),
+                                &id,
+                                "capability_missing",
+                            )
+                        })
+                        .await;
+                    }
+                    Err(_) => return note(store, id, "run_unavailable").await,
+                }
+                let begin = id.to_owned();
+                stored(store, move |store| {
+                    journal::begin_submit(store.completion_db(), &begin)
+                })
+                .await?;
+                submit(store, client, &enrollment, true).await
+            }
+            "submit_possible" => {
+                let begin = id.to_owned();
+                stored(store, move |store| {
+                    journal::begin_recovery(store.completion_db(), &begin)
+                })
+                .await?;
+                let key = enrollment.key()?;
+                if enrollment.abort_requested {
+                    return match client.abort(&key).await {
+                        Ok(lookup) if lookup.state != "absent" => {
+                            apply_lookup(store, &enrollment, lookup).await.map(|_| ())
+                        }
+                        Ok(_) => note(store, id, "outcome_unknown").await,
+                        Err(failure) => note(store, id, failure.code()).await,
+                    };
+                }
+                match client.lookup(&key).await {
+                    Ok(lookup) => {
+                        if apply_lookup(store, &enrollment, lookup).await? {
+                            // Absent is only a snapshot: replay the SAME key and payload.
+                            submit(store, client, &enrollment, false).await?;
+                        }
+                        Ok(())
+                    }
+                    // A prepared Run key continues only through same-key replay.
+                    Err(Failure::InProgress) => submit(store, client, &enrollment, false).await,
+                    Err(failure) => note(store, id, failure.code()).await,
+                }
+            }
+            "admitted" => {
+                let key = enrollment.key()?;
+                for job in jobs.iter().filter(|job| job.state == "admitted") {
+                    observe(store, client, &enrollment, &key, job).await?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    async fn observe<C: Client>(
+        store: &SharedStore,
+        client: &C,
+        enrollment: &journal::Enrollment,
+        key: &Key,
+        job: &journal::Job,
+    ) -> Result<(), Fault> {
+        let id = enrollment.id.clone();
+        let index = job.index;
+        let Some((request, fresh)) = stored(store, move |store| {
+            journal::stage_observation(store.completion_db(), &id, index)
+        })
+        .await?
+        else {
+            return Ok(());
+        };
+        let settle = |retain: bool| {
+            let id = enrollment.id.clone();
+            let request = request.clone();
+            async move {
+                stored(store, move |store| {
+                    journal::settle_observation(store.completion_db(), &id, index, &request, retain)
+                })
+                .await
+            }
+        };
+        match client.current(key, &job.member, &request).await {
+            // A replay of an uncertain earlier observation is never fresh authority.
+            Ok(_) if !fresh => settle(false).await,
+            Ok(attested) => {
+                let attested = Arc::new(attested);
+                if enrollment.mode == "start" {
+                    let id = enrollment.id.clone();
+                    let bound = Arc::clone(&attested);
+                    let result = stored(store, move |store| {
+                        journal::bind_attested(store.completion_db(), &id, index, &bound)
+                    })
+                    .await;
+                    settle(false).await?;
+                    match result {
+                        Ok(_) => Ok(()),
+                        Err(Fault::Conflict) => {
+                            note_job(store, &enrollment.id, index, "address_conflict").await
+                        }
+                        Err(_) => {
+                            note_job(store, &enrollment.id, index, "attestation_mismatch").await
+                        }
+                    }
+                } else {
+                    let replacement = enrollment.replacement.as_ref().ok_or(Fault::Internal)?;
+                    let precondition: Target = serde_json::from_value(
+                        enrollment
+                            .params
+                            .as_ref()
+                            .and_then(|params| params["preconditions"].get(0))
+                            .cloned()
+                            .ok_or(Fault::Internal)?,
+                    )
+                    .map_err(|_| Fault::Internal)?;
+                    let status = client.status(&replacement.store_id, &precondition).await;
+                    let outcome = match status {
+                        OldStatus::Ready(latest) if latest == precondition => {
+                            let id = enrollment.id.clone();
+                            let switched = Arc::clone(&attested);
+                            stored(store, move |store| {
+                                journal::switch(store.completion_db(), &id, &switched)
+                            })
+                            .await
+                        }
+                        OldStatus::Ready(_) | OldStatus::NotReady => {
+                            Ok(Switch::Attention("old_resumed"))
+                        }
+                        OldStatus::Unavailable => Ok(Switch::Attention("run_unavailable")),
+                    };
+                    settle(false).await?;
+                    match outcome {
+                        Ok(Switch::Attention(code)) => note(store, &enrollment.id, code).await,
+                        Ok(_) => Ok(()),
+                        Err(Fault::Conflict) => {
+                            note_job(store, &enrollment.id, index, "address_conflict").await
+                        }
+                        Err(_) => {
+                            note_job(store, &enrollment.id, index, "attestation_mismatch").await
+                        }
+                    }
+                }
+            }
+            Err(Failure::NotReady) => {
+                settle(true).await?;
+                let reason = match client.lookup(key).await {
+                    Ok(lookup) if lookup_matches(enrollment, &lookup) => lookup
+                        .jobs_state
+                        .iter()
+                        .find(|state| state.index == index && state.member_id == job.member)
+                        .map_or("attempt_not_ready", job_reason),
+                    _ => "attempt_not_ready",
+                };
+                note_job(store, &enrollment.id, index, reason).await
+            }
+            Err(failure @ (Failure::Stale | Failure::Refused(_) | Failure::Aborted)) => {
+                settle(false).await?;
+                note_job(store, &enrollment.id, index, failure.code()).await
+            }
+            Err(failure) => note_job(store, &enrollment.id, index, failure.code()).await,
+        }
+    }
+
+    /// Bounded pass over pending enrollments; one enrollment's failure never stops others.
+    pub(crate) async fn reconcile<C: Client>(
+        store: &SharedStore,
+        client: &C,
+        stopped: &watch::Receiver<bool>,
+    ) -> Result<(), Fault> {
+        let pending = stored(store, |store| journal::pending(store.completion_db())).await?;
+        for id in pending {
+            if *stopped.borrow() {
+                return Ok(());
+            }
+            if drive(store, client, &id).await.is_err() {
+                eprintln!("managed enrollment reconciliation deferred");
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Egress performs Run reads and Bridge calls outside the Store mutex.
 mod managed_egress_dispatch {
     use super::*;
@@ -1450,9 +1948,15 @@ async fn managed_session(
         _ => return Err(Fault::Unauthorized),
     }
     let (command, normalized) = crate::managed_codec::normalize_command(begin.command.clone())?;
+    // Owner operations never run under participant authority. A managed join is
+    // admitted only by the P3 enrollment gate inside the domain CAS.
     if matches!(
         command,
-        Command::Join(_) | Command::Start(_) | Command::StartBatch(_) | Command::Replace(_)
+        Command::Start(_)
+            | Command::StartBatch(_)
+            | Command::Replace(_)
+            | Command::EnrollmentGet(_)
+            | Command::EnrollmentResolve(_)
     ) || matches!(&command, Command::Get(get) if get.wait_seconds > 0.0)
     {
         return Err(Fault::Unavailable);
@@ -2296,7 +2800,10 @@ async fn owner_run_proof(
     Ok(Data::RunProof(Box::new(output)))
 }
 
-/// Refuses managed enrollment until Run can prove the current execution and caller attempt.
+/// The legacy Bridge-only path has no Run attempt proof, so it never joins a
+/// Run-started member. P3 enrollees join only through the managed session,
+/// where `managed_enrollment::join_gate` checks the owner receipt, the
+/// qualified enrollment binding, the fresh P1 proof and the pending CAS.
 async fn verify_managed_join(
     store: &SharedStore,
     actor: &Actor,
@@ -2371,10 +2878,25 @@ pub async fn repin(config_path: &Path) -> Result<(i64, i64), Fault> {
     tokio::task::spawn_blocking(move || crate::managed_bridge::discover(&bridge, &expected))
         .await
         .map_err(|_| Fault::Unavailable)?
-        .map_err(crate::managed_bridge::fault)?;
+        .map_err(|error| {
+            eprintln!(
+                "repin: Bridge capability/issuer discovery failed on the configured route ({}); no pin was changed",
+                match error {
+                    crate::managed_bridge::BridgeFailure::RelaunchRequired => "relaunch_required",
+                    crate::managed_bridge::BridgeFailure::Refused => "peer_not_authorized",
+                    _ => "route_unavailable",
+                }
+            );
+            crate::managed_bridge::fault(error)
+        })?;
     peer.current_pin("attempt_current_ingress_v1")
         .await
-        .map_err(|_| Fault::Unavailable)?;
+        .map_err(|_| {
+            eprintln!(
+                "repin: Run attempt capability discovery failed on the configured route (route_unavailable); no pin was changed"
+            );
+            Fault::Unavailable
+        })?;
     store.managed_repin_routes(&bridge_pin, &run_pin, &peer.pool_route, true)
 }
 
@@ -2398,11 +2920,20 @@ pub async fn serve(config_path: &Path) -> Result<(), Fault> {
         }
     }
     let database_path = config.database_path.clone();
-    let store = Arc::new(Mutex::new(
-        tokio::task::spawn_blocking(move || Store::open(&database_path))
-            .await
-            .map_err(|_| Fault::Internal)??,
-    ));
+    let mut opened = tokio::task::spawn_blocking(move || Store::open(&database_path))
+        .await
+        .map_err(|_| Fault::Internal)??;
+    if config
+        .managed_run_transport
+        .as_ref()
+        .is_some_and(|transport| transport.enrollment_enabled)
+    {
+        let pool_store = opened.managed_store_id()?;
+        opened.configure_enrollment(Some(
+            enrollment_dispatch::configured_route(&config, &pool_store).ok_or(Fault::Invalid)?,
+        ));
+    }
+    let store = Arc::new(Mutex::new(opened));
     let (listener, _guard) = listener(&config).await?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|_| Fault::Unavailable)?;
@@ -3199,6 +3730,18 @@ async fn recover_namespace_retirement(config: &Config, store: &SharedStore) -> R
         Err(_) => return Ok(()),
     };
     if plan.is_none() {
+        // E11: a failed issuer discovery is durable owner attention with
+        // bounded backoff; it never silently stops retirement.
+        if !stored(store, move |store| store.managed_discovery_due(now)).await? {
+            return Ok(());
+        }
+        let failed = |code: &'static str| async move {
+            eprintln!("namespace retirement deferred: {code}");
+            stored(store, move |store| {
+                store.managed_discovery_failed(code, now)
+            })
+            .await
+        };
         let cfg = config.clone();
         let route = peer.bridge_route.clone();
         let Ok(Ok((bridge, pin))) = tokio::task::spawn_blocking(move || {
@@ -3206,7 +3749,7 @@ async fn recover_namespace_retirement(config: &Config, store: &SharedStore) -> R
         })
         .await
         else {
-            return Ok(());
+            return failed("route_unavailable").await;
         };
         let candidate = pin.clone();
         let pinned_peer = peer.clone();
@@ -3220,16 +3763,21 @@ async fn recover_namespace_retirement(config: &Config, store: &SharedStore) -> R
         .await
         .is_err()
         {
-            return Ok(());
+            return failed("route_changed").await;
         }
         let expected = pin.route.component_store_id.clone();
-        let Ok(Ok(issuer)) = tokio::task::spawn_blocking(move || {
+        let issuer = match tokio::task::spawn_blocking(move || {
             crate::managed_bridge::discover(&bridge, &expected)
         })
         .await
-        else {
-            return Ok(());
+        {
+            Ok(Ok(issuer)) => issuer,
+            Ok(Err(crate::managed_bridge::BridgeFailure::RelaunchRequired)) => {
+                return failed("relaunch_required").await;
+            }
+            _ => return failed("route_unavailable").await,
         };
+        stored(store, |store| store.managed_discovery_succeeded()).await?;
         plan = stage(Some(issuer)).await.ok().flatten();
     }
     if let Some(plan) = plan {
@@ -3280,6 +3828,12 @@ async fn work(
             _ = interval.tick() => (),
         }
         recover_managed(&config, &store, &stopped, &activity).await?;
+        if config.managed_run_transport.is_some() {
+            let pool_store = stored(&store, |store| store.managed_store_id()).await?;
+            if let Some(client) = enrollment_dispatch::Live::new(&config, &pool_store) {
+                enrollment_dispatch::reconcile(&store, &client, &stopped).await?;
+            }
+        }
         recover_egress_scope(&config, &store, &activity).await?;
         recover_namespace_retirement(&config, &store).await?;
         if completion.is_none() {
@@ -7162,6 +7716,329 @@ mod tests {
         })
         .await?;
         assert_eq!(state, "committed");
+        Ok(())
+    }
+
+    /// P3: an owner-enrolled, generation-1 bound member joins through the full
+    /// managed frontend session (fake Bridge and Run endpoints, real local CAS).
+    #[tokio::test]
+    async fn p3_single_enrollment_session_join() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::managed_bridge::{BridgeB1Client, BridgeFailure};
+        use crate::managed_session::{ClientFrame, ServerFrame};
+        use crate::managed_state::tests::{
+            fake_bridge_pin, fake_config, fake_consumed, fake_run_endpoint, native_proof,
+        };
+
+        #[derive(Clone)]
+        struct Services {
+            binding: crate::managed_state::ManagedBinding,
+            incarnation: crate::managed_state::Incarnation,
+            receipt: crate::managed_state::CurrentReceipt,
+            command: Command,
+        }
+        impl managed_dispatch::IngressClient for Services {
+            fn current<'a>(
+                &'a self,
+                query: &'a crate::managed_run::IngressQuery,
+            ) -> managed_dispatch::Response<
+                'a,
+                crate::managed_run::CurrentAuthority,
+                crate::managed_run::RunError,
+            > {
+                Box::pin(async move {
+                    let mut receipt = self.receipt.clone();
+                    receipt.receipt_id = format!("session-{}", crate::domain::id());
+                    query
+                        .fixture_authority(receipt)
+                        .map_err(|_| crate::managed_run::RunError::Unknown)
+                })
+            }
+        }
+        impl managed_dispatch::Client for Services {
+            fn admit<'a>(
+                &'a self,
+                plan: &'a crate::managed_state::AdmissionPlan,
+            ) -> managed_dispatch::Response<
+                'a,
+                crate::managed_run::Admission,
+                crate::managed_run::RunError,
+            > {
+                Box::pin(async move {
+                    Ok(crate::managed_run::Admission {
+                        admission_id: "session-join-admission".into(),
+                        intent_id: plan.recovery.intent_id.clone(),
+                        security_digest: plan.recovery.security_digest.clone(),
+                        policy: "admission_snapshot".into(),
+                        binding: plan.binding.clone(),
+                        incarnation: self.incarnation.clone(),
+                        successor_proof: self.receipt.successor_proof.clone(),
+                        consumed_ref: plan.recovery.consumed_ref.clone(),
+                    })
+                })
+            }
+            fn consensus<'a>(
+                &'a self,
+                _: crate::managed_state::PendingConsensus,
+                _: &'a SharedStore,
+                _: &'a ManagedLease,
+            ) -> managed_dispatch::Response<'a, crate::managed_state::ConsensusFence> {
+                Box::pin(async move { Err(Fault::Unavailable) })
+            }
+        }
+        impl BridgeB1Client for Services {
+            fn capabilities(&self) -> Result<crate::managed_bridge::Capabilities, BridgeFailure> {
+                Ok(crate::managed_bridge::Capabilities {
+                    store_id: self.binding.bridge_route.component_store_id.clone(),
+                    issuer_epoch: "epoch".into(),
+                    capabilities: vec![
+                        "attempt_launch_v1".into(),
+                        "launch_assertion_v1".into(),
+                        "namespace_retirement_v1".into(),
+                    ],
+                })
+            }
+            fn prepare(
+                &self,
+                request: &crate::managed_bridge::Prepare<'_>,
+            ) -> Result<crate::managed_bridge::Prepared, BridgeFailure> {
+                if request.command_name != "pool_join" {
+                    return Err(BridgeFailure::Refused);
+                }
+                Ok(crate::managed_bridge::Prepared {
+                    store_id: self.binding.bridge_route.component_store_id.clone(),
+                    bridge_context_ref: bridge_sdk::bridge_protocol::Secret::new("join-ref"),
+                    invocation_key: request.invocation_key.into(),
+                    expires_at_ms: 2,
+                })
+            }
+            fn register(
+                &self,
+                request: &crate::managed_bridge::Registration<'_>,
+            ) -> Result<crate::managed_bridge::Registered, BridgeFailure> {
+                if request.command_name != "pool_join" {
+                    return Err(BridgeFailure::Refused);
+                }
+                Ok(crate::managed_bridge::Registered {
+                    store_id: self.binding.bridge_route.component_store_id.clone(),
+                    assertion_key: bridge_sdk::bridge_protocol::Secret::new("join-assertion"),
+                    invocation_key: request.invocation_key.into(),
+                    issuer_epoch: "epoch".into(),
+                    expires_at_ms: 2,
+                })
+            }
+            fn consume(
+                &self,
+                key: &crate::managed_bridge::ConsumeKey<'_>,
+                assertion: &bridge_sdk::bridge_protocol::Secret,
+            ) -> Result<crate::managed_bridge::Consumed, BridgeFailure> {
+                if assertion.expose() != "join-assertion" {
+                    return Err(BridgeFailure::Refused);
+                }
+                Ok(fake_consumed(
+                    &self.binding,
+                    &self.incarnation,
+                    key.consume_request_id,
+                    key.invocation_key,
+                    key.security_digest,
+                    &self.command,
+                ))
+            }
+            fn lookup(
+                &self,
+                _: &str,
+                _: &crate::managed_bridge::ConsumeKey<'_>,
+            ) -> Result<crate::managed_bridge::Consumed, BridgeFailure> {
+                Err(BridgeFailure::Refused)
+            }
+            fn abort(
+                &self,
+                _: &crate::managed_bridge::ConsumeKey<'_>,
+            ) -> Result<crate::managed_bridge::Abort, BridgeFailure> {
+                Err(BridgeFailure::Refused)
+            }
+        }
+        impl managed_dispatch::SessionClient for Services {
+            fn current_pin<'a>(
+                &'a self,
+            ) -> managed_dispatch::Response<'a, crate::managed_state::RunPin> {
+                Box::pin(async move {
+                    let endpoint = fake_run_endpoint(&self.binding);
+                    Ok(crate::managed_state::RunPin {
+                        route: endpoint.route,
+                        socket: endpoint.socket,
+                        executable: endpoint.executable,
+                        executable_sha256: endpoint.executable_sha256,
+                        capabilities: vec![
+                            "attempt_current_ingress_v1".into(),
+                            "attempt_admission_v1".into(),
+                        ],
+                    })
+                })
+            }
+            fn endpoint(&self) -> crate::managed_state::RunEndpointPin {
+                fake_run_endpoint(&self.binding)
+            }
+            fn pool_route(&self) -> crate::managed_state::Route {
+                crate::managed_state::Route {
+                    component_store_id: self.binding.pool_store_id.clone(),
+                    route_id: "pool-route".into(),
+                    worker_uid: self.binding.run_route.worker_uid,
+                }
+            }
+            fn consume(
+                &self,
+                key: &crate::managed_bridge::ConsumeKey<'_>,
+                assertion: &bridge_sdk::bridge_protocol::Secret,
+                server: &str,
+                command: &Command,
+                epoch: &str,
+            ) -> Result<crate::managed_bridge::Consumed, BridgeFailure> {
+                crate::managed_bridge::consume_original(
+                    self, key, assertion, server, command, epoch,
+                )
+            }
+        }
+
+        let mut harness = crate::enrollment_tests::Harness::new();
+        let (enrollment, member) = harness.bound_member("session").await;
+        let (binding, incarnation) = harness.managed_binding(&member).ok_or("binding")?;
+        let mut receipt = harness.ingress_for(&member, "session");
+        receipt.purpose = "ingress".into();
+        let revision = harness.revision();
+        let command = Command::Join(crate::domain::Change {
+            pool_id: harness.pool.clone(),
+            expected_revision: revision,
+            request_key: "session-join".into(),
+        });
+        let normalized = serde_json::to_value(&command)?;
+        let proof = native_proof();
+        let pin = fake_bridge_pin(&binding);
+        let services = Services {
+            binding: binding.clone(),
+            incarnation,
+            receipt,
+            command: command.clone(),
+        };
+        let mut config = fake_config(&binding);
+        let transport = config.managed_run_transport.as_mut().ok_or("transport")?;
+        transport.frontend_enabled = true;
+        transport.mcp_server = Some("pool".into());
+        let begin = crate::managed_session::Begin {
+            version: 1,
+            bootstrap_id: "join-bootstrap".into(),
+            invocation_key: "join-inv".into(),
+            command: normalized.clone(),
+            proof: proof.clone(),
+            bridge_pin: pin.clone(),
+        };
+        let store = Arc::clone(&harness.store);
+        let activity = Arc::new(ManagedActivity::default());
+        let lease = activity
+            .acquire(ManagedWork::Bootstrap("join-bootstrap".into()))?
+            .ok_or("lease")?;
+        let (mut client, mut server) = UnixStream::pair()?;
+        let task_store = Arc::clone(&store);
+        let task_activity = Arc::clone(&activity);
+        let task_services = services.clone();
+        let task_command = command.clone();
+        let task_normalized = normalized.clone();
+        let task_pin = pin.clone();
+        let task = tokio::spawn(async move {
+            managed_session_core(
+                &mut server,
+                &config,
+                &task_store,
+                &task_activity,
+                begin,
+                task_command,
+                task_normalized,
+                task_pin,
+                lease,
+                task_services,
+            )
+            .await
+        });
+        assert!(matches!(
+            crate::managed_session::receive::<ServerFrame>(&mut client).await?,
+            ServerFrame::Ready
+        ));
+        let epoch = crate::managed_bridge::discover(&services, &pin.route.component_store_id)
+            .map_err(|_| "fake discovery")?;
+        crate::managed_session::send(
+            &mut client,
+            &ClientFrame::Epoch {
+                issuer_epoch: epoch.clone(),
+            },
+        )
+        .await?;
+        assert!(matches!(
+            crate::managed_session::receive::<ServerFrame>(&mut client).await?,
+            ServerFrame::Reserved
+        ));
+        let prepared = services
+            .prepare(&crate::managed_bridge::Prepare {
+                request_id: "prepare",
+                expected_store_id: &pin.route.component_store_id,
+                expected_issuer_epoch: &epoch,
+                invocation_key: "join-inv",
+                command_name: "pool_join",
+                native_proof: &proof,
+            })
+            .map_err(|_| "fake prepare")?;
+        crate::managed_session::send(
+            &mut client,
+            &ClientFrame::Prepared {
+                store_id: prepared.store_id.clone(),
+                bridge_context_ref: prepared.bridge_context_ref.clone(),
+                invocation_key: prepared.invocation_key.clone(),
+                expires_at_ms: prepared.expires_at_ms,
+            },
+        )
+        .await?;
+        let ServerFrame::Context(frozen) =
+            crate::managed_session::receive::<ServerFrame>(&mut client).await?
+        else {
+            return Err("missing frozen context".into());
+        };
+        assert_eq!(frozen.context.bindings, vec![binding.clone()]);
+        let registration = crate::managed_bridge::Registration {
+            request_id: &frozen.registration_request_id,
+            expected_store_id: &prepared.store_id,
+            bridge_context_ref: prepared.bridge_context_ref.expose(),
+            invocation_key: &prepared.invocation_key,
+            command_name: "pool_join",
+            security_digest: &frozen.security_digest,
+            audience: "pool",
+            nonce: &frozen.context.nonce,
+            native_proof: &proof,
+        };
+        let registered = crate::managed_bridge::register_original(
+            &services,
+            &registration,
+            &prepared,
+            &epoch,
+            &command,
+        )
+        .map_err(|_| "fake register")?;
+        crate::managed_session::send(
+            &mut client,
+            &ClientFrame::Execute {
+                assertion_key: registered.assertion_key,
+            },
+        )
+        .await?;
+        let ServerFrame::Finished(Ok(Reply::Receipt(receipt))) =
+            crate::managed_session::receive::<ServerFrame>(&mut client).await?
+        else {
+            return Err("missing committed join receipt".into());
+        };
+        assert_eq!(receipt.event.kind, "member_joined");
+        task.await??;
+        assert_eq!(
+            harness.member(&member).0.member.state,
+            crate::domain::MemberState::Active
+        );
+        assert_eq!(harness.view(&enrollment).jobs[0].state, "active");
         Ok(())
     }
 

@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Added
+
+- P3 managed enrollment (schema v15): with the explicit
+  `managed_run_transport.enrollment_enabled` switch and exact `managed_role`,
+  owner `pool_start_agent`/`pool_start_batch` reserve members and a durable
+  enrollment journal before any Run I/O, submit Run `_managed_start_batch_v1`
+  under one permanent key, recover only by same-key submit/lookup/abort, bind
+  generation 1 from a qualified current attestation (or the first rootless
+  hook) and open managed `pool_join` only for owner-enrolled roots.
+- P3 conditioned replacement: `pool_replace` admits a new lineage and member ID
+  on the exact frozen old-lineage precondition and atomically retires the old
+  member when the qualified candidate is switched in.
+- Owner `pool_enrollment_get` and `pool_enrollment_resolve`
+  (`retain_unassigned`), and the observer `enrollment_get` operation with
+  capability `managed_enrollment_v1`.
+
 ### Changed
 
 - Upgrade persistent state to schema v5 so older binaries refuse durable replacement metadata.
@@ -12,6 +28,12 @@
 
 ### Fixed
 
+- E11 namespace retirement records durable owner attention
+  (`namespace_retirement_attention_<code>`) with capped backoff when Bridge
+  issuer discovery fails, instead of silently skipping retirement; `repin`
+  reports which discovery failed.
+- `bind_run` never overwrites a terminal (`refused`, `cancelled`,
+  `reconciliation_needed`) effect or a completed pool.
 - Isolate completion release keys per durable Pool store
   (`completion-keys/<store UUID>/`) so Pool databases sharing one private parent
   never sweep each other's keys; startup migrates only this store's owned legacy
