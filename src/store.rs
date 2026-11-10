@@ -276,15 +276,19 @@ fn inventory_snapshot_inner(
         None
     };
     let returned = pools.len();
+    let completed = crate::completion::completed_count(&tx)?;
+    if completed < 0 || completed > total {
+        return Err(Fault::Internal);
+    }
     let totals = InventoryTotals {
         total: total.to_string(),
-        open: None,
-        completed: None,
-        unknown: total.to_string(),
+        open: Some((total - completed).to_string()),
+        completed: Some(completed.to_string()),
+        unknown: "0".into(),
         closed: closed.to_string(),
     };
     tx.commit()?;
-    Ok(Data::Inventory(Box::new(InventorySnapshot { source, totals, coverage: "Retained Pool rows only; completion classification unsupported, all retained pools unknown. Closed is independent of completion. Pages and totals share one Pool SQLite snapshot; no cross-service or clone/restore anti-rollback guarantee.".into(), pools, returned, has_more, next_cursor, observed_at_unix_ms: crate::observer::now()? })))
+    Ok(Data::Inventory(Box::new(InventorySnapshot { source, totals, coverage: "Retained Pool rows only. Completed counts pools with a committed immutable completion record; every other retained pool is open, including accepted, closed, delivered or Run-succeeded pools without a record and all pools from before the completion ledger. Closed is independent of completion. Pages and totals share one Pool SQLite snapshot; no cross-service or clone/restore anti-rollback guarantee.".into(), pools, returned, has_more, next_cursor, observed_at_unix_ms: crate::observer::now()? })))
 }
 impl Store {
     pub(crate) fn managed_pin_routes(
@@ -801,6 +805,10 @@ impl Store {
             retirement,
         )
     }
+    /// P3-C ledger access for one bounded synchronous step; never held across I/O.
+    pub(crate) fn completion_db(&mut self) -> &mut Connection {
+        &mut self.db
+    }
     /// Grants unit fixtures direct access to the isolated SQLite connection.
     #[cfg(test)]
     pub(crate) fn test_db(&mut self) -> &mut Connection {
@@ -823,6 +831,9 @@ impl Store {
             Operation::InventorySnapshot(args) => {
                 inventory_snapshot(&self.db, &self.read_epoch, args)
             }
+            Operation::CompletionGet(args) => Ok(Data::Completion(Box::new(
+                crate::completion::page(&self.db, args)?,
+            ))),
             Operation::List(args) => {
                 let mut stmt = self
                     .db
@@ -936,7 +947,7 @@ impl Store {
             }
         }
     }
-    /// Opens one private database, takes a nonblocking writer lease and migrates to schema v9.
+    /// Opens one private database, takes a nonblocking writer lease and migrates to the current schema.
     /// The existing parent must be a real 0700 directory; future schemas and second writers refuse.
     pub fn open(path: &Path) -> Result<Self, Fault> {
         let parent = path.parent().ok_or(Fault::Invalid)?;
@@ -972,13 +983,13 @@ impl Store {
         let db = Connection::open(path)?;
         db.busy_timeout(Duration::from_secs(2))?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if !(0..=9).contains(&version) {
+        if !(0..=crate::completion::SCHEMA_VERSION).contains(&version) {
             return Err(Fault::Conflict);
         }
         db.execute_batch(
             "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;",
         )?;
-        if version < 9 {
+        if version < crate::completion::SCHEMA_VERSION {
             db.execute_batch("BEGIN IMMEDIATE;")?;
         }
         if version == 0 {
@@ -1018,6 +1029,14 @@ PRAGMA user_version=5;")?;
         if version < 9 {
             migrate_managed_review_fixes(&db)?;
             db.execute_batch("PRAGMA user_version=9;")?;
+        }
+        // COMPLETION MIGRATION (P3-C): one self-contained numbered step; renumber on rebase.
+        if version < crate::completion::SCHEMA_VERSION {
+            crate::completion::migrate(&db)?;
+            db.execute_batch(&format!(
+                "PRAGMA user_version={};",
+                crate::completion::SCHEMA_VERSION
+            ))?;
             db.execute_batch("COMMIT;")?;
         }
         // No detached egress/consensus read can survive a resident process restart.
@@ -2283,6 +2302,24 @@ fn execute_authorized(
         return Ok(reply);
     }
     if p.closed && !matches!(command, Command::ReleaseHistory(_)) {
+        return Err(Fault::Closed);
+    }
+    // C3: a committed completion freezes goal, roster, assignments, proposals and votes.
+    if matches!(
+        command,
+        Command::Update(_)
+            | Command::Add(_)
+            | Command::Start(_)
+            | Command::StartBatch(_)
+            | Command::Replace(_)
+            | Command::CancelReplacement(_)
+            | Command::MemberUpdate(_)
+            | Command::Remove(_)
+            | Command::Join(_)
+            | Command::Propose(_)
+            | Command::Vote(_)
+    ) && crate::completion::completed(db, pid)?
+    {
         return Err(Fault::Closed);
     }
     if !p.closed && matches!(command, Command::ReleaseHistory(_)) {
@@ -3903,6 +3940,43 @@ fn remove_binding(db: &Connection, b: &Binding, p: &Pool) -> Result<(), Fault> {
     }
     Ok(())
 }
+/// P3-C commit side effects inside the caller's completion CAS transaction:
+/// advance the pool revision, journal the completion and queue one owner notice.
+/// Returns the notice operation ID and its exact payload; delivery is not processing.
+pub(crate) fn completion_effects(
+    db: &Connection,
+    pool_id: &str,
+    completion_id: &str,
+) -> Result<(String, String), Fault> {
+    let (mut p, owner) = pool(db, pool_id)?;
+    p.revision = p.revision.checked_add(1).ok_or(Fault::Internal)?;
+    save_pool(db, &p)?;
+    append_event(
+        db,
+        &p,
+        "pool_completed",
+        Author::Service,
+        format!(
+            "Pool completed. Completion {completion_id}. Goal, roster, assignments, proposals and votes are now frozen; read the record with the owner completion_get operation."
+        ),
+        None,
+    )?;
+    let text = format!(
+        "Pool {pool_id} completed. Completion {completion_id}. The immutable record is available to the owner; this notice is not proof of processing."
+    );
+    let address = owner_address(db, &owner)?;
+    let effect_id = queue(
+        db,
+        pool_id,
+        None,
+        Work::Deliver {
+            address,
+            scope: format!("owner:{pool_id}"),
+            text: text.clone(),
+        },
+    )?;
+    Ok((effect_id, text))
+}
 /// Sends exactly one independent membership-ending notice, with no remaining roster or private data.
 fn final_notice(db: &Connection, p: &Pool, b: &Binding) -> Result<(), Fault> {
     let possible_start:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM effects WHERE member=?1 AND state IN ('inflight','unknown','custody'))",[&b.member.member_id],|r|r.get(0))?;
@@ -4344,7 +4418,7 @@ mod tests {
         let empty = inventory(&store, json!({"filter":"all","limit":1})).unwrap();
         assert_eq!(
             empty["data"]["totals"],
-            json!({"total":"0","open":null,"completed":null,"unknown":"0","closed":"0"})
+            json!({"total":"0","open":"0","completed":"0","unknown":"0","closed":"0"})
         );
         assert_eq!(empty["data"]["returned"], 0);
         assert_eq!(empty["data"]["has_more"], false);
@@ -4359,7 +4433,7 @@ mod tests {
         let page = inventory(&store, json!({"filter":"closed","limit":10})).unwrap();
         assert_eq!(
             page["data"]["totals"],
-            json!({"total":"2","open":null,"completed":null,"unknown":"2","closed":"1"})
+            json!({"total":"2","open":"2","completed":"0","unknown":"0","closed":"1"})
         );
         assert_eq!(page["data"]["returned"], 1);
         assert_eq!(page["data"]["pools"][0]["pool"]["closed"], true);
@@ -8648,6 +8722,10 @@ mod tests {
             }
             store
                 .db
+                .execute_batch(crate::completion::TEST_DROP_SCHEMA)
+                .unwrap();
+            store
+                .db
                 .execute_batch(&format!("PRAGMA user_version={prior_version}"))
                 .unwrap();
             drop(store);
@@ -8656,7 +8734,7 @@ mod tests {
                 .db
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 9);
+            assert_eq!(version, crate::completion::SCHEMA_VERSION);
             assert_eq!(
                 encode(&before).unwrap(),
                 encode(&upgraded.execute(&owner, &command).unwrap()).unwrap()
@@ -8693,6 +8771,10 @@ mod tests {
             }
             store
                 .db
+                .execute_batch(crate::completion::TEST_DROP_SCHEMA)
+                .unwrap();
+            store
+                .db
                 .execute_batch(&format!("PRAGMA user_version={prior}"))
                 .unwrap();
             drop(store);
@@ -8701,7 +8783,7 @@ mod tests {
                 .db
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 9);
+            assert_eq!(version, crate::completion::SCHEMA_VERSION);
             let retained: String = upgraded
                 .db
                 .query_row("SELECT store_id FROM inventory_source", [], |row| {

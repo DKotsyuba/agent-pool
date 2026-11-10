@@ -35,6 +35,8 @@ pub enum Operation {
     InventorySnapshot(InventoryRequest),
     /// Owner-only managed capacity and retained-fence diagnostics.
     ManagedCapacity(IdentityParams),
+    /// One bounded section of an exact immutable completion record.
+    CompletionGet(crate::completion::GetRequest),
     /// One independently paged section; mappings require an explicit opt-in.
     Get(Get),
 }
@@ -253,6 +255,7 @@ impl Request {
         }
         match &self.operation {
             Operation::Identity(_) | Operation::ManagedCapacity(_) => Ok(()),
+            Operation::CompletionGet(args) => args.validate(),
             Operation::List(args) => domain::Command::List(args.clone()).validate(),
             Operation::InventorySnapshot(args) => {
                 if !(1..=10).contains(&args.limit) {
@@ -301,6 +304,7 @@ impl Request {
             Operation::List(_) => "pool_page",
             Operation::InventorySnapshot(_) => "inventory_snapshot",
             Operation::ManagedCapacity(_) => "managed_capacity",
+            Operation::CompletionGet(_) => "completion_page",
             Operation::Get(ref args) if args.section == "run_proof" => "run_proof",
             Operation::Get(_) => "pool_detail",
         }
@@ -357,6 +361,8 @@ pub enum Data {
     Detail(Box<Detail>),
     /// Historical Run evidence for one exact owner-selected membership.
     RunProof(#[serde(deserialize_with = "crate::integrations::json_object")] Box<RunProof>),
+    /// One verified, cursor-fenced completion record page.
+    Completion(Box<crate::completion::Page>),
 }
 /// Whether the status source returned a validated snapshot for this membership.
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -501,11 +507,11 @@ pub struct PoolPage {
 pub struct InventoryTotals {
     /// All retained pools.
     pub total: String,
-    /// Unsupported until atomic completion classification exists.
+    /// Retained pools without a committed completion record; null if classification is unsupported.
     pub open: Option<String>,
-    /// Unsupported until atomic completion records exist.
+    /// Retained pools with a committed immutable completion record; null if unsupported.
     pub completed: Option<String>,
-    /// Pools whose completion classification is unsupported.
+    /// Pools whose completion classification is unsupported or unknown.
     pub unknown: String,
     /// Explicitly closed pools, independent of completion classification.
     pub closed: String,
@@ -611,6 +617,8 @@ impl Envelope {
                 "run_proof_v1".into(),
                 "inventory_snapshot_v1".into(),
                 "managed_capacity_v1".into(),
+                "completion_record_v1".into(),
+                "inventory_completion_v1".into(),
             ],
             observed_at_unix_ms: now()?,
         }))
@@ -660,6 +668,10 @@ pub async fn frontend(request: Request, path: &Path) -> Result<Envelope, Fault> 
     .await
     .map_err(|_| Fault::Internal)??;
     let expected_kind = request.kind();
+    let expected_completion = match &request.operation {
+        Operation::CompletionGet(args) => Some(args.clone()),
+        _ => None,
+    };
     let expected_proof = match &request.operation {
         Operation::Get(args) if args.section == "run_proof" => Some((
             args.pool_id.clone(),
@@ -704,11 +716,19 @@ pub async fn frontend(request: Request, path: &Path) -> Result<Envelope, Fault> 
                     | ("managed_capacity", Data::ManagedCapacity(_))
                     | ("pool_detail", Data::Detail(_))
                     | ("run_proof", Data::RunProof(_))
+                    | ("completion_page", Data::Completion(_))
             )
         }) {
             return Err(Fault::Unavailable);
         }
         if matches!(&envelope.data, Some(Data::ManagedCapacity(capacity)) if !capacity.valid()) {
+            return Err(Fault::Unavailable);
+        }
+        if let Some(Data::Completion(page)) = &envelope.data
+            && !expected_completion
+                .as_ref()
+                .is_some_and(|request| page.valid(request))
+        {
             return Err(Fault::Unavailable);
         }
         if let Some(Data::RunProof(proof)) = &envelope.data {

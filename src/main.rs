@@ -3,6 +3,11 @@
 #[cfg(test)]
 static TEST_EXEC_HASH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+mod completion;
+mod completion_key;
+mod completion_saga;
+#[cfg(test)]
+mod completion_tests;
 mod config;
 mod domain;
 mod integrations;
@@ -32,7 +37,7 @@ mod observer;
 mod response;
 #[allow(
     dead_code,
-    reason = "The private hold client awaits a separately designed durable saga"
+    reason = "The private hold client retains its list-free v1 discovery and recovery helpers"
 )]
 mod run_hold;
 mod run_status;

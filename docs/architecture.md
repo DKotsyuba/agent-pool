@@ -306,7 +306,7 @@ a native actor, leader, membership or assertion consumption.
 
 `agent-pool observe --config /absolute/config.toml` accepts exactly one bounded
 UTF-8 JSON line on stdin followed by EOF, and emits one JSON line. Input is
-`{"schema_version":1,"operation":"identity|list|get|inventory_snapshot","params":{...}}`.
+`{"schema_version":1,"operation":"identity|list|get|inventory_snapshot|managed_capacity|completion_get","params":{...}}`.
 `identity` requires `{}`; `list` accepts `after` (last pool ID). `get` requires
 `pool_id`, accepts numeric `after` (default 0), `section` (default `overview`),
 `proposal_id`, `member_id`, `field`, `include_bindings` (default false), and optional
@@ -331,7 +331,7 @@ not count. Read the next `checks_count` matching `vote_check` events through
 `event_id_exact` for event navigation, including IDs beyond JavaScript's exact
 number range. `check` and `vote_event_id` are omitted from unrelated events.
 
-Success is `{schema_version:1,kind:"identity|pool_page|pool_detail|run_proof|inventory_snapshot",data:...}`.
+Success is `{schema_version:1,kind:"identity|pool_page|pool_detail|run_proof|inventory_snapshot|managed_capacity|completion_page",data:...}`.
 Failure has the same family (or `error` for undecodable input), `error` instead
 of `data`, and fixed `code`, `outcome` (`blocked|unavailable`), `detail` fields.
 Inventory data has `pools:[{pool,leader_id}]`; detail has `section`, `view`
@@ -357,7 +357,7 @@ are opaque). Unlike totals and source revision, `limit` and `returned` are JSON
 integers; all counts and the source revision are canonical decimal strings:
 
 ```json
-{"schema_version":1,"kind":"inventory_snapshot","data":{"source":{"store_id":"store-uuid","read_epoch":"epoch-uuid","revision":"42"},"totals":{"total":"2","open":null,"completed":null,"unknown":"2","closed":"1"},"coverage":"Retained Pool rows only; completion classification unsupported, all retained pools unknown. Closed is independent of completion. Pages and totals share one Pool SQLite snapshot; no cross-service or clone/restore anti-rollback guarantee.","pools":[{"pool":{"pool_id":"pool-a","name":"Example","purpose":"Goal","revision":1,"closed":false,"proposal":null},"leader_id":"leader-id","roster":[{"member_id":"member-id","name":"Worker","role":"Implement","task":"Check","state":"active","runtime":"unknown"}]}],"returned":1,"has_more":true,"next_cursor":{"version":1,"source":{"store_id":"store-uuid","read_epoch":"epoch-uuid","revision":"42"},"filter":"all","limit":1,"after":"pool-a"},"observed_at_unix_ms":1730000000000}}
+{"schema_version":1,"kind":"inventory_snapshot","data":{"source":{"store_id":"store-uuid","read_epoch":"epoch-uuid","revision":"42"},"totals":{"total":"2","open":"1","completed":"1","unknown":"0","closed":"1"},"coverage":"Retained Pool rows only. Completed counts pools with a committed immutable completion record; every other retained pool is open, including accepted, closed, delivered or Run-succeeded pools without a record and all pools from before the completion ledger. Closed is independent of completion. Pages and totals share one Pool SQLite snapshot; no cross-service or clone/restore anti-rollback guarantee.","pools":[{"pool":{"pool_id":"pool-a","name":"Example","purpose":"Goal","revision":1,"closed":false,"proposal":null},"leader_id":"leader-id","roster":[{"member_id":"member-id","name":"Worker","role":"Implement","task":"Check","state":"active","runtime":"unknown"}]}],"returned":1,"has_more":true,"next_cursor":{"version":1,"source":{"store_id":"store-uuid","read_epoch":"epoch-uuid","revision":"42"},"filter":"all","limit":1,"after":"pool-a"},"observed_at_unix_ms":1730000000000}}
 ```
 
 `filter` is required and is `all`, `closed`, or `not_closed`; it selects page
@@ -386,12 +386,14 @@ There is no `data` branch in an error; restart the inventory instead of mixing
 pages from different source revisions.
 
 Totals count retained rows across the whole store, independent of the filter.
-There is currently no formal completion ledger: `open` and `completed` are null,
-and `unknown` equals `total`, including closed, accepted, failed and waiting
-pools. `closed` counts the independent closure flag and never implies completion.
-After a completion ledger is implemented, OPEN is every retained pool without
-atomic settlement; COMPLETED is only a durable settlement, not acceptance, closure,
-Run success or delivery. Retention-deleted rows are outside all these counts.
+Identity also advertises `inventory_completion_v1`: `completed` counts retained
+pools with a committed immutable completion record and `open` every other
+retained pool, read in the same snapshot as `total`, so `total=open+completed`
+and `unknown` is `"0"`. Accepted proposals, closure, delivery and Run success
+alone never count as completed; the schema v10 upgrade creates no records, so
+every pre-existing pool is open. `closed` counts the independent closure flag.
+The completion commit and the source revision advance in one transaction.
+Retention-deleted rows are outside all these counts; v1 deletes none.
 
 Each row contains the existing pool metadata projection (purpose may be a marked
 preview with `purpose_bytes`; proposal and criteria are omitted), the stable
@@ -408,6 +410,78 @@ background changes can invalidate a cursor. An overflow aborts the write. A fres
 random `read_epoch` is created each time the Store opens. Neither reopening nor
 the revision is a wall-clock timestamp. Clone/restore can preserve a store ID and
 roll back its revision, so this is not anti-rollback or a cross-service snapshot.
+
+### Formal completion ledger (P3-C) and completion_record_v1
+
+Owner decisions C1–C4 are final: settlement is automatic in the resident (no
+owner-finalize operation), the owner notice does not gate completion, completion
+is final, and each saga has its own protected Ed25519 release key. Automatic
+settlement is enabled only when both `run_socket` and the managed consensus
+transport are configured; otherwise it stays off and every pool remains open.
+Observers, Hub reads and `completion_get` never acquire or release holds.
+
+A pool becomes a candidate when its latest proposal is accepted, it has no
+record or unresolved saga, and fewer than three sagas were already attempted for
+the same proposal and pool revision. One read snapshot must show every frozen
+voter current and active with a ready ballot (all checks met when structured),
+no legacy `Unknown` ballot, and, for each Run member, a managed attempt binding
+with matching generation, incarnation and committed ballot provenance. Non-Run
+native voters keep their existing Bridge-verified ballot. Ordinary Run members
+without an attempt binding are never eligible. At least one and at most twenty
+Run lineages, all in one Run store, are required; multi-store settlement is
+refused. Before preparing, the resident freshly asks Run consensus for every
+managed voter (only `terminal_no_successor` with the exact attempt and
+incarnation qualifies) and reads Run status for the retained latest execution:
+active original pin, complete coverage, recorded successful terminal commit and
+confirmed whole-lineage cleanup. These reads have no effect.
+
+The saga stages are `prepared -> acquire_possible -> held -> committed|aborted ->
+release_pending -> released`, stored in `completion_sagas`. A fresh key file
+(32-byte seed, mode 0600, in the 0700 `completion-keys` directory beside the
+database) is fsynced before the saga row records only its opaque reference and
+public key. The row freezes the complete settlement (`agent-mcp/pool/completion-settlement/v1`
+digest, also the hold `intent_digest`), the configured Run route and store, the
+hold request ID `agent-pool.completion.<saga>`, ordered targets and roots and the
+hold fingerprint; triggers make these fields and the terminal outcome immutable.
+`acquire_possible` is durable before the first `_lineage_hold_acquire`. A lost
+or failed acknowledgement is recovered by exact lookup and, after an absent
+snapshot, exact replay of the same request; never a new request ID or key. A
+replay or lookup that observes `released` aborts without a CAS. After three
+uncertain acquire attempts the Pool outcome is fenced as aborted while exact
+replay continues, so any late hold is found and released, never committed.
+
+With the hold active, Run consensus and status are read again outside SQLite.
+Live or superseded voters, unverifiable facts or a changed snapshot abort; three
+unavailable reads abort. The single immediate transaction then re-derives the
+frozen settlement and compares every field (pool revision and data, proposal and
+ballots, roster, slots, managed generations/incarnations, invalidations and
+binding epoch), checks each held fact, appends the immutable record, advances
+the pool revision, journals `pool_completed`, queues one owner notice and marks
+the saga committed. Abort claims the same exclusive outcome, so a late commit
+loses to a durable abort and vice versa. The release message is signed with the
+saga key only after the outcome is durable and `release_pending` is stored; a
+verified receipt, linked to the record as an immutable observation, precedes
+key deletion. A missing or substituted key or a changed configured route leaves
+the saga at its stage with a nonsecret `attention` code (`key_unavailable`,
+`route_changed`, `outcome_unknown`, `release_unknown`, `hold_unavailable`,
+`run_unavailable`): there is no TTL unlock and no key regeneration. Restoring the
+original key file or route resumes the same saga.
+
+C3: once a record exists, update, add, start, batch, replace, cancel
+replacement, assignment change, remove, join, propose and vote return `closed`.
+Reads, messages, explicit close, history-pin release and recovery continue.
+Records, observations and sagas cannot be updated or deleted.
+
+`completion_get` (capability `completion_record_v1`) takes
+`{pool_id,completion_id,section,after,limit}` with section `header`, `content`,
+`roster`, `ballots`, `run_facts` or `notice`, `limit` 1–10 and `after` null or
+the previous `next_cursor`. Every read re-verifies the record digest. Pages bind
+completion ID, record version, digest, algorithm and section; cursors bind the
+digest and section and a foreign, stale or out-of-range cursor fails. Content
+slices are at most 16384 bytes at UTF-8 boundaries with exact field, offset,
+total length and SHA-256; an absent snapshot has no slice, an empty one has one
+empty slice. No key, key reference, signature or path appears. The complete wire
+and canonical vectors are in the Completion section of `contracts/pool-p1-wire.md`.
 
 ### Managed attempt binding (P-context and P1)
 

@@ -6182,6 +6182,8 @@ pub(crate) mod tests {
             )
             .unwrap();
             db.execute("INSERT INTO managed_contexts(id,namespace_id,intent_id,invocation_key,command,context,digest,snapshot,state) VALUES('old-context','namespace','old-intent','old-inv','legacy-command','{}','digest','legacy-snapshot','invalidated')",[]).unwrap();
+            db.execute_batch(crate::completion::TEST_DROP_SCHEMA)
+                .unwrap();
             db.execute_batch("DROP TABLE managed_invalidated_ballots; DROP INDEX managed_current_state_owner; ALTER TABLE managed_current_requests DROP COLUMN owner_intent; ALTER TABLE managed_bindings DROP COLUMN incarnation; DROP INDEX managed_bootstrap_state; DROP INDEX managed_intent_state; PRAGMA user_version=8;").unwrap();
         }
         drop(store);
@@ -6190,7 +6192,7 @@ pub(crate) mod tests {
         assert_eq!(
             db.query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap(),
-            9
+            crate::completion::SCHEMA_VERSION
         );
         let payloads:(String,String,String)=db.query_row("SELECT b.command,c.command,c.snapshot FROM managed_bootstrap b JOIN managed_contexts c ON c.invocation_key=b.invocation_key WHERE b.id='old'",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
         assert_eq!(payloads, ("{}".into(), "{}".into(), "{}".into()));
@@ -6236,6 +6238,8 @@ pub(crate) mod tests {
                 1,
             );
             db.execute("INSERT INTO managed_rebinds(receipt_id,member,old_binding,new_binding,generation_before,generation_after) VALUES('fixture-initial-old-context','member',?1,?1,?2,?2)",params![encoded(&binding).unwrap(),sqlite_generation(1)]).unwrap();
+            db.execute_batch(crate::completion::TEST_DROP_SCHEMA)
+                .unwrap();
             db.execute_batch("DROP TABLE managed_invalidated_ballots; DROP INDEX managed_current_state_owner; ALTER TABLE managed_current_requests DROP COLUMN owner_intent; ALTER TABLE managed_bindings DROP COLUMN incarnation; DROP INDEX managed_bootstrap_state; DROP INDEX managed_intent_state; PRAGMA user_version=8;").unwrap();
         }
         drop(store);
@@ -6301,6 +6305,8 @@ pub(crate) mod tests {
                 [],
             )
             .unwrap();
+            db.execute_batch(crate::completion::TEST_DROP_SCHEMA)
+                .unwrap();
             db.execute_batch("DROP TABLE managed_invalidated_ballots; DROP INDEX managed_current_state_owner; ALTER TABLE managed_current_requests DROP COLUMN owner_intent; ALTER TABLE managed_bindings DROP COLUMN incarnation; DROP INDEX managed_bootstrap_state; DROP INDEX managed_intent_state; PRAGMA user_version=8;").unwrap();
         }
         drop(store);

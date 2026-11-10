@@ -23,6 +23,7 @@ uuid = { version = "=1.26.1", features = ["v4"] }
 bridge-sdk = { path = "/home/pluto/projects/tmp/codex-agent-codex/agent-mcp/bridge/sdk-snapshots/38b4f655a0711b59/crates/bridge-sdk" }
 sha2 = "0.10"
 fs2 = "0.4"
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std"] }
 toml = "0.8"
 semver = "1"
 tempfile = "3"
@@ -50,6 +51,7 @@ rusqlite.workspace = true
 uuid.workspace = true
 sha2.workspace = true
 fs2.workspace = true
+ed25519-dalek.workspace = true
 bridge-sdk.workspace = true
 
 [dev-dependencies]
