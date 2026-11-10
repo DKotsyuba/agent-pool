@@ -934,11 +934,16 @@ impl SdkBridge {
         crate::config::private_socket(&config.bridge_core_socket, config.expected_uid)?;
         let credential = config.credential(&config.bridge_credential_file)?;
         let credential_sha256 = format!("{:x}", sha2::Sha256::digest(credential.as_bytes()));
+        // The unoptimized synthetic test executable is much larger than a release server.
+        #[cfg(test)]
+        let timeout = crate::integrations::EXCHANGE_TIMEOUT.saturating_mul(6);
+        #[cfg(not(test))]
+        let timeout = crate::integrations::EXCHANGE_TIMEOUT;
         let mut sdk = bridge_sdk::Config::new(
             &config.bridge_registration_socket,
             &config.bridge_core_socket,
             Secret::new(credential),
-            crate::integrations::EXCHANGE_TIMEOUT,
+            timeout,
         )
         .map_err(|_| Fault::Unavailable)?;
         sdk.reconnect_once = false;

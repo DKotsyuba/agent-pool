@@ -31,7 +31,7 @@ fn require_capacity(db: &Connection, limit: i64) -> Result<(), Fault> {
 
 #[cfg(test)]
 pub(crate) fn drop_test_schema(db: &Connection) -> Result<(), Fault> {
-    db.execute_batch("DROP TABLE managed_delivery_outbox; DROP TABLE managed_delivery_seeds; DROP TABLE managed_delivery_scopes;")?;
+    db.execute_batch("DROP TABLE managed_namespace_retirements; DROP TABLE managed_route_pin_history; ALTER TABLE managed_bootstrap DROP COLUMN bridge_pin; ALTER TABLE managed_run_routes DROP COLUMN pool_route; DROP TABLE managed_delivery_outbox; DROP TABLE managed_delivery_seeds; DROP TABLE managed_delivery_scopes;")?;
     Ok(())
 }
 
@@ -1126,7 +1126,16 @@ pub(crate) fn insert_seed(
         }
     }
     let hash = format!("{:x}", Sha256::digest(text.as_bytes()));
-    db.execute("INSERT INTO managed_delivery_seeds(effect_id,pool_id,member_id,event_key,payload_sha256,payload_length,producer_scope,final_notice) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![effect_id,pool,member,format!("event/{event_id}"),hash,i64::try_from(text.len()).map_err(|_|Fault::Invalid)?,scope,i64::from(final_notice)])?;
+    // Empty means explicitly non-issuer owner/legacy origin; NULL is reserved
+    // for migrated v10 seeds whose provenance was never recorded.
+    let origin: Option<String> = db
+        .query_row(
+            "SELECT namespace_id FROM temp.managed_delivery_origin WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    db.execute("INSERT INTO managed_delivery_seeds(effect_id,pool_id,member_id,event_key,payload_sha256,payload_length,producer_scope,final_notice,issuer_namespace) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![effect_id,pool,member,format!("event/{event_id}"),hash,i64::try_from(text.len()).map_err(|_|Fault::Invalid)?,scope,i64::from(final_notice),origin.as_deref().unwrap_or("")])?;
     db.execute(
         "INSERT INTO managed_delivery_outbox(effect_id,state) VALUES(?1,'pending')",
         [effect_id],
@@ -1537,6 +1546,52 @@ pub(crate) mod tests {
             begin_publish(store.test_db(), "identity-effect"),
             Err(Fault::Stale)
         ));
+    }
+
+    #[test]
+    fn repin_never_retargets_a_frozen_egress_effect() {
+        let (_directory, mut store, binding, incarnation, _run) = fixture();
+        index_managed_member(store.test_db(), &binding);
+        add_seed(&mut store, &binding, "repin-effect", "payload", false);
+        let original = freeze_next(
+            &mut store,
+            &binding,
+            &incarnation,
+            "repin-effect",
+            "next",
+            2,
+        );
+        let mut bridge = fake_bridge_pin(&binding);
+        bridge.server_sha256 = "c".repeat(64);
+        bridge.credential_sha256 = "d".repeat(64);
+        let mut run = fake_run_endpoint(&binding);
+        run.executable_sha256 = "e".repeat(64);
+        let pool_route = crate::managed_state::Route {
+            component_store_id: binding.pool_store_id.clone(),
+            route_id: "pool-route".into(),
+            worker_uid: binding.run_route.worker_uid,
+        };
+        assert_eq!(
+            store
+                .managed_repin_routes(&bridge, &run, &pool_route, true)
+                .unwrap(),
+            (2, 2)
+        );
+        let retained = frozen(store.test_db(), "repin-effect").unwrap();
+        assert!(retained.run_pin.endpoint() == original.run_pin.endpoint());
+        assert!(retained.bridge_pin == original.bridge_pin);
+        assert_eq!(retained.digest, original.digest);
+        assert!(retained.intent.target_binding == original.intent.target_binding);
+        let candidate = encode(&bridge).unwrap();
+        assert!(
+            store
+                .test_db()
+                .execute(
+                    "UPDATE managed_delivery_outbox SET bridge_pin=?2 WHERE effect_id=?1",
+                    params!["repin-effect", candidate]
+                )
+                .is_err()
+        );
     }
 
     #[test]

@@ -675,12 +675,16 @@ mod managed_egress_dispatch {
     type Response<'a, T> = Pin<Box<dyn Future<Output = Result<T, RunError>> + Send + 'a>>;
     pub(super) trait CurrentClient {
         fn endpoint(&self) -> RunEndpointPin;
+        fn pool_route(&self) -> crate::managed_state::Route;
         fn current_pin(&self) -> Response<'_, RunPin>;
         fn current<'a>(&'a self, query: &'a EgressQuery) -> Response<'a, CurrentAuthority>;
     }
     impl CurrentClient for RunPeer {
         fn endpoint(&self) -> RunEndpointPin {
             self.endpoint_pin()
+        }
+        fn pool_route(&self) -> crate::managed_state::Route {
+            self.pool_route.clone()
         }
         fn current_pin(&self) -> Response<'_, RunPin> {
             Box::pin(async move { RunPeer::current_pin(self, "attempt_current_egress_v1").await })
@@ -743,8 +747,9 @@ mod managed_egress_dispatch {
         require_effect_lease(lease, &id)?;
         let bridge = bridge_pin.clone();
         let endpoint = run.endpoint();
+        let pool_route = run.pool_route();
         stored_managed(store, lease, move |store| {
-            store.managed_pin_routes(&bridge, &endpoint)
+            store.managed_pin_routes(&bridge, &endpoint, &pool_route)
         })
         .await?;
         let run_pin = match run.current_pin().await {
@@ -1313,8 +1318,9 @@ async fn recover_egress_scope(
     };
     let pin_for_store = pin.clone();
     let endpoint = run.endpoint_pin();
+    let pool_route = run.pool_route.clone();
     if stored_managed(store, &lease, move |store| {
-        store.managed_pin_routes(&pin_for_store, &endpoint)
+        store.managed_pin_routes(&pin_for_store, &endpoint, &pool_route)
     })
     .await
     .is_err()
@@ -1493,9 +1499,10 @@ async fn managed_session_core<S: managed_dispatch::SessionClient>(
         .ok_or(Fault::Unavailable)?;
     let route = bridge_pin.route.clone();
     let endpoint = services.endpoint();
+    let pool_route = services.pool_route();
     let persisted_pin = bridge_pin.clone();
     stored_managed(store, &lease, move |store| {
-        store.managed_pin_routes(&persisted_pin, &endpoint)
+        store.managed_pin_routes(&persisted_pin, &endpoint, &pool_route)
     })
     .await?;
     crate::managed_session::send(stream, &ServerFrame::Ready).await?;
@@ -2323,6 +2330,41 @@ async fn listener(config: &Config) -> Result<(UnixListener, SocketGuard), Fault>
     Ok((listener, guard))
 }
 
+/// Verify both configured services and atomically re-pin an existing, exclusively held store.
+/// Candidate peers are checked through the same pinned capability exchanges used by admission.
+pub async fn repin(config_path: &Path) -> Result<(i64, i64), Fault> {
+    let config = Config::load(config_path)?;
+    integrations::own_uid(config.expected_uid)?;
+    private_parent(&config.database_path, config.expected_uid)?;
+    private_file(&config.database_path, config.expected_uid)?;
+    let lock_path = config.database_path.with_extension("lock");
+    if fs::symlink_metadata(&lock_path).is_ok() {
+        private_file(&lock_path, config.expected_uid)?;
+    }
+    let mut store = Store::open(&config.database_path)?;
+    let store_id = store.managed_store_id()?;
+    let peer =
+        crate::managed_run::RunPeer::from_config(&config, &store_id).map_err(|_| Fault::Invalid)?;
+    let route = peer.bridge_route.clone();
+    let capture_config = config.clone();
+    let (bridge, bridge_pin) = tokio::task::spawn_blocking(move || {
+        crate::managed_bridge::SdkBridge::capture(&capture_config, route)
+    })
+    .await
+    .map_err(|_| Fault::Unavailable)??;
+    let run_pin = peer.endpoint_pin();
+    store.managed_repin_routes(&bridge_pin, &run_pin, &peer.pool_route, false)?;
+    let expected = bridge_pin.route.component_store_id.clone();
+    tokio::task::spawn_blocking(move || crate::managed_bridge::discover(&bridge, &expected))
+        .await
+        .map_err(|_| Fault::Unavailable)?
+        .map_err(crate::managed_bridge::fault)?;
+    peer.current_pin("attempt_current_ingress_v1")
+        .await
+        .map_err(|_| Fault::Unavailable)?;
+    store.managed_repin_routes(&bridge_pin, &run_pin, &peer.pool_route, true)
+}
+
 /// Runs the resident until SIGINT/SIGTERM or a supervised worker failure.
 /// Admission closes first; accepted connections and the serial worker are then joined without detaching.
 pub async fn serve(config_path: &Path) -> Result<(), Fault> {
@@ -3085,6 +3127,107 @@ async fn recover_managed(
     Ok(())
 }
 
+/// Retire one drained superseded issuer, retaining exact keys across errors and restarts.
+async fn recover_namespace_retirement(config: &Config, store: &SharedStore) -> Result<(), Fault> {
+    if config.managed_run_transport.is_none()
+        || !stored(store, |store| store.managed_has_namespace_retirement_work()).await?
+    {
+        return Ok(());
+    }
+    let source = stored(store, |store| store.managed_store_id()).await?;
+    let Ok(peer) = crate::managed_run::RunPeer::from_config(config, &source) else {
+        return Ok(());
+    };
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| Fault::Unavailable)?
+            .as_secs(),
+    )
+    .map_err(|_| Fault::Unavailable)?;
+    let stage = |issuer: Option<String>| {
+        let peer = peer.clone();
+        async move {
+            stored(store, move |store| {
+                store.managed_stage_namespace_retirement(
+                    &peer.endpoint_pin(),
+                    &peer.pool_route,
+                    &peer.bridge_route,
+                    &peer.producer,
+                    issuer.as_deref(),
+                    now,
+                )
+            })
+            .await
+        }
+    };
+    let mut plan = match stage(None).await {
+        Ok(plan) => plan,
+        Err(_) => return Ok(()),
+    };
+    if plan.is_none() {
+        let cfg = config.clone();
+        let route = peer.bridge_route.clone();
+        let Ok(Ok((bridge, pin))) = tokio::task::spawn_blocking(move || {
+            crate::managed_bridge::SdkBridge::capture(&cfg, route)
+        })
+        .await
+        else {
+            return Ok(());
+        };
+        let candidate = pin.clone();
+        let pinned_peer = peer.clone();
+        if stored(store, move |store| {
+            store.managed_pin_routes(
+                &candidate,
+                &pinned_peer.endpoint_pin(),
+                &pinned_peer.pool_route,
+            )
+        })
+        .await
+        .is_err()
+        {
+            return Ok(());
+        }
+        let expected = pin.route.component_store_id.clone();
+        let Ok(Ok(issuer)) = tokio::task::spawn_blocking(move || {
+            crate::managed_bridge::discover(&bridge, &expected)
+        })
+        .await
+        else {
+            return Ok(());
+        };
+        plan = stage(Some(issuer)).await.ok().flatten();
+    }
+    if let Some(plan) = plan {
+        let retired = peer.retire_namespace(&plan).await.is_ok();
+        let completed = if retired {
+            let completion = plan.clone();
+            stored(store, move |store| {
+                store.managed_complete_namespace_retirement(&completion)
+            })
+            .await
+            .is_ok()
+        } else {
+            false
+        };
+        if !completed {
+            let failed_at = i64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|_| Fault::Unavailable)?
+                    .as_secs(),
+            )
+            .map_err(|_| Fault::Unavailable)?;
+            stored(store, move |store| {
+                store.managed_defer_namespace_retirement(&plan, failed_at)
+            })
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 /// Unknown delivery uses status only; unknown Run admission retries the same frozen admission key.
 async fn work(
     config: Config,
@@ -3103,6 +3246,7 @@ async fn work(
         }
         recover_managed(&config, &store, &stopped, &activity).await?;
         recover_egress_scope(&config, &store, &activity).await?;
+        recover_namespace_retirement(&config, &store).await?;
         for _ in 0..32 {
             if *stopped.borrow() {
                 return Ok(());
@@ -3152,6 +3296,124 @@ async fn work(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exercise the operator entry point against isolated same-process peers, including a rejected build.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn repin_cli_authenticates_both_candidates_before_commit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use sha2::{Digest, Sha256};
+        use tokio::io::AsyncReadExt;
+
+        let _guard = crate::TEST_EXEC_HASH_LOCK.lock().await;
+        let directory =
+            tempfile::tempdir_in(std::env::var_os("TMPDIR").ok_or("task TMPDIR required")?)?;
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))?;
+        let root = directory.path();
+        let uid = fs::metadata(root)?.uid();
+        let bridge_socket = root.join("bridge.sock");
+        let run_socket = root.join("attempt.sock");
+        let bridge_listener = UnixListener::bind(&bridge_socket)?;
+        let run_listener = UnixListener::bind(&run_socket)?;
+        fs::set_permissions(&bridge_socket, fs::Permissions::from_mode(0o600))?;
+        fs::set_permissions(&run_socket, fs::Permissions::from_mode(0o600))?;
+        let credential = root.join("credential");
+        fs::write(&credential, "fixture-credential")?;
+        fs::set_permissions(&credential, fs::Permissions::from_mode(0o600))?;
+        let executable = fs::canonicalize(std::env::current_exe()?)?;
+        struct RestoreExecutableMode(PathBuf, fs::Permissions);
+        impl Drop for RestoreExecutableMode {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.0, self.1.clone());
+            }
+        }
+        let _mode =
+            RestoreExecutableMode(executable.clone(), fs::metadata(&executable)?.permissions());
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o500))?;
+        let sha = format!("{:x}", Sha256::digest(fs::read(&executable)?));
+        let config_path = root.join("config.toml");
+        let config_text = |run_sha: &str| {
+            format!(
+                "socket_path = {:?}\ndatabase_path = {:?}\nexpected_uid = {}\nbridge_registration_socket = {:?}\nbridge_core_socket = {:?}\nbridge_credential_file = {:?}\nbridge_producer_id = 'pool'\nbridge_audience = 'pool'\nbridge_server_executable = {:?}\nbridge_server_sha256 = '{}'\n[managed_run_transport]\nsocket = {:?}\nexecutable = {:?}\nsha256 = '{}'\nrun_store_id = 'store_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\nrun_route_id = 'run-route'\npool_route_id = 'pool-route'\nbridge_store_id = '00000000-0000-4000-8000-000000000003'\nbridge_route_id = 'bridge-route'\nproducer = 'pool'\n",
+                root.join("pool.sock"),
+                root.join("pool.db"),
+                uid,
+                bridge_socket,
+                bridge_socket,
+                credential,
+                executable,
+                sha,
+                run_socket,
+                executable,
+                run_sha,
+            )
+        };
+        fs::write(&config_path, config_text(&"3".repeat(64)))?;
+        let config = Config::load(&config_path)?;
+        let mut initial = Store::open(&config.database_path)?;
+        let pool_store = initial.managed_store_id()?;
+        let peer = crate::managed_run::RunPeer::from_config(&config, &pool_store)
+            .map_err(|_| "peer config")?;
+        let (_, mut old_bridge) =
+            crate::managed_bridge::SdkBridge::capture(&config, peer.bridge_route.clone())?;
+        old_bridge.server_sha256 = "0".repeat(64);
+        old_bridge.credential_sha256 = "1".repeat(64);
+        let mut old_run = peer.endpoint_pin();
+        old_run.executable_sha256 = "2".repeat(64);
+        initial.managed_pin_routes(&old_bridge, &old_run, &peer.pool_route)?;
+        drop(initial);
+
+        let bridge_task = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut stream, _) = bridge_listener.accept().await?;
+                let frame = integrations::read_frame(&mut stream).await?;
+                let request: serde_json::Value = serde_json::from_slice(&frame)?;
+                assert_eq!(request["op"], "attempt_binding_capabilities_v1");
+                let response = serde_json::json!({"api_version":1,"request_id":request["request_id"],"success":true,"result":{"op":"attempt_binding_capabilities_v1","value":{"status":"ok","value":{"version":1,"store_id":"00000000-0000-4000-8000-000000000003","issuer_epoch":"epoch","capabilities":["attempt_launch_v1","launch_assertion_v1","namespace_retirement_v1"]}}}});
+                stream.write_all(format!("{response}\n").as_bytes()).await?;
+            }
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        });
+        let run_task = tokio::spawn(async move {
+            for index in 0..3 {
+                let (mut stream, _) = run_listener.accept().await?;
+                if index == 0 {
+                    let mut byte = [0u8; 1];
+                    assert_eq!(stream.read(&mut byte).await?, 0);
+                    continue;
+                }
+                let frame = integrations::read_frame(&mut stream).await?;
+                let request: serde_json::Value = serde_json::from_slice(&frame)?;
+                assert_eq!(request["method"], "_attempt_capabilities_v1");
+                let response = serde_json::json!({"id":request["id"],"result":{"version":1,"store_id":"store_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","capabilities":["attempt_current_ingress_v1","attempt_admission_v1"],"policy":"admission_snapshot"}});
+                stream.write_all(format!("{response}\n").as_bytes()).await?;
+            }
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        });
+        assert_eq!(repin(&config_path).await.err(), Some(Fault::Unavailable));
+        let mut unchanged = Store::open(&config.database_path)?;
+        assert_eq!(
+            unchanged.managed_repin_routes(&old_bridge, &old_run, &peer.pool_route, false)?,
+            (1, 1)
+        );
+        drop(unchanged);
+        fs::write(&config_path, config_text(&sha))?;
+        assert_eq!(
+            repin(&config_path)
+                .await
+                .map_err(|error| format!("verified candidate: {error}"))?,
+            (2, 2)
+        );
+        assert_eq!(
+            repin(&config_path)
+                .await
+                .map_err(|error| format!("replayed candidate: {error}"))?,
+            (2, 2)
+        );
+        bridge_task.await?.map_err(|_| "Bridge fixture")?;
+        run_task.await?.map_err(|_| "Run fixture")?;
+        Ok(())
+    }
 
     /// Receives one Run request over an isolated listener using the production framing rules.
     async fn receive_run_request(
@@ -7406,6 +7668,13 @@ mod tests {
             fn endpoint(&self) -> crate::managed_state::RunEndpointPin {
                 fake_run_endpoint(&self.binding)
             }
+            fn pool_route(&self) -> crate::managed_state::Route {
+                crate::managed_state::Route {
+                    component_store_id: self.binding.pool_store_id.clone(),
+                    route_id: "pool-route".into(),
+                    worker_uid: self.binding.run_route.worker_uid,
+                }
+            }
             fn current_pin(
                 &self,
             ) -> std::pin::Pin<
@@ -7801,6 +8070,13 @@ mod tests {
         impl managed_egress_dispatch::CurrentClient for Foreign {
             fn endpoint(&self) -> crate::managed_state::RunEndpointPin {
                 fake_run_endpoint(&self.binding)
+            }
+            fn pool_route(&self) -> crate::managed_state::Route {
+                crate::managed_state::Route {
+                    component_store_id: self.binding.pool_store_id.clone(),
+                    route_id: "pool-route".into(),
+                    worker_uid: self.binding.run_route.worker_uid,
+                }
             }
             fn current_pin(
                 &self,

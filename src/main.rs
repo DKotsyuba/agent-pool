@@ -79,6 +79,12 @@ enum Commands {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Explicitly approve verified Run and Bridge build or credential changes for existing routes.
+    Repin {
+        /// Explicit validated configuration for the stopped resident and candidate services.
+        #[arg(long)]
+        config: PathBuf,
+    },
     /// Check local resources; an optional owner grant reads resident capacity.
     Doctor {
         /// Request JSON diagnostics (the current output is always JSON).
@@ -360,6 +366,16 @@ async fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("resident: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Commands::Repin { config } => match runtime::repin(&config).await {
+            Ok((bridge, run)) => print_json(serde_json::json!({
+                "bridge_pin_generation": bridge,
+                "run_pin_generation": run,
+            })),
+            Err(error) => {
+                eprintln!("repin: {error}");
                 ExitCode::FAILURE
             }
         },

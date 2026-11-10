@@ -464,6 +464,17 @@ struct Tagged<T> {
     #[serde(flatten)]
     value: T,
 }
+/// Correlated durable retirement response; the outer tag validates the Run store.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NamespaceRetired {
+    state: String,
+    bridge_route: Route,
+    producer: String,
+    issuer_epoch: String,
+    retirement_key: String,
+    retired_count: u64,
+}
 /// Discovery is not authority and must agree with the already pinned store.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1039,6 +1050,14 @@ impl RunPeer {
                 "_attempt_admission_lookup_v1"
                 | "_attempt_admission_abort_v1"
                 | "_attempt_settle_v1" => &["state", "admission", "outcome_digest"],
+                "_attempt_retire_namespace_v1" => &[
+                    "state",
+                    "bridge_route",
+                    "producer",
+                    "issuer_epoch",
+                    "retirement_key",
+                    "retired_count",
+                ],
                 _ => return Err(RunError::Invalid),
             };
             if required.iter().any(|key| !fields.contains_key(*key)) {
@@ -1067,6 +1086,47 @@ impl RunPeer {
             return Err(RunError::Unknown);
         }
         Ok(result)
+    }
+    /// Retry the original namespace retirement only on its frozen authenticated routes.
+    pub async fn retire_namespace(
+        &self,
+        plan: &crate::managed_state::NamespaceRetirement,
+    ) -> Result<(), RunError> {
+        if self.endpoint_pin() != plan.run_pin
+            || self.pool_route != plan.pool_route
+            || self.bridge_route != plan.bridge_route
+            || self.producer != plan.producer
+            || plan.request_id == plan.retirement_key
+            || plan.pool_seal_request_id == plan.retirement_key
+        {
+            return Err(RunError::Invalid);
+        }
+        let caps = self.capabilities(&crate::domain::id()).await?;
+        if !caps
+            .capabilities
+            .iter()
+            .any(|capability| capability == "attempt_namespace_retirement_v1")
+        {
+            return Err(RunError::Refused);
+        }
+        let result: NamespaceRetired = self.exchange(
+            &crate::domain::id(),
+            "_attempt_retire_namespace_v1",
+            serde_json::json!({"version":1,"expected_store_id":self.route.component_store_id,
+                "request_id":plan.request_id,"bridge_route":plan.bridge_route,"producer":plan.producer,
+                "issuer_epoch":plan.issuer_epoch,"retirement_key":plan.retirement_key,
+                "pool_route":plan.pool_route,"pool_seal_request_id":plan.pool_seal_request_id}),
+        ).await?;
+        let _ = result.retired_count;
+        if result.state != "retired"
+            || result.bridge_route != plan.bridge_route
+            || result.producer != plan.producer
+            || result.issuer_epoch != plan.issuer_epoch
+            || result.retirement_key != plan.retirement_key
+        {
+            return Err(RunError::Unknown);
+        }
+        Ok(())
     }
     /// Lookup of a durable current receipt never refreshes its authority.
     async fn current_receipt(
@@ -1415,6 +1475,68 @@ mod tests {
             producer: "pool".into(),
             recovery_capabilities: vec!["attempt_admission_v1".into()],
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn namespace_retirement_wire_replays_keys_and_rejects_mismatched_receipt() {
+        let _guard = crate::TEST_EXEC_HASH_LOCK.lock().await;
+        let dir = tempfile::tempdir_in(std::env::var_os("TMPDIR").unwrap()).unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = dir.path().join("attempt.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let sha = format!("{:x}", Sha256::digest(fs::read(&executable).unwrap()));
+        let peer = local_peer(
+            socket,
+            fs::metadata(dir.path()).unwrap().uid(),
+            executable,
+            sha,
+        );
+        let plan = crate::managed_state::NamespaceRetirement {
+            namespace_id: "namespace".into(),
+            request_id: "request".into(),
+            retirement_key: "retirement".into(),
+            pool_seal_request_id: "pool-seal".into(),
+            run_pin: peer.endpoint_pin(),
+            pool_route: peer.pool_route.clone(),
+            bridge_route: peer.bridge_route.clone(),
+            producer: peer.producer.clone(),
+            issuer_epoch: "old-epoch".into(),
+        };
+        let expected = plan.clone();
+        let server = tokio::spawn(async move {
+            for index in 0..4 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request: Value =
+                    serde_json::from_slice(&read_frame(&mut stream).await.unwrap()).unwrap();
+                let result = if index % 2 == 0 {
+                    assert_eq!(request["method"], "_attempt_capabilities_v1");
+                    serde_json::json!({"version":1,"store_id":expected.run_pin.route.component_store_id,"capabilities":["attempt_namespace_retirement_v1"],"policy":"admission_snapshot"})
+                } else {
+                    assert_eq!(request["method"], "_attempt_retire_namespace_v1");
+                    assert_eq!(request["params"]["request_id"], expected.request_id);
+                    assert_eq!(
+                        request["params"]["pool_seal_request_id"],
+                        expected.pool_seal_request_id
+                    );
+                    assert_eq!(request["params"]["retirement_key"], expected.retirement_key);
+                    serde_json::json!({"version":1,"store_id":expected.run_pin.route.component_store_id,"state":"retired","bridge_route":expected.bridge_route,"producer":expected.producer,"issuer_epoch":expected.issuer_epoch,"retirement_key":if index==1 {"retirement"} else {"other"},"retired_count":1})
+                };
+                let response = serde_json::json!({"id":request["id"],"result":result});
+                stream
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        assert!(peer.retire_namespace(&plan).await.is_ok());
+        assert_eq!(
+            peer.retire_namespace(&plan).await.err(),
+            Some(RunError::Unknown)
+        );
+        server.await.unwrap();
     }
     #[test]
     fn early_hook_not_ready_is_distinct_from_uncertain_or_foreign_reply() {

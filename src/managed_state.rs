@@ -166,7 +166,7 @@ fn verify_bridge_pin(
     context_id: &str,
     pin: &crate::managed_bridge::BridgePin,
 ) -> Result<(), Fault> {
-    let stored:Option<String>=db.query_row("SELECT n.bridge_pin FROM managed_contexts c JOIN managed_namespaces n ON n.id=c.namespace_id WHERE c.id=?1",[context_id],|row|row.get(0))?;
+    let stored:Option<String>=db.query_row("SELECT b.bridge_pin FROM managed_contexts c JOIN managed_bootstrap b ON b.namespace_id=c.namespace_id AND b.invocation_key=c.invocation_key WHERE c.id=?1",[context_id],|row|row.get(0))?;
     if stored.as_deref() != Some(encoded(pin)?.as_str()) {
         return Err(Fault::Conflict);
     }
@@ -198,8 +198,172 @@ pub(crate) fn persist_bridge_route(
         "INSERT INTO managed_bridge_routes(route,pin) VALUES(?1,?2)",
         params![route, encoded_pin],
     )?;
+    append_route_pin(&tx, "bridge", &route, &encoded_pin)?;
     tx.commit()?;
     Ok(())
+}
+
+/// Append one immutable generation; callers hold the same immediate transaction as the route update.
+fn append_route_pin(db: &Connection, kind: &str, route: &str, pin: &str) -> Result<i64, Fault> {
+    let previous: i64 = db.query_row(
+        "SELECT COALESCE(MAX(generation),0) FROM managed_route_pin_history WHERE kind=?1 AND route=?2",
+        params![kind, route],
+        |row| row.get(0),
+    )?;
+    let generation = previous.checked_add(1).ok_or(Fault::Conflict)?;
+    db.execute(
+        "INSERT INTO managed_route_pin_history(kind,route,generation,pin) VALUES(?1,?2,?3,?4)",
+        params![kind, route, generation, pin],
+    )?;
+    Ok(generation)
+}
+
+/// Pin the Pool route alongside the Run endpoint, including on first managed use.
+fn check_pool_route(
+    db: &Connection,
+    run: &RunEndpointPin,
+    pool_route: &Route,
+    apply: bool,
+) -> Result<(), Fault> {
+    let run_route = encoded(&run.route)?;
+    let candidate = encoded(pool_route)?;
+    let stored_pool: String = db.query_row(
+        "SELECT store_id FROM inventory_source WHERE singleton=1",
+        [],
+        |r| r.get(0),
+    )?;
+    if pool_route.component_store_id != stored_pool || pool_route.worker_uid != run.route.worker_uid
+    {
+        return Err(Fault::Conflict);
+    }
+    let previous: Option<Option<String>> = db
+        .query_row(
+            "SELECT pool_route FROM managed_run_routes WHERE route=?1",
+            [&run_route],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let previous = previous.ok_or(Fault::Conflict)?;
+    if previous.as_deref().is_some_and(|old| old != candidate) {
+        return Err(Fault::Conflict);
+    }
+    let different: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM managed_intents WHERE run_route=?1 AND pool_route!=?2)",
+        params![run_route, candidate],
+        |r| r.get(0),
+    )?;
+    if different {
+        return Err(Fault::Conflict);
+    }
+    if apply && previous.is_none() {
+        db.execute(
+            "UPDATE managed_run_routes SET pool_route=?2 WHERE route=?1 AND pool_route IS NULL",
+            params![run_route, candidate],
+        )?;
+    }
+    Ok(())
+}
+
+/// Retain the Pool route in the active Run pin before managed work starts.
+pub(crate) fn persist_pool_route(
+    db: &mut Connection,
+    run: &RunEndpointPin,
+    pool_route: &Route,
+) -> Result<(), Fault> {
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    check_pool_route(&tx, run, pool_route, true)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Atomically replace only build and credential hashes on already-pinned routes.
+/// The caller must authenticate both candidate services before entering this transaction.
+pub(crate) fn repin_routes(
+    db: &mut Connection,
+    bridge: &crate::managed_bridge::BridgePin,
+    run: &RunEndpointPin,
+    pool_route: &Route,
+    apply: bool,
+) -> Result<(i64, i64), Fault> {
+    let bridge_route = encoded(&bridge.route)?;
+    let run_route = encoded(&run.route)?;
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let old_bridge: Option<String> = tx
+        .query_row(
+            "SELECT pin FROM managed_bridge_routes WHERE route=?1",
+            [&bridge_route],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let old_run: Option<String> = tx
+        .query_row(
+            "SELECT pin FROM managed_run_routes WHERE route=?1",
+            [&run_route],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let old_bridge = old_bridge.ok_or(Fault::Conflict)?;
+    let old_run = old_run.ok_or(Fault::Conflict)?;
+    // A failed earlier invocation may already have inserted a different route for
+    // these sockets. Without an old-route selector that state is ambiguous.
+    let ambiguous_run: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM managed_run_routes WHERE route!=?1 AND json_extract(pin,'$.socket')=?2)",
+        params![run_route, run.socket.to_str().ok_or(Fault::Invalid)?],
+        |r| r.get(0),
+    )?;
+    let ambiguous_bridge: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM managed_bridge_routes WHERE route!=?1 AND (json_extract(pin,'$.core_socket')=?2 OR json_extract(pin,'$.registration_socket')=?3))",
+        params![bridge_route, bridge.core_socket.to_str().ok_or(Fault::Invalid)?, bridge.registration_socket.to_str().ok_or(Fault::Invalid)?],
+        |r| r.get(0),
+    )?;
+    if ambiguous_run || ambiguous_bridge {
+        return Err(Fault::Conflict);
+    }
+    let mut prior_bridge: crate::managed_bridge::BridgePin = decoded(&old_bridge)?;
+    let mut prior_run: RunEndpointPin = decoded(&old_run)?;
+    prior_bridge.server_sha256.clone_from(&bridge.server_sha256);
+    prior_bridge
+        .credential_sha256
+        .clone_from(&bridge.credential_sha256);
+    prior_run
+        .executable_sha256
+        .clone_from(&run.executable_sha256);
+    if &prior_bridge != bridge || &prior_run != run {
+        return Err(Fault::Conflict);
+    }
+    check_pool_route(&tx, run, pool_route, apply)?;
+    let mut generations = [0; 2];
+    for (index, (kind, route, previous, candidate)) in [
+        ("bridge", &bridge_route, &old_bridge, encoded(bridge)?),
+        ("run", &run_route, &old_run, encoded(run)?),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (generation, historical): (i64, String) = tx.query_row(
+            "SELECT generation,pin FROM managed_route_pin_history WHERE kind=?1 AND route=?2 ORDER BY generation DESC LIMIT 1",
+            params![kind, route], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional()?.ok_or(Fault::Conflict)?;
+        if historical != *previous {
+            return Err(Fault::Conflict);
+        }
+        generations[index] = if *previous == candidate || !apply {
+            generation
+        } else {
+            let next = append_route_pin(&tx, kind, route, &candidate)?;
+            let sql = if kind == "bridge" {
+                "UPDATE managed_bridge_routes SET pin=?2 WHERE route=?1 AND pin=?3"
+            } else {
+                "UPDATE managed_run_routes SET pin=?2 WHERE route=?1 AND pin=?3"
+            };
+            if tx.execute(sql, params![route, candidate, previous])? != 1 {
+                return Err(Fault::Conflict);
+            }
+            next
+        };
+    }
+    tx.commit()?;
+    Ok((generations[0], generations[1]))
 }
 fn sqlite_generation(value: u64) -> Vec<u8> {
     value.to_be_bytes().to_vec()
@@ -1866,19 +2030,18 @@ pub(crate) fn reserve_bootstrap(
         Some(_) => return Err(Fault::Conflict),
         None => return Err(Fault::Unavailable),
     }
-    let existing: Option<(String, Option<String>, String, String, String)> = tx
+    let existing: Option<(String, String, String, String)> = tx
         .query_row(
-            "SELECT bridge_route,bridge_pin,producer,issuer_epoch,state FROM managed_namespaces WHERE id=?1",
+            "SELECT bridge_route,producer,issuer_epoch,state FROM managed_namespaces WHERE id=?1",
             [namespace_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?,r.get(4)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()?;
     match existing {
-        Some((old_route, old_pin, old_producer, old_epoch, state)) => {
-            if (old_route, old_pin, old_producer, old_epoch)
+        Some((old_route, old_producer, old_epoch, state)) => {
+            if (old_route, old_producer, old_epoch)
                 != (
                     route_json.clone(),
-                    Some(bridge_pin_json.clone()),
                     producer.to_owned(),
                     issuer_epoch.to_owned(),
                 )
@@ -1896,18 +2059,19 @@ pub(crate) fn reserve_bootstrap(
             tx.execute("INSERT INTO managed_namespaces(id,bridge_route,bridge_pin,producer,issuer_epoch,state) VALUES(?1,?2,?3,?4,?5,'open')",params![namespace_id,route_json,bridge_pin_json,producer,issuer_epoch])?;
         }
     }
-    let prior: Option<(String, String, String, String)> = tx
+    let prior: Option<(String, String, String, String, Option<String>)> = tx
         .query_row(
-            "SELECT namespace_id,invocation_key,command,proof_hash FROM managed_bootstrap WHERE id=?1",
+            "SELECT namespace_id,invocation_key,command,proof_hash,bridge_pin FROM managed_bootstrap WHERE id=?1",
             [bootstrap_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()?;
-    if let Some((namespace, invocation, previous_command, previous_proof)) = prior {
+    if let Some((namespace, invocation, previous_command, previous_proof, previous_pin)) = prior {
         if namespace != namespace_id
             || invocation != invocation_key
             || previous_command != command_json
             || previous_proof != proof_hash
+            || previous_pin.as_deref() != Some(&bridge_pin_json)
         {
             return Err(Fault::Conflict);
         }
@@ -1933,7 +2097,7 @@ pub(crate) fn reserve_bootstrap(
     {
         return Err(Fault::Unavailable);
     }
-    tx.execute("INSERT INTO managed_bootstrap(id,namespace_id,invocation_key,command,proof_hash,state) VALUES(?1,?2,?3,?4,?5,'prepared')",params![bootstrap_id,namespace_id,invocation_key,command_json,proof_hash])?;
+    tx.execute("INSERT INTO managed_bootstrap(id,namespace_id,invocation_key,command,proof_hash,state,bridge_pin) VALUES(?1,?2,?3,?4,?5,'prepared',?6)",params![bootstrap_id,namespace_id,invocation_key,command_json,proof_hash,bridge_pin_json])?;
     tx.commit()?;
     Ok(())
 }
@@ -1998,7 +2162,7 @@ pub(crate) fn record_bootstrap_ref(
     used_pin: &crate::managed_bridge::BridgePin,
 ) -> Result<(), Fault> {
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let (state,namespace,route,invocation,prior,stored_pin): (String,String,String,String,Option<String>,Option<String>) = tx.query_row("SELECT b.state,n.state,n.bridge_route,b.invocation_key,b.bridge_context_ref,n.bridge_pin FROM managed_bootstrap b JOIN managed_namespaces n ON n.id=b.namespace_id WHERE b.id=?1",[&dispatch.id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)))?;
+    let (state,namespace,route,invocation,prior,stored_pin): (String,String,String,String,Option<String>,Option<String>) = tx.query_row("SELECT b.state,n.state,n.bridge_route,b.invocation_key,b.bridge_context_ref,b.bridge_pin FROM managed_bootstrap b JOIN managed_namespaces n ON n.id=b.namespace_id WHERE b.id=?1",[&dispatch.id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)))?;
     let route: Route = decoded(&route)?;
     if state != "submitted"
         || namespace != "open"
@@ -2095,6 +2259,134 @@ pub(crate) fn abandon_unregistered_bootstrap(
 pub(crate) struct SealStatus {
     pub seal_id: String,
     pub sealed: bool,
+}
+
+/// Exact persisted request and endpoint for one superseded issuer retirement.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NamespaceRetirement {
+    pub namespace_id: String,
+    pub request_id: String,
+    pub retirement_key: String,
+    pub pool_seal_request_id: String,
+    pub run_pin: RunEndpointPin,
+    pub pool_route: Route,
+    pub bridge_route: Route,
+    pub producer: String,
+    pub issuer_epoch: String,
+}
+
+fn retirement_delay(attempts: i64) -> Result<i64, Fault> {
+    if attempts < 1 {
+        return Err(Fault::Internal);
+    }
+    let shift = u32::try_from((attempts - 1).min(6)).map_err(|_| Fault::Internal)?;
+    Ok(5_i64.saturating_mul(1_i64 << shift).min(300))
+}
+
+/// Stage or retry one exact retirement. `current_issuer` must come from a freshly
+/// authenticated Bridge discovery; absent discovery permits only existing retries.
+pub(crate) fn stage_namespace_retirement(
+    db: &mut Connection,
+    run_pin: &RunEndpointPin,
+    pool_route: &Route,
+    bridge_route: &Route,
+    producer: &str,
+    current_issuer: Option<&str>,
+    now: i64,
+) -> Result<Option<NamespaceRetirement>, Fault> {
+    if now < 0 {
+        return Err(Fault::Invalid);
+    }
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_run_route(&tx, run_pin)?;
+    check_pool_route(&tx, run_pin, pool_route, false)?;
+    let saved: Option<(String, i64)> = tx.query_row(
+        "SELECT plan,attempts FROM managed_namespace_retirements WHERE state='requested' AND next_attempt<=?1 AND json_extract(plan,'$.run_pin')=json(?2) AND json_extract(plan,'$.pool_route')=json(?3) AND json_extract(plan,'$.bridge_route')=json(?4) AND json_extract(plan,'$.producer')=?5 ORDER BY next_attempt,namespace_id LIMIT 1",
+        params![now, encoded(run_pin)?, encoded(pool_route)?, encoded(bridge_route)?, producer],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    ).optional()?;
+    if let Some((json, attempts)) = saved {
+        let plan: NamespaceRetirement = decoded(&json)?;
+        let delay = retirement_delay(attempts.saturating_add(1))?;
+        tx.execute("UPDATE managed_namespace_retirements SET attempts=attempts+1,next_attempt=?2 WHERE namespace_id=?1 AND state='requested'", params![plan.namespace_id, now.saturating_add(delay)])?;
+        tx.commit()?;
+        return Ok(Some(plan));
+    }
+    let Some(current_issuer) = current_issuer else {
+        return Ok(None);
+    };
+    wire_string(current_issuer)?;
+    let route = encoded(bridge_route)?;
+    let candidate: Option<(String, String)> = tx.query_row(
+        "SELECT n.id,n.issuer_epoch FROM managed_namespaces n WHERE n.bridge_route=?1 AND n.producer=?2 AND n.issuer_epoch!=?3 AND n.state='open' AND NOT EXISTS(SELECT 1 FROM managed_namespace_retirements r WHERE r.namespace_id=n.id) AND NOT EXISTS(SELECT 1 FROM managed_bootstrap b WHERE b.namespace_id=n.id AND b.state NOT IN ('terminal','stale_epoch')) AND NOT EXISTS(SELECT 1 FROM managed_intents i JOIN managed_contexts c ON c.id=i.context_id WHERE c.namespace_id=n.id AND (i.state NOT IN ('committed','aborted') OR i.bridge_resolved=0 OR i.run_resolved=0)) AND NOT EXISTS(SELECT 1 FROM managed_contexts c WHERE c.namespace_id=n.id AND c.state='prepared' AND NOT EXISTS(SELECT 1 FROM managed_intents i WHERE i.context_id=c.id)) AND NOT EXISTS(SELECT 1 FROM managed_delivery_seeds s JOIN managed_delivery_outbox o ON o.effect_id=s.effect_id WHERE (s.issuer_namespace IS NULL OR s.issuer_namespace=n.id) AND o.state NOT IN ('accepted','aborted','not_delivered')) ORDER BY n.rowid LIMIT 1",
+        params![route, producer, current_issuer], |r| Ok((r.get(0)?, r.get(1)?)),
+    ).optional()?;
+    let Some((namespace_id, issuer_epoch)) = candidate else {
+        return Ok(None);
+    };
+    let retirement_key = crate::domain::id();
+    let mut request_id = crate::domain::id();
+    while request_id == retirement_key {
+        request_id = crate::domain::id();
+    }
+    let mut pool_seal_request_id = crate::domain::id();
+    while pool_seal_request_id == retirement_key || pool_seal_request_id == request_id {
+        pool_seal_request_id = crate::domain::id();
+    }
+    let plan = NamespaceRetirement {
+        namespace_id,
+        request_id,
+        retirement_key,
+        pool_seal_request_id,
+        run_pin: run_pin.clone(),
+        pool_route: pool_route.clone(),
+        bridge_route: bridge_route.clone(),
+        producer: producer.into(),
+        issuer_epoch,
+    };
+    // Fence late bootstrap/commit work atomically with the durable request.
+    if tx.execute("UPDATE managed_namespaces SET state='draining',request_id=?2,retirement_key=?3,seal_id=?4 WHERE id=?1 AND state='open'", params![plan.namespace_id, plan.pool_seal_request_id, plan.retirement_key, crate::domain::id()])? != 1 {
+        return Err(Fault::Stale);
+    }
+    tx.execute("UPDATE managed_contexts SET state='invalidated' WHERE namespace_id=?1 AND state='prepared'", [&plan.namespace_id])?;
+    tx.execute("UPDATE managed_current_requests SET state='aborted' WHERE namespace_id=?1 AND state IN ('prepared','received')", [&plan.namespace_id])?;
+    tx.execute("INSERT INTO managed_namespace_retirements(namespace_id,plan,state,attempts,next_attempt) VALUES(?1,?2,'requested',1,?3)", params![plan.namespace_id, encoded(&plan)?, now.saturating_add(5)])?;
+    tx.commit()?;
+    Ok(Some(plan))
+}
+
+/// Start the backoff after an unavailable or uncertain response, without changing its key.
+pub(crate) fn defer_namespace_retirement(
+    db: &mut Connection,
+    plan: &NamespaceRetirement,
+    now: i64,
+) -> Result<(), Fault> {
+    if now < 0 {
+        return Err(Fault::Invalid);
+    }
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let attempts: i64 = tx.query_row(
+        "SELECT attempts FROM managed_namespace_retirements WHERE namespace_id=?1 AND plan=?2 AND state='requested'",
+        params![plan.namespace_id, encoded(plan)?], |r| r.get(0),
+    )?;
+    tx.execute(
+        "UPDATE managed_namespace_retirements SET next_attempt=max(next_attempt,?2) WHERE namespace_id=?1 AND state='requested'",
+        params![plan.namespace_id, now.saturating_add(retirement_delay(attempts)?)],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Record only an authenticated, fully correlated terminal Run retirement.
+pub(crate) fn complete_namespace_retirement(
+    db: &Connection,
+    plan: &NamespaceRetirement,
+) -> Result<(), Fault> {
+    if db.execute("UPDATE managed_namespace_retirements SET state='retired' WHERE namespace_id=?1 AND plan=?2 AND state IN ('requested','retired') AND EXISTS(SELECT 1 FROM managed_namespaces n WHERE n.id=managed_namespace_retirements.namespace_id AND n.state='sealed' AND n.request_id=?3 AND n.retirement_key=?4)", params![plan.namespace_id, encoded(plan)?, plan.pool_seal_request_id, plan.retirement_key])? != 1 {
+        return Err(Fault::Conflict);
+    }
+    Ok(())
 }
 /// Strip no-longer-actionable command/snapshot payloads while retaining all keys,
 /// terminal outcomes, route bindings and remote recovery receipts as tombstones.
@@ -2521,6 +2813,37 @@ pub(crate) mod tests {
         namespace: &str,
         issuer: &str,
     ) -> String {
+        prepare_with_pin(
+            db,
+            run,
+            binding,
+            incarnation,
+            id,
+            intent,
+            invocation,
+            cmd,
+            namespace,
+            issuer,
+            &fake_bridge_pin(binding),
+        )
+    }
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Fixture supplies the exact Bridge pin and independent durable identities"
+    )]
+    fn prepare_with_pin(
+        db: &mut Connection,
+        run: &FakeRun,
+        binding: &ManagedBinding,
+        incarnation: &Incarnation,
+        id: &str,
+        intent: &str,
+        invocation: &str,
+        cmd: &Command,
+        namespace: &str,
+        issuer: &str,
+        pin: &crate::managed_bridge::BridgePin,
+    ) -> String {
         let proof = native_proof();
         reserve_bootstrap(
             db,
@@ -2528,7 +2851,7 @@ pub(crate) mod tests {
                 namespace_id: namespace,
                 bootstrap_id: id,
                 route: &binding.bridge_route,
-                bridge_pin: &fake_bridge_pin(binding),
+                bridge_pin: pin,
                 producer: "pool",
                 issuer_epoch: issuer,
                 invocation_key: invocation,
@@ -2544,7 +2867,7 @@ pub(crate) mod tests {
             invocation_key: invocation.into(),
             expires_at_ms: 100,
         };
-        record_bootstrap_ref(db, dispatch, &prepared, &fake_bridge_pin(binding)).unwrap();
+        record_bootstrap_ref(db, dispatch, &prepared, pin).unwrap();
         record_fake_current(db, run, binding, incarnation, id, invocation, "initial");
         let digest = prepare_context(
             db,
@@ -2559,15 +2882,7 @@ pub(crate) mod tests {
             )],
         )
         .unwrap();
-        mark_registration_submitted(
-            db,
-            id,
-            id,
-            &format!("register-{id}"),
-            &digest,
-            &fake_bridge_pin(binding),
-        )
-        .unwrap();
+        mark_registration_submitted(db, id, id, &format!("register-{id}"), &digest, pin).unwrap();
         let mut consumed = fake_consumed(binding, incarnation, intent, invocation, &digest, cmd);
         consumed.receipt.issuer_epoch = issuer.into();
         let key = crate::managed_bridge::ConsumeKey {
@@ -2579,19 +2894,8 @@ pub(crate) mod tests {
             security_digest: &digest,
             audience: "pool",
         };
-        mark_bootstrap_consume_submitted(db, id, intent, &digest, &fake_bridge_pin(binding))
-            .unwrap();
-        record_bootstrap_consumption(
-            db,
-            id,
-            &key,
-            &consumed,
-            "pool",
-            cmd,
-            issuer,
-            &fake_bridge_pin(binding),
-        )
-        .unwrap();
+        mark_bootstrap_consume_submitted(db, id, intent, &digest, pin).unwrap();
+        record_bootstrap_consumption(db, id, &key, &consumed, "pool", cmd, issuer, pin).unwrap();
         record_fake_current(db, run, binding, incarnation, id, invocation, "fresh");
         digest
     }
@@ -3363,6 +3667,356 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(read_generation(&generation).unwrap(), 1);
     }
+
+    #[test]
+    fn repin_upgrades_new_invocations_and_keeps_old_intent_frozen() {
+        let (_dir, mut store, binding, incarnation, run) = fixture();
+        let db = store.test_db();
+        let pool_route = Route {
+            component_store_id: binding.pool_store_id.clone(),
+            route_id: "pool-route".into(),
+            worker_uid: binding.run_route.worker_uid,
+        };
+        let old_bridge = fake_bridge_pin(&binding);
+        let old_run = fake_run_endpoint(&binding);
+        persist_pool_route(db, &old_run, &pool_route).unwrap();
+        let digest = prepare(
+            db,
+            &run,
+            &binding,
+            &incarnation,
+            "old-context",
+            "old-intent",
+            "old-inv",
+            1,
+        );
+        assert!(matches!(
+            reserve(
+                db,
+                &run,
+                &binding,
+                &incarnation,
+                "old-context",
+                "old-inv",
+                "old-intent",
+                &command(1),
+                &digest
+            ),
+            Ok(IntentReservation::Created)
+        ));
+        let mut new_run = old_run.clone();
+        new_run.executable_sha256 = "c".repeat(64);
+        let mut new_bridge = old_bridge.clone();
+        new_bridge.server_sha256 = "d".repeat(64);
+        new_bridge.credential_sha256 = "e".repeat(64);
+        assert_eq!(persist_run_route(db, &new_run).err(), Some(Fault::Conflict));
+        assert_eq!(
+            persist_bridge_route(db, &new_bridge).err(),
+            Some(Fault::Conflict)
+        );
+        assert_eq!(
+            repin_routes(db, &new_bridge, &new_run, &pool_route, true).unwrap(),
+            (2, 2)
+        );
+        assert_eq!(
+            repin_routes(db, &new_bridge, &new_run, &pool_route, true).unwrap(),
+            (2, 2)
+        );
+        assert!(require_run_route(db, &new_run).is_ok());
+        let original = recovery_intent(db, "old-intent", &digest).unwrap();
+        assert!(original.run_pin.endpoint() == old_run);
+        assert!(original.bridge_pin == old_bridge);
+        let mut upgraded_config = fake_config(&binding);
+        upgraded_config.bridge_server_sha256 = new_bridge.server_sha256.clone();
+        upgraded_config
+            .managed_run_transport
+            .as_mut()
+            .unwrap()
+            .sha256 = new_run.executable_sha256.clone();
+        assert!(crate::managed_run::RunPeer::from_recovery(&upgraded_config, &original).is_err());
+        assert!(matches!(
+            stage_recovery(db, "old-intent", &digest).unwrap(),
+            RecoveryAction::LocallyFenced
+        ));
+        let RecoveryAction::BridgeAbort { pin, key, .. } =
+            stage_recovery(db, "old-intent", &digest).unwrap()
+        else {
+            panic!("original abort");
+        };
+        assert!(pin == old_bridge);
+        let abort = crate::managed_bridge::Abort {
+            store_id: binding.bridge_route.component_store_id.clone(),
+            aborted: true,
+            receipt: Some(
+                fake_consumed(
+                    &binding,
+                    &incarnation,
+                    "old-intent",
+                    "old-inv",
+                    &digest,
+                    &command(1),
+                )
+                .receipt,
+            ),
+        };
+        record_bridge_abort(db, "old-intent", &digest, &key.borrowed(), &abort, &pin).unwrap();
+        let mut next_command = command(1);
+        if let Command::Join(change) = &mut next_command {
+            change.request_key = "new-key".into();
+        }
+        let next_digest = prepare_with_pin(
+            db,
+            &run,
+            &binding,
+            &incarnation,
+            "new-context",
+            "new-intent",
+            "new-inv",
+            &next_command,
+            "namespace",
+            "epoch",
+            &new_bridge,
+        );
+        assert!(matches!(
+            reserve(
+                db,
+                &run,
+                &binding,
+                &incarnation,
+                "new-context",
+                "new-inv",
+                "new-intent",
+                &next_command,
+                &next_digest
+            ),
+            Ok(IntentReservation::Created)
+        ));
+        let new_intent = recovery_intent(db, "new-intent", &next_digest).unwrap();
+        assert!(new_intent.run_pin.endpoint() == new_run);
+        assert!(new_intent.bridge_pin == new_bridge);
+        let admission = consumed_admission(
+            db,
+            &run,
+            &binding,
+            &incarnation,
+            "new-intent",
+            "new-inv",
+            &next_digest,
+            &next_command,
+        );
+        mark_admitted(db, "new-intent", &next_digest, &admission).unwrap();
+        assert_eq!(
+            commit(
+                db,
+                "new-intent",
+                &next_digest,
+                |_, _| Ok("committed".into())
+            )
+            .unwrap(),
+            "committed"
+        );
+        let mut rotated = new_bridge.clone();
+        rotated.credential_sha256 = "f".repeat(64);
+        assert_eq!(
+            repin_routes(db, &rotated, &new_run, &pool_route, true).unwrap(),
+            (3, 2)
+        );
+        assert_eq!(
+            repin_routes(db, &rotated, &new_run, &pool_route, true).unwrap(),
+            (3, 2)
+        );
+        let original_new = recovery_intent(db, "new-intent", &next_digest).unwrap();
+        assert!(original_new.bridge_pin == new_bridge);
+        let mut rotated_command = command(1);
+        if let Command::Join(change) = &mut rotated_command {
+            change.request_key = "rotated-key".into();
+        }
+        let rotated_digest = prepare_with_pin(
+            db,
+            &run,
+            &binding,
+            &incarnation,
+            "rotated-context",
+            "rotated-intent",
+            "rotated-inv",
+            &rotated_command,
+            "namespace",
+            "epoch",
+            &rotated,
+        );
+        assert!(matches!(
+            reserve(
+                db,
+                &run,
+                &binding,
+                &incarnation,
+                "rotated-context",
+                "rotated-inv",
+                "rotated-intent",
+                &rotated_command,
+                &rotated_digest
+            ),
+            Ok(IntentReservation::Created)
+        ));
+    }
+
+    #[test]
+    fn repin_refuses_route_identity_changes_atomically() {
+        let (_dir, mut store, binding, _incarnation, _run) = fixture();
+        let db = store.test_db();
+        let pool_route = Route {
+            component_store_id: binding.pool_store_id.clone(),
+            route_id: "pool-route".into(),
+            worker_uid: binding.run_route.worker_uid,
+        };
+        let bridge = fake_bridge_pin(&binding);
+        let run = fake_run_endpoint(&binding);
+        persist_pool_route(db, &run, &pool_route).unwrap();
+        let mut upgraded = bridge.clone();
+        upgraded.server_sha256 = "c".repeat(64);
+        let mut wrong = run.clone();
+        wrong.route.route_id = "other".into();
+        assert_eq!(
+            repin_routes(db, &upgraded, &wrong, &pool_route, true).err(),
+            Some(Fault::Conflict)
+        );
+        wrong = run.clone();
+        wrong.route.component_store_id = "store_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into();
+        assert_eq!(
+            repin_routes(db, &upgraded, &wrong, &pool_route, true).err(),
+            Some(Fault::Conflict)
+        );
+        let mut wrong_bridge = upgraded.clone();
+        wrong_bridge.route.component_store_id = "00000000-0000-4000-8000-000000000004".into();
+        assert_eq!(
+            repin_routes(db, &wrong_bridge, &run, &pool_route, true).err(),
+            Some(Fault::Conflict)
+        );
+        wrong_bridge = upgraded.clone();
+        wrong_bridge.route.route_id = "other".into();
+        assert_eq!(
+            repin_routes(db, &wrong_bridge, &run, &pool_route, true).err(),
+            Some(Fault::Conflict)
+        );
+        wrong_bridge = upgraded.clone();
+        wrong_bridge.producer = "other".into();
+        assert_eq!(
+            repin_routes(db, &wrong_bridge, &run, &pool_route, true).err(),
+            Some(Fault::Conflict)
+        );
+        let mut wrong_pool = pool_route.clone();
+        wrong_pool.route_id = "other".into();
+        assert_eq!(
+            repin_routes(db, &upgraded, &run, &wrong_pool, true).err(),
+            Some(Fault::Conflict)
+        );
+        assert_eq!(
+            repin_routes(db, &bridge, &run, &pool_route, true).unwrap(),
+            (1, 1)
+        );
+        let mut conflicting_route = run.clone();
+        conflicting_route.route.route_id = "previously-inserted".into();
+        persist_run_route(db, &conflicting_route).unwrap();
+        assert_eq!(
+            repin_routes(db, &upgraded, &conflicting_route, &pool_route, true).err(),
+            Some(Fault::Conflict)
+        );
+    }
+
+    #[test]
+    fn v10_no_intent_migrates_and_first_repin_fences_pool_route() {
+        let (dir, mut store, binding, _incarnation, _run) = fixture();
+        crate::managed_egress::tests::add_seed(&mut store, &binding, "v10-seed", "old", false);
+        let db = store.test_db();
+        let bridge = fake_bridge_pin(&binding);
+        let run = fake_run_endpoint(&binding);
+        let proof = native_proof();
+        reserve_bootstrap(
+            db,
+            &BootstrapRequest {
+                namespace_id: "namespace",
+                bootstrap_id: "old",
+                route: &binding.bridge_route,
+                bridge_pin: &bridge,
+                producer: "pool",
+                issuer_epoch: "epoch",
+                invocation_key: "old-inv",
+                command: &command(1),
+                native_proof: &proof,
+            },
+        )
+        .unwrap();
+        db.execute_batch("DROP TABLE managed_namespace_retirements; DROP TABLE managed_route_pin_history; ALTER TABLE managed_bootstrap DROP COLUMN bridge_pin; ALTER TABLE managed_run_routes DROP COLUMN pool_route; ALTER TABLE managed_delivery_seeds DROP COLUMN issuer_namespace; PRAGMA user_version=10;").unwrap();
+        drop(store);
+        let mut reopened = Store::open(&dir.path().join("pool.db")).unwrap();
+        let db = reopened.test_db();
+        assert_eq!(
+            db.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap(),
+            11
+        );
+        let saved: String = db
+            .query_row(
+                "SELECT bridge_pin FROM managed_bootstrap WHERE id='old'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(saved, encoded(&bridge).unwrap());
+        let origin: Option<String> = db
+            .query_row(
+                "SELECT issuer_namespace FROM managed_delivery_seeds WHERE effect_id='v10-seed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(origin.is_none());
+        let pool_route = Route {
+            component_store_id: binding.pool_store_id.clone(),
+            route_id: "pool-route".into(),
+            worker_uid: binding.run_route.worker_uid,
+        };
+        assert_eq!(
+            repin_routes(db, &bridge, &run, &pool_route, true).unwrap(),
+            (1, 1)
+        );
+        let mut changed = pool_route.clone();
+        changed.route_id = "changed".into();
+        assert_eq!(
+            repin_routes(db, &bridge, &run, &changed, true).err(),
+            Some(Fault::Conflict)
+        );
+        drop(reopened);
+        let mut reopened = Store::open(&dir.path().join("pool.db")).unwrap();
+        assert_eq!(
+            repin_routes(reopened.test_db(), &bridge, &run, &changed, true).err(),
+            Some(Fault::Conflict)
+        );
+    }
+
+    #[test]
+    fn v10_repin_migration_failure_rolls_back() {
+        let (dir, mut store, _binding, _incarnation, _run) = fixture();
+        store.test_db().execute_batch("DROP TABLE managed_namespace_retirements; DROP TABLE managed_route_pin_history; ALTER TABLE managed_run_routes DROP COLUMN pool_route; ALTER TABLE managed_delivery_seeds DROP COLUMN issuer_namespace; PRAGMA user_version=10;").unwrap();
+        drop(store);
+        assert!(Store::open(&dir.path().join("pool.db")).is_err());
+        let db = Connection::open(dir.path().join("pool.db")).unwrap();
+        assert_eq!(
+            db.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap(),
+            10
+        );
+        assert_eq!(
+            db.query_row::<i64, _, _>(
+                "SELECT count(*) FROM sqlite_master WHERE name='managed_route_pin_history'",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(db.query_row::<i64, _, _>("SELECT count(*) FROM pragma_table_info('managed_run_routes') WHERE name='pool_route'", [], |r| r.get(0)).unwrap(), 0);
+    }
     #[test]
     fn effect_free_abort_domain_key_and_delayed_cas() {
         let (_dir, mut store, binding, incarnation, run) = fixture();
@@ -4000,6 +4654,15 @@ pub(crate) mod tests {
         };
         assert_eq!(reply.revision, 3);
         assert_eq!(reply.event.kind, "member_removed");
+        assert_eq!(
+            db.query_row::<String, _, _>(
+                "SELECT issuer_namespace FROM managed_delivery_seeds WHERE final_notice=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap(),
+            "namespace"
+        );
         let current: bool = db
             .query_row("SELECT current FROM members WHERE id='member'", [], |row| {
                 row.get(0)
@@ -5840,6 +6503,286 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn superseded_namespace_retirement_waits_for_its_seeds_and_retries_exact_keys() {
+        use crate::managed_egress::tests::add_seed;
+        let (_dir, mut store, binding, _incarnation, _run) = fixture();
+        let bridge = fake_bridge_pin(&binding);
+        let run = fake_run_endpoint(&binding);
+        let pool = Route {
+            component_store_id: binding.pool_store_id.clone(),
+            route_id: "pool-route".into(),
+            worker_uid: binding.run_route.worker_uid,
+        };
+        let proof = native_proof();
+        let command = command(1);
+        {
+            let db = store.test_db();
+            persist_pool_route(db, &run, &pool).unwrap();
+            for (ns, epoch) in [("old-ns", "old-epoch"), ("new-ns", "new-epoch")] {
+                reserve_bootstrap(
+                    db,
+                    &BootstrapRequest {
+                        namespace_id: ns,
+                        bootstrap_id: ns,
+                        route: &binding.bridge_route,
+                        bridge_pin: &bridge,
+                        producer: "pool",
+                        issuer_epoch: epoch,
+                        invocation_key: ns,
+                        command: &command,
+                        native_proof: &proof,
+                    },
+                )
+                .unwrap();
+                abandon_unregistered_bootstrap(db, ns).unwrap();
+            }
+            db.execute(
+                "INSERT INTO temp.managed_delivery_origin VALUES(1,'new-ns')",
+                [],
+            )
+            .unwrap();
+        }
+        add_seed(&mut store, &binding, "new-seed", "new traffic", false);
+        {
+            let db = store.test_db();
+            db.execute("DELETE FROM temp.managed_delivery_origin", [])
+                .unwrap();
+        }
+        add_seed(
+            &mut store,
+            &binding,
+            "external-seed",
+            "owner traffic",
+            false,
+        );
+        {
+            let db = store.test_db();
+            assert_eq!(db.query_row::<String, _, _>("SELECT issuer_namespace FROM managed_delivery_seeds WHERE effect_id='external-seed'", [], |r| r.get(0)).unwrap(), "");
+            db.execute(
+                "INSERT INTO temp.managed_delivery_origin VALUES(1,'old-ns')",
+                [],
+            )
+            .unwrap();
+        }
+        add_seed(&mut store, &binding, "old-seed", "old traffic", false);
+        let db = store.test_db();
+        db.execute("DELETE FROM temp.managed_delivery_origin", [])
+            .unwrap();
+        assert!(
+            stage_namespace_retirement(
+                db,
+                &run,
+                &pool,
+                &binding.bridge_route,
+                "pool",
+                Some("new-epoch"),
+                100
+            )
+            .unwrap()
+            .is_none()
+        );
+        db.execute(
+            "UPDATE managed_delivery_outbox SET state='accepted' WHERE effect_id='old-seed'",
+            [],
+        )
+        .unwrap();
+        // New issuer traffic remains pending and must not block the drained old issuer.
+        let plan = stage_namespace_retirement(
+            db,
+            &run,
+            &pool,
+            &binding.bridge_route,
+            "pool",
+            Some("new-epoch"),
+            100,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(plan.namespace_id, "old-ns");
+        assert_eq!(
+            db.query_row::<String, _, _>(
+                "SELECT state FROM managed_namespaces WHERE id='old-ns'",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+            "draining"
+        );
+        assert!(
+            stage_namespace_retirement(db, &run, &pool, &binding.bridge_route, "pool", None, 104)
+                .unwrap()
+                .is_none()
+        );
+        // A lost/unavailable Run attempt reuses all three durable keys after backoff.
+        defer_namespace_retirement(db, &plan, 110).unwrap();
+        assert!(
+            stage_namespace_retirement(db, &run, &pool, &binding.bridge_route, "pool", None, 114)
+                .unwrap()
+                .is_none()
+        );
+        let retry =
+            stage_namespace_retirement(db, &run, &pool, &binding.bridge_route, "pool", None, 115)
+                .unwrap()
+                .unwrap();
+        assert_eq!(encoded(&plan).unwrap(), encoded(&retry).unwrap());
+        assert_eq!(
+            complete_namespace_retirement(db, &plan).err(),
+            Some(Fault::Conflict)
+        );
+        let sealed = seal_namespace(
+            db,
+            &plan.bridge_route,
+            &plan.producer,
+            &plan.issuer_epoch,
+            &plan.pool_seal_request_id,
+            &plan.retirement_key,
+        )
+        .unwrap();
+        assert!(sealed.sealed);
+        let replay = seal_namespace(
+            db,
+            &plan.bridge_route,
+            &plan.producer,
+            &plan.issuer_epoch,
+            &plan.pool_seal_request_id,
+            &plan.retirement_key,
+        )
+        .unwrap();
+        assert_eq!(replay.seal_id, sealed.seal_id);
+        complete_namespace_retirement(db, &plan).unwrap();
+        complete_namespace_retirement(db, &plan).unwrap();
+        assert!(
+            stage_namespace_retirement(
+                db,
+                &run,
+                &pool,
+                &binding.bridge_route,
+                "pool",
+                Some("new-epoch"),
+                500
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(
+            db.query_row::<String, _, _>(
+                "SELECT state FROM managed_delivery_outbox WHERE effect_id='new-seed'",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+            "pending"
+        );
+    }
+
+    #[test]
+    fn namespace_retirement_refuses_active_intents_and_legacy_unknown_origin() {
+        use crate::managed_egress::tests::add_seed;
+        let (_dir, mut store, binding, incarnation, run_authority) = fixture();
+        let run = fake_run_endpoint(&binding);
+        let pool = Route {
+            component_store_id: binding.pool_store_id.clone(),
+            route_id: "pool-route".into(),
+            worker_uid: binding.run_route.worker_uid,
+        };
+        let db = store.test_db();
+        persist_pool_route(db, &run, &pool).unwrap();
+        let digest = prepare(
+            db,
+            &run_authority,
+            &binding,
+            &incarnation,
+            "ctx",
+            "intent",
+            "inv",
+            1,
+        );
+        reserve(
+            db,
+            &run_authority,
+            &binding,
+            &incarnation,
+            "ctx",
+            "inv",
+            "intent",
+            &command(1),
+            &digest,
+        )
+        .unwrap();
+        assert!(
+            stage_namespace_retirement(
+                db,
+                &run,
+                &pool,
+                &binding.bridge_route,
+                "pool",
+                Some("next-epoch"),
+                100
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(matches!(
+            stage_recovery(db, "intent", &digest).unwrap(),
+            RecoveryAction::LocallyFenced
+        ));
+        // A terminal local result is still unsettled until both remote fences are recorded.
+        assert!(
+            stage_namespace_retirement(
+                db,
+                &run,
+                &pool,
+                &binding.bridge_route,
+                "pool",
+                Some("next-epoch"),
+                100
+            )
+            .unwrap()
+            .is_none()
+        );
+        db.execute(
+            "UPDATE managed_intents SET bridge_resolved=1,run_resolved=1 WHERE id='intent'",
+            [],
+        )
+        .unwrap();
+        add_seed(&mut store, &binding, "legacy-seed", "legacy", false);
+        let db = store.test_db();
+        // Recreate the NULL provenance left by migration, without weakening the production trigger.
+        db.execute_batch("DROP TRIGGER managed_delivery_seeds_immutable; UPDATE managed_delivery_seeds SET issuer_namespace=NULL WHERE effect_id='legacy-seed'; CREATE TRIGGER managed_delivery_seeds_immutable BEFORE UPDATE ON managed_delivery_seeds BEGIN SELECT RAISE(ABORT,'immutable managed delivery seed'); END;").unwrap();
+        assert!(
+            stage_namespace_retirement(
+                db,
+                &run,
+                &pool,
+                &binding.bridge_route,
+                "pool",
+                Some("next-epoch"),
+                100
+            )
+            .unwrap()
+            .is_none()
+        );
+        db.execute(
+            "UPDATE managed_delivery_outbox SET state='accepted' WHERE effect_id='legacy-seed'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            stage_namespace_retirement(
+                db,
+                &run,
+                &pool,
+                &binding.bridge_route,
+                "pool",
+                Some("next-epoch"),
+                100
+            )
+            .unwrap()
+            .is_some()
+        );
+    }
+
+    #[test]
     fn managed_capacity_counts_only_live_work_and_compacts_after_seal() {
         let (directory, mut store, binding, incarnation, run) = fixture();
         let path = directory.path().join("pool.db");
@@ -6232,7 +7175,7 @@ pub(crate) mod tests {
         assert_eq!(
             db.query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap(),
-            10
+            11
         );
         let payloads:(String,String,String)=db.query_row("SELECT b.command,c.command,c.snapshot FROM managed_bootstrap b JOIN managed_contexts c ON c.invocation_key=b.invocation_key WHERE b.id='old'",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
         assert_eq!(payloads, ("{}".into(), "{}".into(), "{}".into()));
@@ -7219,7 +8162,7 @@ pub(crate) fn recover_bootstrap_ref(
         String,
         Option<String>,
     );
-    let (namespace,invocation,old_command,old_proof,state,old_ref,ns_state,stored_route,stored_producer,stored_epoch,stored_pin):BootstrapRecoveryRow=tx.query_row("SELECT b.namespace_id,b.invocation_key,b.command,b.proof_hash,b.state,b.bridge_context_ref,n.state,n.bridge_route,n.producer,n.issuer_epoch,n.bridge_pin FROM managed_bootstrap b JOIN managed_namespaces n ON n.id=b.namespace_id WHERE b.id=?1",[bootstrap_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?)))?;
+    let (namespace,invocation,old_command,old_proof,state,old_ref,ns_state,stored_route,stored_producer,stored_epoch,stored_pin):BootstrapRecoveryRow=tx.query_row("SELECT b.namespace_id,b.invocation_key,b.command,b.proof_hash,b.state,b.bridge_context_ref,n.state,n.bridge_route,n.producer,n.issuer_epoch,b.bridge_pin FROM managed_bootstrap b JOIN managed_namespaces n ON n.id=b.namespace_id WHERE b.id=?1",[bootstrap_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?)))?;
     if state != "submitted" || ns_state != "open" {
         return Err(Fault::Stale);
     }
@@ -7477,6 +8420,7 @@ pub(crate) fn persist_run_route(db: &mut Connection, pin: &RunEndpointPin) -> Re
         "INSERT INTO managed_run_routes(route,pin) VALUES(?1,?2)",
         params![route, pin_json],
     )?;
+    append_route_pin(&tx, "run", &route, &pin_json)?;
     tx.commit()?;
     Ok(())
 }
@@ -7833,7 +8777,7 @@ pub(crate) fn recovery_intent(
     let run_pin: RunPin = decoded(&pin_json)?;
     let run_route: Route = decoded(&run_json)?;
     let pool_route: Route = decoded(&pool_json)?;
-    let bridge_pin_json:Option<String>=db.query_row("SELECT n.bridge_pin FROM managed_intents i JOIN managed_contexts c ON c.id=i.context_id JOIN managed_namespaces n ON n.id=c.namespace_id WHERE i.id=?1",[intent_id],|row|row.get(0))?;
+    let bridge_pin_json:Option<String>=db.query_row("SELECT b.bridge_pin FROM managed_intents i JOIN managed_contexts c ON c.id=i.context_id JOIN managed_bootstrap b ON b.namespace_id=c.namespace_id AND b.invocation_key=c.invocation_key WHERE i.id=?1",[intent_id],|row|row.get(0))?;
     let bridge_pin: crate::managed_bridge::BridgePin =
         decoded(bridge_pin_json.as_deref().ok_or(Fault::Unavailable)?)?;
     let consumed_ref: crate::managed_run::ConsumedRef =
@@ -8470,7 +9414,7 @@ pub(crate) fn stage_bootstrap_recovery(
         Option<String>,
         String,
     );
-    let (invocation,registration,consume_id,abort_id,context_id,context_json,pin_json,producer):BootstrapStageRow=db.query_row("SELECT b.invocation_key,b.registration_digest,b.consume_request_id,b.bridge_abort_request_id,c.id,c.context,n.bridge_pin,n.producer FROM managed_bootstrap b JOIN managed_namespaces n ON n.id=b.namespace_id LEFT JOIN managed_contexts c ON c.invocation_key=b.invocation_key AND c.namespace_id=b.namespace_id WHERE b.id=?1",[bootstrap_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?)))?;
+    let (invocation,registration,consume_id,abort_id,context_id,context_json,pin_json,producer):BootstrapStageRow=db.query_row("SELECT b.invocation_key,b.registration_digest,b.consume_request_id,b.bridge_abort_request_id,c.id,c.context,b.bridge_pin,n.producer FROM managed_bootstrap b JOIN managed_namespaces n ON n.id=b.namespace_id LEFT JOIN managed_contexts c ON c.invocation_key=b.invocation_key AND c.namespace_id=b.namespace_id WHERE b.id=?1",[bootstrap_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?)))?;
     let Some(digest) = registration else {
         abandon_unregistered_bootstrap(db, bootstrap_id)?;
         return Ok(BootstrapRecoveryAction::LocallyAbandoned);

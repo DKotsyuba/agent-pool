@@ -11,9 +11,9 @@ its EOF never starts, stops or replaces the resident.
 - `domain.rs` defines strict flat commands, safe public views and private outbox work.
 - `store.rs` owns the single SQLite writer and synchronous transactions. A process
   lifetime file lock excludes a second writer. WAL, full synchronization, foreign
-  keys and schema version 10 are explicit. Future schema versions refuse to open.
-  Schema v1–v9 upgrades transactionally to v10 before use; older binaries must
-  refuse v10 because they cannot preserve newer durable state. The v5 replacement
+  keys and schema version 11 are explicit. Future schema versions refuse to open.
+  Schema v1–v10 upgrades transactionally to v11 before use; older binaries must
+  refuse v11 because they cannot preserve newer durable state. The v5 replacement
   and stable-slot migration and v6 inventory revision fence remain in that upgrade.
 - `runtime.rs` supervises bounded frontend connections, one serial effect worker
   and rotating observation batches. Blocking database work never spans provider I/O.
@@ -466,6 +466,37 @@ pending until its original Bridge abort is durably recorded. Immediate managed
 list and get projections recheck the captured binding in the same transaction;
 managed long polls are not implemented.
 
+### Operator re-pin after an upgrade or credential rotation
+
+The resident never accepts a different executable hash or Bridge credential hash
+implicitly. To approve an upgrade, stop the Pool resident and wait for it to exit,
+then install and start the intended Run and Bridge services at their existing
+configured paths. Update the private Pool config with the new executable SHA-256
+values, including `managed_run_reader.sha256` when that reader uses the upgraded
+Run build, and provision the rotated Bridge credential at its existing private path.
+Run `agent-pool repin --config /absolute/path/to/pool.toml`, then start the Pool
+resident separately. This command does not stop or start any service. It requires
+the existing private Pool store and its exclusive writer lease, authenticates both
+candidate service peers and checks their configured stores through the same pinned
+capability exchanges used by managed operation. It refuses changed Run, Bridge or
+known Pool store/route identities, endpoints, producer or credential path. A failed
+check leaves both active pins unchanged. If multiple stored route identities share
+either configured endpoint, re-pin refuses the ambiguous store. A repeated command with the same identities
+is a no-op and reports the same per-route generation. Each actual pin change
+increments its generation; previous pins remain in the store.
+
+The Pool route is stored with the Run pin on initial use. For migrated v10 stores,
+Pool derives it from retained intents when possible. If no intent recorded that
+route, the first successful re-pin records the configured Pool route; subsequent
+uses and re-pins must match it. If prior intents disagree, re-pin fails closed.
+Each bootstrap retains its original Bridge pin, each intent its original Run pin,
+and a frozen delivery retains both original pins and target. Re-pinning never
+retargets or resends them. Recovery continues only when the original route, build
+and credential can still be authenticated; otherwise the original work remains
+unresolved or unknown under its existing recovery rules. Preserve old binaries and
+credentials if they may be needed to reconcile such work. Re-pin does not itself
+settle or discard unresolved work.
+
 Consensus captures voter identities in a SQLite read snapshot, checks all voters
 against Run without holding that transaction, then applies generation and roster
 CAS. A superseded verified voter triggers a separately capability-gated Run egress
@@ -533,6 +564,26 @@ The B1 issuer namespace seal covers P1 ingress contexts, consumes and admissions
 It neither fences nor waits for P2 egress. Managed egress derives its authority
 from a Run egress receipt and uses its separate B2 effect ledger and producer
 scope retirement lifecycle.
+
+The resident discovers the current Bridge issuer over the pinned authenticated
+route and checks superseded issuer namespaces for drain. It waits for their
+bootstraps, contexts, intents and Run/Bridge settlement, and for undelivered
+egress seeds attributed to that issuer. Schema v11 records the exact namespace
+on each managed-origin seed in the same transaction as its event. New owner or
+legacy-origin seeds have an explicit non-issuer origin: their B2 authority is the
+producer scope and Run egress receipt. Migrated v10 seeds have unknown origin and
+conservatively block every issuer until terminal. Other issuers' new traffic does
+not block retirement of a drained namespace.
+
+Pool atomically fences the drained namespace and records the Run retirement
+request, retirement key, Pool seal request ID and original Run endpoint before
+I/O. Run authenticates Pool, fences the old issuer and calls Pool's namespace
+seal; Pool accepts the already recorded seal key and returns a stable seal ID.
+Run then retires the Bridge namespace. Pool records only a matching authenticated
+terminal result after its own seal; unavailable services and lost replies retry
+the same keys with bounded exponential backoff. A changed pin never silently
+retargets a pending retirement. This implements erratum E11 and does not authorize
+native delivery or claim installed-provider qualification.
 
 The owner observer capability `managed_capacity_v1` accepts
 `{"schema_version":1,"operation":"managed_capacity","params":{}}` through
@@ -623,7 +674,7 @@ delivery are separate facts. Inventory orders by pool ID; archive orders by
 retained proposal insertion sequence; other sections preserve existing cursor
 semantics. Pages observe current state independently; mutable offset sections
 require the revision fence on continuation.
-Store schema v10 has no historical timestamps: `source_timestamp:null` and
+Store schema v11 has no historical timestamps: `source_timestamp:null` and
 coverage text disclose that absence. Complete encoded envelopes including the
 newline are capped at 1 MiB; oversized results fail explicitly without partial
 publication or silently advancing a cursor. Resident exchanges use the existing

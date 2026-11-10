@@ -175,6 +175,21 @@ CREATE INDEX managed_delivery_scopes_state ON managed_delivery_scopes(state);")?
     )
 }
 
+/// Version 11 retains every route pin and freezes the Bridge pin per bootstrap.
+fn migrate_managed_route_pins(db: &Connection) -> Result<(), Fault> {
+    db.execute_batch("\
+CREATE TABLE managed_route_pin_history(kind TEXT NOT NULL CHECK(kind IN ('run','bridge')),route TEXT NOT NULL,generation INTEGER NOT NULL CHECK(generation>0),pin TEXT NOT NULL,PRIMARY KEY(kind,route,generation));\
+INSERT INTO managed_route_pin_history SELECT 'run',route,1,pin FROM managed_run_routes;\
+INSERT INTO managed_route_pin_history SELECT 'bridge',route,1,pin FROM managed_bridge_routes;\
+ALTER TABLE managed_run_routes ADD COLUMN pool_route TEXT;\
+UPDATE managed_run_routes SET pool_route=(SELECT MIN(pool_route) FROM managed_intents WHERE run_route=managed_run_routes.route HAVING COUNT(DISTINCT pool_route)=1);\
+ALTER TABLE managed_bootstrap ADD COLUMN bridge_pin TEXT;\
+UPDATE managed_bootstrap SET bridge_pin=(SELECT bridge_pin FROM managed_namespaces WHERE id=managed_bootstrap.namespace_id);\
+ALTER TABLE managed_delivery_seeds ADD COLUMN issuer_namespace TEXT;\
+CREATE TABLE managed_namespace_retirements(namespace_id TEXT PRIMARY KEY REFERENCES managed_namespaces(id),plan TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('requested','retired')),attempts INTEGER NOT NULL CHECK(attempts>0),next_attempt INTEGER NOT NULL CHECK(next_attempt>=0));")?;
+    Ok(())
+}
+
 /// Read totals, page, roster and its revision from one SQLite snapshot.
 fn inventory_snapshot(
     db: &Connection,
@@ -481,9 +496,21 @@ impl Store {
         &mut self,
         bridge: &crate::managed_bridge::BridgePin,
         run: &crate::managed_state::RunEndpointPin,
+        pool_route: &crate::managed_state::Route,
     ) -> Result<(), Fault> {
         crate::managed_state::persist_bridge_route(&mut self.db, bridge)?;
-        crate::managed_state::persist_run_route(&mut self.db, run)
+        crate::managed_state::persist_run_route(&mut self.db, run)?;
+        crate::managed_state::persist_pool_route(&mut self.db, run, pool_route)
+    }
+    /// Check or atomically install an operator-verified pair of existing route pins.
+    pub(crate) fn managed_repin_routes(
+        &mut self,
+        bridge: &crate::managed_bridge::BridgePin,
+        run: &crate::managed_state::RunEndpointPin,
+        pool_route: &crate::managed_state::Route,
+        apply: bool,
+    ) -> Result<(i64, i64), Fault> {
+        crate::managed_state::repin_routes(&mut self.db, bridge, run, pool_route, apply)
     }
     #[allow(
         clippy::too_many_arguments,
@@ -991,6 +1018,45 @@ impl Store {
             retirement,
         )
     }
+    /// Freeze one superseded namespace request or recover its due exact key.
+    pub(crate) fn managed_stage_namespace_retirement(
+        &mut self,
+        run: &crate::managed_state::RunEndpointPin,
+        pool_route: &crate::managed_state::Route,
+        bridge_route: &crate::managed_state::Route,
+        producer: &str,
+        current_issuer: Option<&str>,
+        now: i64,
+    ) -> Result<Option<crate::managed_state::NamespaceRetirement>, Fault> {
+        crate::managed_state::stage_namespace_retirement(
+            &mut self.db,
+            run,
+            pool_route,
+            bridge_route,
+            producer,
+            current_issuer,
+            now,
+        )
+    }
+    /// Avoid contacting providers when no namespace can need retirement.
+    pub(crate) fn managed_has_namespace_retirement_work(&self) -> Result<bool, Fault> {
+        self.db.query_row("SELECT EXISTS(SELECT 1 FROM managed_namespaces WHERE state='open') OR EXISTS(SELECT 1 FROM managed_namespace_retirements WHERE state='requested')", [], |row| row.get(0)).map_err(Into::into)
+    }
+    /// Record a fully correlated terminal retirement after Run's authenticated response.
+    pub(crate) fn managed_complete_namespace_retirement(
+        &mut self,
+        plan: &crate::managed_state::NamespaceRetirement,
+    ) -> Result<(), Fault> {
+        crate::managed_state::complete_namespace_retirement(&self.db, plan)
+    }
+    /// Keep a failed or uncertain exact-key attempt behind its durable retry time.
+    pub(crate) fn managed_defer_namespace_retirement(
+        &mut self,
+        plan: &crate::managed_state::NamespaceRetirement,
+        now: i64,
+    ) -> Result<(), Fault> {
+        crate::managed_state::defer_namespace_retirement(&mut self.db, plan, now)
+    }
     /// Grants unit fixtures direct access to the isolated SQLite connection.
     #[cfg(test)]
     pub(crate) fn test_db(&mut self) -> &mut Connection {
@@ -1135,7 +1201,7 @@ impl Store {
             }
         }
     }
-    /// Opens one private database, takes a nonblocking writer lease and migrates to schema v10.
+    /// Opens one private database, takes a nonblocking writer lease and migrates to schema v11.
     /// The existing parent must be a real 0700 directory; future schemas and second writers refuse.
     pub fn open(path: &Path) -> Result<Self, Fault> {
         let parent = path.parent().ok_or(Fault::Invalid)?;
@@ -1171,13 +1237,13 @@ impl Store {
         let db = Connection::open(path)?;
         db.busy_timeout(Duration::from_secs(2))?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if !(0..=10).contains(&version) {
+        if !(0..=11).contains(&version) {
             return Err(Fault::Conflict);
         }
         db.execute_batch(
             "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;",
         )?;
-        if version < 10 {
+        if version < 11 {
             db.execute_batch("BEGIN IMMEDIATE;")?;
         }
         if version == 0 {
@@ -1221,8 +1287,14 @@ PRAGMA user_version=5;")?;
         if version < 10 {
             migrate_managed_egress(&db)?;
             db.execute_batch("PRAGMA user_version=10;")?;
+        }
+        if version < 11 {
+            migrate_managed_route_pins(&db)?;
+            db.execute_batch("PRAGMA user_version=11;")?;
             db.execute_batch("COMMIT;")?;
         }
+        // Transaction-local managed mutation provenance, never retained after restart.
+        db.execute_batch("CREATE TEMP TABLE managed_delivery_origin(singleton INTEGER PRIMARY KEY CHECK(singleton=1),namespace_id TEXT NOT NULL);")?;
         // Only a pending, event-bound egress probe can resume its original Run key.
         db.execute("UPDATE managed_current_requests SET state='aborted' WHERE namespace_id IS NULL AND state IN ('prepared','received') AND NOT EXISTS(SELECT 1 FROM managed_delivery_outbox o WHERE o.state='pending' AND o.probe_request_id=managed_current_requests.id)", [])?;
         // A crash may have happened after a provider accepted the work. Never turn these back into queued.
@@ -2432,7 +2504,24 @@ pub(crate) fn apply_managed_mutation(
         &binding.actor.native_id,
         &binding.actor.role,
     )?;
-    let reply = execute_authorized(db, &actor, command, Some(binding), checked_consensus)?;
+    if db.is_autocommit() {
+        return Err(Fault::Internal);
+    }
+    let namespace: String = db.query_row(
+        "SELECT namespace_id FROM managed_contexts WHERE intent_id=?1 AND invocation_key=?2",
+        params![context.intent_id, context.invocation_key],
+        |row| row.get(0),
+    )?;
+    db.execute(
+        "INSERT INTO temp.managed_delivery_origin(singleton,namespace_id) VALUES(1,?1)",
+        [&namespace],
+    )?;
+    let result = execute_authorized(db, &actor, command, Some(binding), checked_consensus);
+    db.execute(
+        "DELETE FROM temp.managed_delivery_origin WHERE singleton=1",
+        [],
+    )?;
+    let reply = result?;
     let Reply::Receipt(receipt) = &reply else {
         return Err(Fault::Internal);
     };
@@ -9067,7 +9156,7 @@ mod tests {
                 .db
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 10);
+            assert_eq!(version, 11);
             assert_eq!(
                 encode(&before).unwrap(),
                 encode(&upgraded.execute(&owner, &command).unwrap()).unwrap()
@@ -9113,7 +9202,7 @@ mod tests {
                 .db
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 10);
+            assert_eq!(version, 11);
             let retained: String = upgraded
                 .db
                 .query_row("SELECT store_id FROM inventory_source", [], |row| {
