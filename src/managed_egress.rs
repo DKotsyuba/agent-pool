@@ -2679,6 +2679,126 @@ pub(crate) mod tests {
         assert_eq!(live_effects(&mut store), 0);
     }
 
+    /// The refusal arrives through the real SDK decode and validation path
+    /// (`publish_managed_owner_v1` against an isolated peer process), not a
+    /// hand-built result, and Pool still maps it to a terminal `not_delivered`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sdk_decoded_attempt_mismatch_known_unsent_is_not_delivered() {
+        use sha2::Digest;
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+
+        // The child is a task-owned copy of this test executable acting as the
+        // Bridge peer whose loaded image the SDK pins by path and hash.
+        if let Some(socket) = std::env::var_os("POOL_MISMATCH_SYNTHETIC_SOCKET") {
+            let listener = UnixListener::bind(socket).unwrap();
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let op = request["op"].as_str().unwrap();
+            assert_eq!(op, "publish_managed_owner_v1");
+            let params = &request["params"];
+            let value = serde_json::json!({
+                "version": 1,
+                "store_id": params["expected_store_id"],
+                "producer": "pool",
+                "producer_scope": params["outbox_intent"]["producer_scope"],
+                "effect_id": params["outbox_intent"]["effect_id"],
+                "effect_digest": params["effect_digest"],
+                "state": "known_unsent",
+                "protocol": null,
+                "native_id": null,
+                "reason": "attempt_mismatch",
+            });
+            let response = serde_json::json!({"api_version":1,"request_id":request["request_id"],"success":true,"result":{"op":op,"value":{"status":"ok","value":value}}});
+            writeln!(stream, "{response}").unwrap();
+            return;
+        }
+
+        let _hash_guard = crate::TEST_EXEC_HASH_LOCK.blocking_lock();
+        let directory = tempfile::tempdir_in(std::env::var_os("TMPDIR").unwrap()).unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = directory.path().join("bridge.sock");
+        let executable = directory.path().join("fake-bridge");
+        std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o500)).unwrap();
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let _process = ChildGuard(
+            std::process::Command::new(&executable)
+                .args([
+                    "--exact",
+                    "managed_egress::tests::sdk_decoded_attempt_mismatch_known_unsent_is_not_delivered",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env("POOL_MISMATCH_SYNTHETIC_SOCKET", &socket)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !socket.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "synthetic Bridge did not bind"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut config = bridge_sdk::Config::new(
+            &socket,
+            &socket,
+            bridge_sdk::bridge_protocol::Secret::new("fixture-only"),
+            // The SDK hashes the full debug test binary for the peer check.
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+        config.reconnect_once = false;
+        let sha = format!(
+            "{:x}",
+            sha2::Sha256::digest(std::fs::read(&executable).unwrap())
+        );
+        let bridge = crate::managed_bridge::SdkBridge {
+            client: bridge_sdk::Client::new(config).unwrap(),
+            server_pin: bridge_sdk::attempt::AttemptServerPin::new(&executable, sha).unwrap(),
+        };
+
+        let (_directory, mut store, binding, incarnation, _run) = fixture();
+        index_managed_member(store.test_db(), &binding);
+        add_seed(&mut store, &binding, "stale", "hello", false);
+        let frozen = freeze_next(&mut store, &binding, &incarnation, "stale", "next", 2);
+        let (_, dispatch) = begin_publish(store.test_db(), "stale").unwrap();
+        let decoded = OwnerClient::publish(&bridge, &dispatch, &frozen).unwrap();
+        assert_eq!(decoded.state, ManagedOwnerStateV1::KnownUnsent);
+        assert_eq!(decoded.reason.as_deref(), Some("attempt_mismatch"));
+        assert_eq!(
+            record_result(store.test_db(), "stale", Some(&dispatch), &decoded, false).unwrap(),
+            State::NotDelivered
+        );
+        assert_eq!(
+            owner_attention(store.test_db(), "stale")
+                .unwrap()
+                .0
+                .as_deref(),
+            Some("delivery_refused_attempt_mismatch")
+        );
+        assert_eq!(
+            begin_publish(store.test_db(), "stale").err(),
+            Some(Fault::Stale)
+        );
+    }
+
     #[test]
     fn attempt_mismatch_is_terminal_for_its_generation_and_a_rebind_delivers_new_events() {
         let (_directory, mut store, binding, incarnation, _run) = fixture();

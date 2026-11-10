@@ -114,7 +114,8 @@ dependencies = [
 
 [[package]]
 name = "bridge-protocol"
-version = "0.6.6"
+version = "0.7.0"
+source = "git+https://github.com/DKotsyuba/agent-bridge.git?rev=c12376fe8a89fd18dd4bb21e0c55aec1308e1e5f#c12376fe8a89fd18dd4bb21e0c55aec1308e1e5f"
 dependencies = [
  "serde",
  "serde_json",
@@ -123,7 +124,8 @@ dependencies = [
 
 [[package]]
 name = "bridge-sdk"
-version = "0.6.6"
+version = "0.7.0"
+source = "git+https://github.com/DKotsyuba/agent-bridge.git?rev=c12376fe8a89fd18dd4bb21e0c55aec1308e1e5f#c12376fe8a89fd18dd4bb21e0c55aec1308e1e5f"
 dependencies = [
  "bridge-protocol",
  "serde",
