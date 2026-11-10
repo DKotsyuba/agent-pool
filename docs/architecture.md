@@ -497,7 +497,9 @@ unreleased sagas. Ed25519 signing keys and transient seeds are zeroized on drop.
 record preserves Run's exact status timestamp text.
 
 C3: once a record exists, update, add, start, batch, replace, cancel
-replacement, assignment change, remove, join, propose and vote return `closed`.
+replacement, assignment change, remove, join, propose and vote return `closed`;
+the text states that the pool is completed, not explicitly closed (internally a
+distinct `completed` refusal).
 Late admission receipts cannot change a completed pool. When a start, batch or
 replacement admission (including one found by recovery) arrives after
 completion, one transaction retains the exact receipt identifiers in the

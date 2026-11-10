@@ -1596,7 +1596,10 @@ async fn p3_completion_counts() {
             member_id: "member-1".into(),
         }),
     ] {
-        assert_eq!(guard.execute(&owner(), &command).err(), Some(Fault::Closed));
+        assert_eq!(
+            guard.execute(&owner(), &command).err(),
+            Some(Fault::Completed)
+        );
     }
     guard
         .execute(

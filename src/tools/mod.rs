@@ -305,7 +305,7 @@ pub fn present(reply: Result<Reply, Fault>, templates: &Templates) -> CallToolRe
         Ok(Reply::Pending{pool_id,request_key})=>templates.render("pool_pending",&PendingView{pool_id,request_key}),
         Ok(Reply::List{pools,next_after,has_more})=>templates.render("pool_list",&ListView{pools,next_after,has_more:*has_more}),
         Ok(Reply::Enrollment(view))=>templates.render("pool_enrollment",view),
-        Err(code)=>templates.render("pool_error",&ErrorView{code:*code,recovery:match code{
+        Err(code)=>templates.render("pool_error",&ErrorView{code:if *code==Fault::Completed{Fault::Closed}else{*code},recovery:match code{
             Fault::Stale=>"Read pool_get for current revision and proposal/roster identity before a new intent.",
             Fault::Unavailable=>"A previous write may have committed. Inspect pool_get or repeat only the identical request_key and intent.",
             Fault::RelaunchRequired=>"Relaunch the Pool resident after Bridge managed mode is enabled. Preserve the original request_key for recovery.",
@@ -313,6 +313,7 @@ pub fn present(reply: Result<Reply, Fault>, templates: &Templates) -> CallToolRe
             Fault::Forbidden=>"The current authenticated caller cannot perform this action.",
             Fault::Conflict=>"A role, membership or idempotency conflict prevents this intent.",
             Fault::Closed=>"This pool was explicitly closed; global leader status remains.",
+            Fault::Completed=>"This pool is completed: a formal completion record is committed and final (it was not explicitly closed). Reads, messages, explicit close and history release remain.",
             Fault::Invalid=>"Check documented fields, UTF-8 byte limits and exact identifiers.",
             Fault::Internal=>"No success is confirmed. Inspect state before repeating the same intent.",
         }}),
@@ -324,6 +325,7 @@ pub fn present(reply: Result<Reply, Fault>, templates: &Templates) -> CallToolRe
         Ok(Reply::List{..})=>"READ COMPLETED; presentation degraded, content omitted. Retry the same list cursor.".into(),
         Ok(Reply::Enrollment(view))=>format!("READ COMPLETED enrollment {} state={} revision={}; presentation degraded. Retry the same read; no Run call or retry was made.",view.enrollment_id,view.state,view.revision),
         Err(Fault::RelaunchRequired)=>"ERROR relaunch_required; relaunch the Pool resident after Bridge managed mode is enabled. Preserve the original request_key for recovery.".into(),
+        Err(Fault::Completed)=>"ERROR closed; the pool is completed (formal completion record committed), not explicitly closed. No mutation was applied.".into(),
         Err(code)=>format!("ERROR {code}; presentation degraded. No success confirmed; preserve the original request_key for reconciliation."),
     });
     result(text, error)
@@ -396,6 +398,21 @@ mod tests {
             serde_json::to_string(&present(Ok(Reply::Receipt(Box::new(r))), &broken)).unwrap();
         assert!(fallback.contains("COMMITTED pool pool-id revision=9 event=7"));
         assert!(fallback.contains("do not create a new request_key"));
+    }
+
+    /// A completed pool keeps the `closed` code but never claims an explicit close.
+    #[test]
+    fn completed_refusal_is_distinct_from_explicit_close() {
+        let normal = Templates::new(&templates()).unwrap();
+        let broken = Templates::new(&[("pool_error", "{{ missing }}")]).unwrap();
+        let completed = serde_json::to_string(&present(Err(Fault::Completed), &normal)).unwrap();
+        assert!(completed.contains("ERROR closed."));
+        assert!(completed.contains("formal completion record"));
+        assert!(!completed.contains("explicitly closed;"));
+        let closed = serde_json::to_string(&present(Err(Fault::Closed), &normal)).unwrap();
+        assert!(closed.contains("explicitly closed; global leader status remains"));
+        let degraded = serde_json::to_string(&present(Err(Fault::Completed), &broken)).unwrap();
+        assert!(degraded.contains("ERROR closed; the pool is completed"));
     }
 
     /// The owner enrollment projection renders per-job facts and degrades safely.

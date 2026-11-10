@@ -50,6 +50,9 @@ pub enum Fault {
     Conflict,
     /// The pool is closed and cannot be changed.
     Closed,
+    /// The pool has a committed formal completion record and is final; it was
+    /// not explicitly closed. Presented with the existing `closed` code.
+    Completed,
     /// A configured dependency is unavailable; no success is implied.
     Unavailable,
     /// The Pool resident must be relaunched after Bridge enabled its managed role.

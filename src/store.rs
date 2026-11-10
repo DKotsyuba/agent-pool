@@ -2885,7 +2885,7 @@ fn execute_authorized(
             | Command::Vote(_)
     ) && crate::completion::completed(db, pid)?
     {
-        return Err(Fault::Closed);
+        return Err(Fault::Completed);
     }
     if !p.closed && matches!(command, Command::ReleaseHistory(_)) {
         return Err(Fault::Conflict);

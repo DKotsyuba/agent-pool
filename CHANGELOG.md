@@ -35,6 +35,8 @@
 - Erratum E12 egress liveness: an unknown managed publish whose exact lookups
   stay non-decisive is aborted for the exact original effect after bounded
   backoff; only a durable `aborted` creates one new effect for the same event.
+- Mutations refused because a pool is formally completed keep the `closed`
+  code but no longer claim the pool was explicitly closed.
 - `bind_run` never overwrites a terminal (`refused`, `cancelled`,
   `reconciliation_needed`) effect or a completed pool.
 - Isolate completion release keys per durable Pool store
