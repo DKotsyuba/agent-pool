@@ -214,7 +214,7 @@ impl StatusItem {
 pub(crate) struct StatusResponse {
     version: u32,
     store_id: String,
-    observed_at: f64,
+    observed_at: Box<serde_json::value::RawValue>,
     #[serde(deserialize_with = "crate::integrations::json_objects")]
     items: Vec<StatusItem>,
     // The optional view has a separate contract and never contributes to proof.
@@ -324,7 +324,12 @@ impl StatusEvidence {
 
     /// Returns the producer's nonnegative Unix timestamp, not a freshness guarantee.
     pub(crate) fn observed_at(&self) -> f64 {
-        self.0.observed_at
+        self.0.observed_at.get().parse().unwrap_or(f64::NAN)
+    }
+
+    /// Returns the exact numeric text received from Run.
+    pub(crate) fn observed_at_text(&self) -> &str {
+        self.0.observed_at.get()
     }
 
     /// Returns the validated items in the original target order.
@@ -622,8 +627,11 @@ pub(crate) fn validate_response(
     validate_request(expected_store_id, expected)?;
     if response.version != 1
         || response.store_id != expected_store_id
-        || !response.observed_at.is_finite()
-        || response.observed_at < 0.0
+        || !response
+            .observed_at
+            .get()
+            .parse::<f64>()
+            .is_ok_and(|value| value.is_finite() && value >= 0.0)
         || response.items.len() != expected.len()
         || response
             .items
@@ -859,6 +867,18 @@ mod tests {
                 .items()
                 .all(|item| item.proves_historical_success())
         );
+    }
+
+    #[test]
+    fn status_observed_at_retains_exact_run_decimal_text() {
+        let targets = vec![target(1)];
+        let bytes = response(&targets)
+            .to_string()
+            .replace("1792000000.25", "1792000000.250000000000");
+        let Ok(evidence) = parse(bytes.as_bytes(), STORE, &targets) else {
+            panic!("valid exact decimal timestamp rejected")
+        };
+        assert_eq!(evidence.observed_at_text(), "1792000000.250000000000");
     }
 
     #[test]

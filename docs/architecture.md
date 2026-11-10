@@ -406,7 +406,8 @@ attempts or change the fail-closed managed participant guard.
 Schema v6 adds a random durable `store_id` and a signed-64-bit nonnegative source
 revision, initially `"0"` on migration. Transactional triggers increment the
 revision on inserts, updates and deletes of durable state tables; even private or
-background changes can invalidate a cursor. An overflow aborts the write. A fresh
+background changes can invalidate a cursor, except completion saga and observation
+bookkeeping; the completion record itself advances the revision. An overflow aborts the write. A fresh
 random `read_epoch` is created each time the Store opens. Neither reopening nor
 the revision is a wall-clock timestamp. Clone/restore can preserve a store ID and
 roll back its revision, so this is not anti-rollback or a cross-service snapshot.
@@ -417,11 +418,12 @@ Owner decisions C1–C4 are final: settlement is automatic in the resident (no
 owner-finalize operation), the owner notice does not gate completion, completion
 is final, and each saga has its own protected Ed25519 release key. Automatic
 settlement is enabled only when both `run_socket` and the managed consensus
-transport are configured; otherwise it stays off and every pool remains open.
+transport are configured; otherwise no new settlement starts and unfinished
+sagas require the original route for recovery.
 Observers, Hub reads and `completion_get` never acquire or release holds.
 
 A pool becomes a candidate when its latest proposal is accepted, it has no
-record or unresolved saga, and fewer than three sagas were already attempted for
+record or unreleased saga, no pending start, batch or replacement admission, and fewer than three sagas were already attempted for
 the same proposal and pool revision. One read snapshot must show every frozen
 voter current and active with a ready ballot (all checks met when structured),
 no legacy `Unknown` ballot, and, for each Run member, a managed attempt binding
@@ -433,7 +435,10 @@ refused. Before preparing, the resident freshly asks Run consensus for every
 managed voter (only `terminal_no_successor` with the exact attempt and
 incarnation qualifies) and reads Run status for the retained latest execution:
 active original pin, complete coverage, recorded successful terminal commit and
-confirmed whole-lineage cleanup. These reads have no effect.
+confirmed whole-lineage cleanup. These reads have no effect and leave no local
+currentness request rows. Ineligible candidates back off exponentially per
+proposal and revision, up to five minutes; a local revision change permits an
+immediate recheck.
 
 The saga stages are `prepared -> acquire_possible -> held -> committed|aborted ->
 release_pending -> released`, stored in `completion_sagas`. A fresh key file
@@ -446,9 +451,13 @@ hold fingerprint; triggers make these fields and the terminal outcome immutable.
 `acquire_possible` is durable before the first `_lineage_hold_acquire`. A lost
 or failed acknowledgement is recovered by exact lookup and, after an absent
 snapshot, exact replay of the same request; never a new request ID or key. A
-replay or lookup that observes `released` aborts without a CAS. After three
+replay or lookup that observes `released` aborts without a CAS. A correlated
+Run `RequestConflict` on the first acquire terminates without a hold; a refusal
+after an uncertain earlier attempt remains unknown. After three
 uncertain acquire attempts the Pool outcome is fenced as aborted while exact
-replay continues, so any late hold is found and released, never committed.
+replay continues, so any late hold is found and released, never committed. No
+new saga for that pool starts until the earlier saga is released. Recovery uses
+exponential retry delays capped at five minutes.
 
 With the hold active, Run consensus and status are read again outside SQLite.
 Live or superseded voters, unverifiable facts or a changed snapshot abort; three
@@ -465,10 +474,20 @@ key deletion. A missing or substituted key or a changed configured route leaves
 the saga at its stage with a nonsecret `attention` code (`key_unavailable`,
 `route_changed`, `outcome_unknown`, `release_unknown`, `hold_unavailable`,
 `run_unavailable`): there is no TTL unlock and no key regeneration. Restoring the
-original key file or route resumes the same saga.
+original key file or route resumes the same saga. Unexpected driver errors are
+recorded as `internal_error` and retried with backoff. If the driver cannot
+start, unfinished sagas receive `key_unavailable` or `route_changed`, the
+resident logs the condition, and owner identity capabilities include
+`completion_attention_<code>` while that condition persists. Startup removes
+unreferenced key and temporary files while preserving keys of all unreleased
+sagas. Ed25519 signing keys and transient seeds are zeroized on drop. The
+record preserves Run's exact status timestamp text.
 
 C3: once a record exists, update, add, start, batch, replace, cancel
 replacement, assignment change, remove, join, propose and vote return `closed`.
+Late admission receipts cannot change a completed pool; the owner receives a
+deduplicated reconciliation notice. Eligibility is checked again in the
+completion transaction, including pending admission effects.
 Reads, messages, explicit close, history-pin release and recovery continue.
 Records and observations cannot be updated or deleted. Saga intent fields and
 terminal outcomes are immutable; recovery advances its stage and observations.
@@ -625,14 +644,18 @@ membership's previously bound lineage, with a fresh Run receipt and a same-linea
 rebind, and grants no participant access. A different lineage is not delivered.
 These rules implement `contracts/attempt-binding-v1-errata.md` E8–E10.
 
-On removal, Pool drains the exact member scope, resolves all its effects, then
+Each effect retains its original Bridge pin. New effects use the approved active
+pin after re-pin, including in an already-used final-notice scope. On removal, Pool drains the exact member scope, resolves all its effects, then
 records a pinned Bridge retirement receipt before requesting bounded compaction.
 The final-notice scope drains when the pool closes. Uncertain effects and fences
 survive restart; scope retirement never claims that an accepted or unknown effect
 was recalled. Each of the active outbox and active scope sets is bounded at
 100,000; terminal records and rejecting fences remain retained. Scope retirement
-uses the SDK's same-connection pinned Bridge method, retaining the original key
-after an uncertain reply. Synthetic fakes do not qualify the Run/Bridge endpoints
+freezes the active pin and audience when retirement is first prepared, before
+I/O, and uses the SDK's same-connection pinned Bridge method, retaining that
+pin and original key after an uncertain reply. Schema v13 clears delivery-era
+scope pins only on open or draining scopes; prepared retirement pins remain
+immutable. Synthetic fakes do not qualify the Run/Bridge endpoints
 or native provider delivery.
 
 The B1 issuer namespace seal covers P1 ingress contexts, consumes and admissions.
@@ -749,7 +772,7 @@ delivery are separate facts. Inventory orders by pool ID; archive orders by
 retained proposal insertion sequence; other sections preserve existing cursor
 semantics. Pages observe current state independently; mutable offset sections
 require the revision fence on continuation.
-Store schema v12 has no historical timestamps: `source_timestamp:null` and
+Store schema v13 has no historical timestamps: `source_timestamp:null` and
 coverage text disclose that absence. Complete encoded envelopes including the
 newline are capped at 1 MiB; oversized results fail explicitly without partial
 publication or silently advancing a cursor. Resident exchanges use the existing

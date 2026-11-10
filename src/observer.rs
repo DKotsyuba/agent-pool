@@ -487,7 +487,7 @@ pub struct Page {
     pub returned: usize,
     /// Source snapshot observation time, in Unix milliseconds.
     pub observed_at_unix_ms: u64,
-    /// Historical timestamps are absent from Store schema v12, explicitly null.
+    /// Historical timestamps are absent from Store schema v13, explicitly null.
     pub source_timestamp: Option<u64>,
     /// Explicit paging/snapshot and missing timestamp limitations.
     pub coverage: String,
@@ -573,7 +573,7 @@ impl Page {
     /// Constructs truthful metadata; each request is a current resident snapshot, not a cross-page snapshot.
     pub fn new(cursor: Option<String>, has_more: bool, returned: usize) -> Result<Self, Fault> {
         Ok(Self { cursor, has_more, returned, observed_at_unix_ms: now()?, source_timestamp:None,
-            coverage:"Selected section only; follow cursor while has_more. Pages observe current state independently. Historical source timestamps are not recorded in Store schema v12.".into() })
+            coverage:"Selected section only; follow cursor while has_more. Pages observe current state independently. Historical source timestamps are not recorded in Store schema v13.".into() })
     }
 }
 /// Returns current Unix milliseconds, refusing clocks before the epoch or unrepresentable values.

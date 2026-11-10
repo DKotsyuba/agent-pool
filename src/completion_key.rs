@@ -9,11 +9,13 @@
 use crate::domain::Fault;
 use ed25519_dalek::{Signer, SigningKey};
 use std::{
+    collections::HashSet,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
+use zeroize::Zeroizing;
 
 /// Subdirectory of the private database directory reserved for release keys.
 const KEY_DIRECTORY: &str = "completion-keys";
@@ -91,9 +93,9 @@ impl KeyStore {
         if fs::symlink_metadata(&target).is_ok() {
             return Err(Fault::Conflict);
         }
-        let mut seed = [0_u8; SEED_BYTES];
+        let mut seed = Zeroizing::new([0_u8; SEED_BYTES]);
         File::open("/dev/urandom")
-            .and_then(|mut source| source.read_exact(&mut seed))
+            .and_then(|mut source| source.read_exact(&mut *seed))
             .map_err(|_| Fault::Unavailable)?;
         let public = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
         let written = OpenOptions::new()
@@ -102,10 +104,9 @@ impl KeyStore {
             .mode(0o600)
             .open(&staged)
             .and_then(|mut file| {
-                file.write_all(&seed)?;
+                file.write_all(&*seed)?;
                 file.sync_all()
             });
-        seed.fill(0);
         if written.is_err() {
             let _ = fs::remove_file(&staged);
             return Err(Fault::Unavailable);
@@ -138,11 +139,10 @@ impl KeyStore {
         if opened.dev() != before.dev() || opened.ino() != before.ino() {
             return Err(Fault::Unavailable);
         }
-        let mut seed = [0_u8; SEED_BYTES];
-        let read = file.read_exact(&mut seed);
+        let mut seed = Zeroizing::new([0_u8; SEED_BYTES]);
+        file.read_exact(&mut *seed)
+            .map_err(|_| Fault::Unavailable)?;
         let key = SigningKey::from_bytes(&seed);
-        seed.fill(0);
-        read.map_err(|_| Fault::Unavailable)?;
         if key.verifying_key().to_bytes() != *public {
             return Err(Fault::Unavailable);
         }
@@ -173,6 +173,36 @@ impl KeyStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(_) => Err(Fault::Unavailable),
         }
+    }
+
+    /// Remove crash leftovers while retaining every key still needed by a saga.
+    pub(crate) fn sweep(&self, referenced: &HashSet<String>) -> Result<(), Fault> {
+        self.check_directory()?;
+        let mut changed = false;
+        for entry in fs::read_dir(&self.directory).map_err(|_| Fault::Unavailable)? {
+            let entry = entry.map_err(|_| Fault::Unavailable)?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some((reference, suffix)) = name.rsplit_once('.') else {
+                continue;
+            };
+            if !matches!(suffix, "tmp" | "key") {
+                continue;
+            }
+            if suffix == "key" && referenced.contains(reference) {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(entry.path()).map_err(|_| Fault::Unavailable)?;
+            if !metadata.is_file() || metadata.uid() != self.uid {
+                continue;
+            }
+            fs::remove_file(entry.path()).map_err(|_| Fault::Unavailable)?;
+            changed = true;
+        }
+        if changed {
+            sync_directory(&self.directory)?;
+        }
+        Ok(())
     }
 
     /// Test-only fixture access to simulate loss or substitution.
@@ -235,5 +265,32 @@ mod tests {
         assert!(keys.sign(&reference, &public, message).is_err());
         keys.destroy(&reference).unwrap();
         assert!(fs::read_dir(&keys.directory).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn startup_sweep_keeps_referenced_keys_and_removes_crash_files() {
+        let (_dir, keys) = fixture();
+        let retained = crate::domain::id();
+        let orphan = crate::domain::id();
+        let public = keys.create(&retained).unwrap();
+        keys.create(&orphan).unwrap();
+        fs::write(keys.path(&retained, "tmp").unwrap(), [1_u8; 32]).unwrap();
+        let unrecognized = keys.directory.join("unrelated.txt");
+        fs::write(&unrecognized, b"keep").unwrap();
+        keys.sweep(&std::collections::HashSet::from([retained.clone()]))
+            .unwrap();
+        assert!(keys.available(&retained, &public));
+        assert!(!keys.key_path(&orphan).exists());
+        assert!(!keys.path(&retained, "tmp").unwrap().exists());
+        assert!(unrecognized.exists());
+    }
+
+    #[test]
+    fn signing_keys_and_seed_buffers_have_zeroize_guards() {
+        fn requires_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        requires_zeroize_on_drop::<SigningKey>();
+        let mut seed = Zeroizing::new([0x5a_u8; SEED_BYTES]);
+        zeroize::Zeroize::zeroize(&mut *seed);
+        assert_eq!(*seed, [0_u8; SEED_BYTES]);
     }
 }

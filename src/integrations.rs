@@ -806,6 +806,25 @@ fn strict_initial_refusal(frame: &[u8], request_id: u64) -> bool {
             )
     )
 }
+
+/// Run's hold writer returns RequestConflict before inserting any hold, or
+/// replays an existing exact receipt. Only an initial call can use this proof.
+fn strict_hold_conflict(frame: &[u8], request_id: u64) -> bool {
+    let Ok(JsonObject(envelope)) =
+        serde_json::from_slice::<JsonObject<AdmissionErrorEnvelope>>(frame)
+    else {
+        return false;
+    };
+    envelope.jsonrpc == "2.0"
+        && envelope.id == request_id
+        && !envelope.error.message.is_empty()
+        && envelope.error.code == -32000
+        && envelope
+            .error
+            .data
+            .as_ref()
+            .is_some_and(|data| data.code == "RequestConflict")
+}
 /// Accepts only a correlated, structurally unambiguous producer precondition refusal.
 fn strict_precondition_failure(frame: &[u8], request_id: u64) -> bool {
     let Ok(JsonObject(envelope)) =
@@ -877,6 +896,9 @@ pub(crate) async fn run_rpc_typed<T: serde::de::DeserializeOwned>(
             }
             let mut failure = RunFailure::from_response(&error);
             if method == "start_batch" && strict_initial_refusal(&frame, request_id) {
+                failure.known_unadmitted = true;
+            }
+            if method == "_lineage_hold_acquire" && strict_hold_conflict(&frame, request_id) {
                 failure.known_unadmitted = true;
             }
             return Err(
@@ -1604,6 +1626,17 @@ mod tests {
         assert!(!strict_hold_envelope(failure_with_null, 7));
         assert!(serde_json::from_slice::<JsonObject<RunReply<Value>>>(success_with_null).is_ok());
         assert!(serde_json::from_slice::<JsonObject<RunReply<Value>>>(failure_with_null).is_ok());
+    }
+
+    #[test]
+    fn hold_conflict_requires_exact_correlated_unambiguous_refusal() {
+        let good = br#"{"jsonrpc":"2.0","id":7,"error":{"code":-32000,"message":"refused","data":{"code":"RequestConflict"}}}"#;
+        let duplicate = br#"{"jsonrpc":"2.0","id":7,"error":{"code":-32000,"message":"refused","data":{"code":"RequestConflict","code":"RequestConflict"}}}"#;
+        let other = br#"{"jsonrpc":"2.0","id":7,"error":{"code":-32000,"message":"refused","data":{"code":"StateTransitionError"}}}"#;
+        assert!(strict_hold_conflict(good, 7));
+        assert!(!strict_hold_conflict(good, 8));
+        assert!(!strict_hold_conflict(duplicate, 7));
+        assert!(!strict_hold_conflict(other, 7));
     }
     /// A wall-clock rollback cannot extend an invocation beyond its original monotonic lifetime.
     #[test]

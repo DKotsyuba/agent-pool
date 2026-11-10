@@ -23,6 +23,7 @@ dependencies = [
  "tokio",
  "toml",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

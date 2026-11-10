@@ -33,6 +33,7 @@ const SAGAS_PER_TICK: u32 = 8;
 const CANDIDATES_PER_TICK: u32 = 2;
 /// Minimum delay before a not-yet-eligible pool is examined again.
 const CANDIDATE_BACKOFF: Duration = Duration::from_secs(30);
+const RETRY_CEILING: Duration = Duration::from_secs(300);
 /// Uncertain held-stage reads tolerated before the saga is aborted and released.
 const HELD_FAILURE_LIMIT: i64 = 3;
 /// Bounded local progress per saga per cycle.
@@ -127,25 +128,9 @@ impl ConfiguredRun {
             .map_err(|_| Fault::Unavailable)?;
         let request_id = crate::domain::id();
         let transport_id = crate::domain::id();
-        let staged = voter.clone();
-        let staged_id = request_id.clone();
-        let query = stored(store, move |store| {
-            crate::managed_run::VoterQuery::stage(
-                store.completion_db(),
-                &pin,
-                &staged,
-                &staged_id,
-                &transport_id,
-            )
-        })
-        .await?;
+        let query =
+            crate::managed_run::VoterQuery::read_only(&pin, voter, &request_id, &transport_id)?;
         let authority = peer.collect_voters(&[query]).await;
-        // A settlement read has no owner intent; retire its staged key immediately.
-        stored(store, move |store| {
-            store.completion_db().execute("UPDATE managed_current_requests SET state='aborted' WHERE id=?1 AND namespace_id IS NULL AND owner_intent IS NULL AND state='prepared'", [request_id])?;
-            Ok(())
-        })
-        .await?;
         authority.map_err(|_| Fault::Unavailable)?.consensus(
             &voter.binding.run_route,
             &voter.attempt,
@@ -194,7 +179,7 @@ impl SettlementRun for ConfiguredRun {
                 latest: item.replacement_precondition(),
             })
             .collect();
-        Ok((evidence.observed_at().to_string(), facts))
+        Ok((evidence.observed_at_text().to_owned(), facts))
     }
     async fn discover(&self, store_id: &str) -> Result<(), HoldError> {
         crate::run_hold::discover(&self.config, store_id).await
@@ -239,7 +224,13 @@ pub(crate) struct Driver<R> {
     keys: KeyStore,
     saga_cursor: String,
     pool_cursor: String,
-    backoff: HashMap<String, Instant>,
+    backoff: HashMap<String, ((String, i64), u32, Instant)>,
+    saga_backoff: HashMap<String, Instant>,
+}
+
+fn retry_delay(base: Duration, failures: u32) -> Duration {
+    base.saturating_mul(1_u32 << failures.saturating_sub(1).min(16))
+        .min(RETRY_CEILING)
 }
 
 impl Driver<ConfiguredRun> {
@@ -252,9 +243,24 @@ impl Driver<ConfiguredRun> {
         let keys = KeyStore::open(&config.database_path, config.expected_uid).ok()?;
         Some(Self::new(ConfiguredRun::new(config.clone()), keys))
     }
+
+    pub(crate) fn unavailable_reason(config: &Config) -> &'static str {
+        if config.run_socket.is_none() || config.managed_run_transport.is_none() {
+            "route_changed"
+        } else {
+            "key_unavailable"
+        }
+    }
 }
 
 impl<R: SettlementRun> Driver<R> {
+    pub(crate) async fn sweep(&self, store: &SharedStore) -> Result<(), Fault> {
+        let references = stored(store, |store| {
+            completion::retained_keys(store.completion_db())
+        })
+        .await?;
+        self.keys.sweep(&references)
+    }
     pub(crate) fn new(run: R, keys: KeyStore) -> Self {
         Self {
             run,
@@ -262,6 +268,7 @@ impl<R: SettlementRun> Driver<R> {
             saga_cursor: String::new(),
             pool_cursor: String::new(),
             backoff: HashMap::new(),
+            saga_backoff: HashMap::new(),
         }
     }
 
@@ -287,7 +294,38 @@ impl<R: SettlementRun> Driver<R> {
             if *stopped.borrow() {
                 return Ok(());
             }
-            let _ = self.advance(store, &saga).await;
+            if self
+                .saga_backoff
+                .get(&saga)
+                .is_some_and(|until| Instant::now() < *until)
+            {
+                continue;
+            }
+            if self.advance(store, &saga).await.is_err() {
+                eprintln!("completion saga advance failed; recovery will retry");
+                self.attention(store, &saga, "internal_error").await?;
+            }
+            let id = saga.clone();
+            let failures: i64 = stored(store, move |store| {
+                Ok(store.completion_db().query_row(
+                    "SELECT failures FROM completion_sagas WHERE id=?1",
+                    [id],
+                    |row| row.get(0),
+                )?)
+            })
+            .await?;
+            if failures > 0 {
+                self.saga_backoff.insert(
+                    saga,
+                    Instant::now()
+                        + retry_delay(
+                            Duration::from_secs(5),
+                            u32::try_from(failures).unwrap_or(u32::MAX),
+                        ),
+                );
+            } else {
+                self.saga_backoff.remove(&saga);
+            }
         }
         let after = self.pool_cursor.clone();
         let pools = stored(store, move |store| {
@@ -299,21 +337,42 @@ impl<R: SettlementRun> Driver<R> {
             if *stopped.borrow() {
                 return Ok(());
             }
+            let id = pool.clone();
+            let version = stored(store, move |store| {
+                completion::candidate_version(store.completion_db(), &id)
+            })
+            .await?;
             if self
                 .backoff
                 .get(&pool)
-                .is_some_and(|until| Instant::now() < *until)
+                .is_some_and(|(old, _, until)| *old == version && Instant::now() < *until)
             {
                 continue;
             }
             if let Ok(Some(saga)) = self.start(store, &pool).await {
-                let _ = self.advance(store, &saga).await;
+                self.backoff.remove(&pool);
+                if self.advance(store, &saga).await.is_err() {
+                    eprintln!("completion saga advance failed; recovery will retry");
+                    self.attention(store, &saga, "internal_error").await?;
+                    self.saga_backoff
+                        .insert(saga, Instant::now() + Duration::from_secs(5));
+                }
             } else {
-                self.backoff
-                    .insert(pool, Instant::now() + CANDIDATE_BACKOFF);
+                let attempts = self
+                    .backoff
+                    .get(&pool)
+                    .filter(|(old, _, _)| *old == version)
+                    .map_or(1, |(_, attempts, _)| attempts.saturating_add(1));
+                self.backoff.insert(
+                    pool,
+                    (
+                        version,
+                        attempts,
+                        Instant::now() + retry_delay(CANDIDATE_BACKOFF, attempts),
+                    ),
+                );
             }
         }
-        self.backoff.retain(|_, until| Instant::now() < *until);
         Ok(())
     }
 
@@ -531,7 +590,7 @@ impl<R: SettlementRun> Driver<R> {
         .await?;
         // The first possible request; its outcome is unknown until correlated.
         let result = self.run.acquire(&saga.intent, None).await;
-        self.record_acquire(store, saga, result).await
+        self.record_acquire(store, saga, result, true).await
     }
 
     async fn record_acquire(
@@ -539,7 +598,16 @@ impl<R: SettlementRun> Driver<R> {
         store: &SharedStore,
         saga: &Saga,
         result: Result<AcquireResult, HoldError>,
+        first: bool,
     ) -> Result<Step, Fault> {
+        if first && matches!(result, Err(HoldError::Refused)) {
+            let id = saga.id.clone();
+            stored(store, move |store| {
+                completion::refuse_first_acquire(store.completion_db(), &id)
+            })
+            .await?;
+            return Ok(Step::Progress);
+        }
         let Ok(result) = result else {
             return self.acquire_unknown(store, saga).await;
         };
@@ -594,6 +662,11 @@ impl<R: SettlementRun> Driver<R> {
             self.attention(store, &saga.id, "route_changed").await?;
             return Ok(Step::Idle);
         }
+        let id = saga.id.clone();
+        stored(store, move |store| {
+            completion::clear_route_attention(store.completion_db(), &id)
+        })
+        .await?;
         let prior = match &saga.hold_id {
             Some(hold_id) => Some(
                 HoldObservation::from_persisted(&saga.intent, hold_id, HoldState::Active)
@@ -608,7 +681,7 @@ impl<R: SettlementRun> Driver<R> {
             // Absence is only a snapshot: replay the original acquire, never a new key.
             Ok(LookupResult::AbsentSnapshot) => {
                 let result = self.run.acquire(&saga.intent, prior.as_ref()).await;
-                self.record_acquire(store, saga, result).await
+                self.record_acquire(store, saga, result, false).await
             }
             Err(_) => self.acquire_unknown(store, saga).await,
         }
@@ -634,6 +707,11 @@ impl<R: SettlementRun> Driver<R> {
             self.attention(store, &saga.id, "route_changed").await?;
             return Ok(Step::Idle);
         }
+        let id = saga.id.clone();
+        stored(store, move |store| {
+            completion::clear_route_attention(store.completion_db(), &id)
+        })
+        .await?;
         let pool = saga.pool_id.clone();
         let candidate = stored(store, move |store| {
             completion::snapshot(store.completion_db(), &pool)
@@ -735,6 +813,11 @@ impl<R: SettlementRun> Driver<R> {
             self.attention(store, &saga.id, "route_changed").await?;
             return Ok(Step::Idle);
         }
+        let id = saga.id.clone();
+        stored(store, move |store| {
+            completion::clear_route_attention(store.completion_db(), &id)
+        })
+        .await?;
         let hold_id = saga.hold_id.as_deref().ok_or(Fault::Internal)?;
         let observation = HoldObservation::from_persisted(&saga.intent, hold_id, HoldState::Active)
             .map_err(|_| Fault::Internal)?;
@@ -765,5 +848,23 @@ impl<R: SettlementRun> Driver<R> {
         })
         .await?;
         Ok(Step::Progress)
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+    #[test]
+    fn retry_backoff_grows_and_is_bounded() {
+        assert_eq!(
+            retry_delay(Duration::from_secs(5), 1),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            retry_delay(Duration::from_secs(5), 3),
+            Duration::from_secs(20)
+        );
+        assert_eq!(retry_delay(Duration::from_secs(5), 100), RETRY_CEILING);
+        assert_eq!(retry_delay(CANDIDATE_BACKOFF, 100), RETRY_CEILING);
     }
 }

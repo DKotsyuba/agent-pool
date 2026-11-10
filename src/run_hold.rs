@@ -26,6 +26,8 @@ const MAX_TARGETS: usize = 20;
 pub(crate) enum HoldError {
     /// The immutable input was rejected locally before a request was sent.
     InvalidInput,
+    /// This particular acquire was refused before its transaction inserted a hold.
+    Refused,
     /// The outcome cannot be established from the received evidence.
     Unknown,
 }
@@ -422,7 +424,13 @@ pub(crate) async fn acquire(
     });
     let response: AcquireResponse = run_rpc_typed(config, "_lineage_hold_acquire", params)
         .await
-        .map_err(|_| HoldError::Unknown)?;
+        .map_err(|error| {
+            if error.known_unadmitted {
+                HoldError::Refused
+            } else {
+                HoldError::Unknown
+            }
+        })?;
     let observation = HoldObservation {
         receipt: response.receipt,
         state: response.state,

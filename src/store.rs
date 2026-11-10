@@ -79,6 +79,23 @@ fn inventory_revision_triggers(db: &Connection, tables: &[&str]) -> Result<(), F
     Ok(())
 }
 
+/// Scope pins from v12 were delivery pins until retirement was prepared.
+/// Keep prepared retirement pins, but allow undrained scopes to select the
+/// currently approved pin when their retirement is first prepared.
+fn migrate_review_v13(db: &Connection) -> Result<(), Fault> {
+    db.execute_batch("\
+DROP TRIGGER managed_delivery_scope_immutable;\
+UPDATE managed_delivery_scopes SET bridge_pin=NULL,audience=NULL WHERE state IN ('open','draining');\
+CREATE TRIGGER managed_delivery_scope_immutable BEFORE UPDATE OF producer_scope,pool_id,member_id,retire_request_id,bridge_pin,audience ON managed_delivery_scopes WHEN OLD.producer_scope IS NOT NEW.producer_scope OR OLD.pool_id IS NOT NEW.pool_id OR OLD.member_id IS NOT NEW.member_id OR OLD.retire_request_id IS NOT NEW.retire_request_id OR (OLD.bridge_pin IS NOT NULL AND OLD.bridge_pin IS NOT NEW.bridge_pin) OR (OLD.audience IS NOT NULL AND OLD.audience IS NOT NEW.audience) BEGIN SELECT RAISE(ABORT,'immutable managed delivery scope'); END;\
+DROP TRIGGER inventory_rev_completion_sagas_INSERT;\
+DROP TRIGGER inventory_rev_completion_sagas_UPDATE;\
+DROP TRIGGER inventory_rev_completion_sagas_DELETE;\
+DROP TRIGGER inventory_rev_completion_observations_INSERT;\
+DROP TRIGGER inventory_rev_completion_observations_UPDATE;\
+DROP TRIGGER inventory_rev_completion_observations_DELETE;")?;
+    Ok(())
+}
+
 /// Version 7 persists binding generations, pool binding epochs, contexts and verified rebinds.
 fn migrate_managed_context(db: &Connection) -> Result<(), Fault> {
     db.execute_batch("\
@@ -1080,7 +1097,28 @@ impl Store {
         use crate::observer::{Data, Detail, Envelope, Operation, Page, PoolPage, PoolRow};
         request.validate()?;
         match &request.operation {
-            Operation::Identity(_) => Envelope::identity(),
+            Operation::Identity(_) => {
+                let mut data = Envelope::identity()?;
+                if let Data::Identity(identity) = &mut data {
+                    for code in [
+                        "key_unavailable",
+                        "route_changed",
+                        "outcome_unknown",
+                        "release_unknown",
+                        "hold_unavailable",
+                        "run_unavailable",
+                        "internal_error",
+                    ] {
+                        let present: bool = self.db.query_row("SELECT EXISTS(SELECT 1 FROM completion_sagas WHERE stage!='released' AND attention=?1)", [code], |row| row.get(0))?;
+                        if present {
+                            identity
+                                .capabilities
+                                .push(format!("completion_attention_{code}"));
+                        }
+                    }
+                }
+                Ok(data)
+            }
             Operation::ManagedCapacity(_) => Ok(Data::ManagedCapacity(Box::new(
                 crate::managed_state::managed_capacity(&self.db)?,
             ))),
@@ -1304,16 +1342,19 @@ PRAGMA user_version=5;")?;
             db.execute_batch("PRAGMA user_version=11;")?;
         }
         // Version 12 adds completion and fences changes to v11's durable tables.
-        if version < crate::completion::SCHEMA_VERSION {
+        if version < 12 {
             crate::completion::migrate(&db)?;
             inventory_revision_triggers(
                 &db,
                 &["managed_route_pin_history", "managed_namespace_retirements"],
             )?;
-            db.execute_batch(&format!(
-                "PRAGMA user_version={};",
-                crate::completion::SCHEMA_VERSION
-            ))?;
+            db.execute_batch("PRAGMA user_version=12;")?;
+        }
+        if version < 13 {
+            migrate_review_v13(&db)?;
+            db.execute_batch("PRAGMA user_version=13;")?;
+        }
+        if version < crate::completion::SCHEMA_VERSION {
             db.execute_batch("COMMIT;")?;
         }
         // Transaction-local managed mutation provenance, never retained after restart.
@@ -1950,6 +1991,17 @@ PRAGMA user_version=5;")?;
         }
         let mid = e.member_id.as_deref().ok_or(Fault::Internal)?;
         let (mut b, current) = binding_any(&tx, mid)?;
+        if crate::completion::completed(&tx, &e.pool_id)? {
+            if matches!(e.state.as_str(), "custody" | "accepted")
+                && b.run_id.as_deref() == Some(agent_id)
+                && b.run_sequence == Some(sequence)
+            {
+                return Ok(());
+            }
+            completed_admission_notice(&tx, &e)?;
+            tx.commit()?;
+            return Err(Fault::Closed);
+        }
         if b.run_id.as_deref().is_some_and(|v| v != agent_id)
             || b.run_sequence.is_some_and(|v| v != sequence)
         {
@@ -1996,6 +2048,11 @@ PRAGMA user_version=5;")?;
         let recorded_store_id = route.as_ref().and_then(|route| route.store_id.as_deref());
         if *store_fence && (recorded_store_id.is_none() || recorded_store_id != receipt_store_id) {
             return Err(Fault::Conflict);
+        }
+        if e.state != "accepted" && crate::completion::completed(&tx, &e.pool_id)? {
+            completed_admission_notice(&tx, &e)?;
+            tx.commit()?;
+            return Err(Fault::Closed);
         }
         let mut seen = BTreeSet::new();
         let mut seen_refs = BTreeSet::new();
@@ -2128,6 +2185,11 @@ PRAGMA user_version=5;")?;
             } else {
                 Err(Fault::Conflict)
             };
+        }
+        if crate::completion::completed(&tx, &effect.pool_id)? {
+            completed_admission_notice(&tx, &effect)?;
+            tx.commit()?;
+            return Err(Fault::Closed);
         }
         if effect.state != "inflight" {
             return Err(Fault::Conflict);
@@ -3849,6 +3911,46 @@ fn batch_pending(db: &Connection, pool_id: &str) -> Result<bool, Fault> {
         }
     }
     Ok(false)
+}
+/// An admission that can still change the roster prevents the completion CAS.
+pub(crate) fn completion_admission_pending(db: &Connection, pool_id: &str) -> Result<bool, Fault> {
+    let mut stmt = db.prepare("SELECT data FROM effects WHERE pool=?1 AND state IN ('queued','inflight','unknown','custody')")?;
+    for row in stmt.query_map([pool_id], |r| r.get::<_, String>(0))? {
+        let effect: Effect = decode(&row?)?;
+        if matches!(
+            effect.work,
+            Work::Start { .. } | Work::StartBatch { .. } | Work::Replace { .. }
+        ) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Preserve the external admission evidence and alert the owner without changing a completed pool.
+fn completed_admission_notice(db: &Connection, effect: &Effect) -> Result<(), Fault> {
+    if db.execute(
+        "INSERT OR IGNORE INTO alerts(effect,kind) VALUES(?1,'completed_admission')",
+        [&effect.effect_id],
+    )? != 0
+    {
+        let (_, owner) = pool(db, &effect.pool_id)?;
+        let address = owner_address(db, &owner)?;
+        queue(
+            db,
+            &effect.pool_id,
+            None,
+            Work::Deliver {
+                address,
+                scope: format!("owner:{}", effect.pool_id),
+                text: format!(
+                    "Pool {} is completed; admission {} needs owner reconciliation and was not installed.",
+                    effect.pool_id, effect.effect_id
+                ),
+            },
+        )?;
+    }
+    Ok(())
 }
 /// Prevents decisions and enrollment from changing the frozen replacement roster.
 fn replacement_pending(db: &Connection, pool_id: &str) -> Result<bool, Fault> {

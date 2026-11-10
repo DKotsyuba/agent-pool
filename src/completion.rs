@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 /// Schema step owned by the completion ledger, following managed route pins.
-pub(crate) const SCHEMA_VERSION: i64 = 12;
+pub(crate) const SCHEMA_VERSION: i64 = 13;
 /// Version of the frozen record body and its canonical integrity preimage.
 pub(crate) const RECORD_VERSION: u32 = 1;
 /// Published integrity algorithm label: SHA-256 over domain, NUL and canonical C.
@@ -423,7 +423,10 @@ pub(crate) fn snapshot(db: &Connection, pool_id: &str) -> Result<Option<Candidat
         return Ok(None);
     };
     let pool: Pool = decoded(&data)?;
-    if pool.pool_id != pool_id || completed(db, pool_id)? {
+    if pool.pool_id != pool_id
+        || completed(db, pool_id)?
+        || crate::store::completion_admission_pending(db, pool_id)?
+    {
         return Ok(None);
     }
     let Some(proposal) = pool.proposal.as_ref() else {
@@ -683,10 +686,15 @@ pub(crate) fn snapshot(db: &Connection, pool_id: &str) -> Result<Option<Candidat
 
 /// Pools that may become settlement candidates, after an exclusive rotating cursor.
 pub(crate) fn candidates(db: &Connection, after: &str, limit: u32) -> Result<Vec<String>, Fault> {
-    let mut stmt = db.prepare(&format!("SELECT p.id FROM pools p WHERE p.id>?1 AND json_extract(p.data,'$.proposal.state')='accepted' AND NOT EXISTS(SELECT 1 FROM completion_records r WHERE r.pool=p.id) AND NOT EXISTS(SELECT 1 FROM completion_sagas s WHERE s.pool=p.id AND s.outcome IS NULL) AND (SELECT count(*) FROM completion_sagas s WHERE s.pool=p.id AND s.proposal=json_extract(p.data,'$.proposal.proposal_id') AND s.source_revision=json_extract(p.data,'$.revision'))<{MAX_ABORTED_ATTEMPTS} ORDER BY p.id LIMIT ?2"))?;
+    let mut stmt = db.prepare(&format!("SELECT p.id FROM pools p WHERE p.id>?1 AND json_extract(p.data,'$.proposal.state')='accepted' AND NOT EXISTS(SELECT 1 FROM completion_records r WHERE r.pool=p.id) AND NOT EXISTS(SELECT 1 FROM completion_sagas s WHERE s.pool=p.id AND s.stage!='released') AND (SELECT count(*) FROM completion_sagas s WHERE s.pool=p.id AND s.proposal=json_extract(p.data,'$.proposal.proposal_id') AND s.source_revision=json_extract(p.data,'$.revision'))<{MAX_ABORTED_ATTEMPTS} ORDER BY p.id LIMIT ?2"))?;
     Ok(stmt
         .query_map(params![after, limit], |r| r.get(0))?
         .collect::<Result<Vec<String>, _>>()?)
+}
+
+/// Local proposal identity for pre-hold retry scheduling.
+pub(crate) fn candidate_version(db: &Connection, pool_id: &str) -> Result<(String, i64), Fault> {
+    Ok(db.query_row("SELECT json_extract(data,'$.proposal.proposal_id'),json_extract(data,'$.revision') FROM pools WHERE id=?1", [pool_id], |row| Ok((row.get(0)?, row.get(1)?)))?)
 }
 
 /// Durable saga stage, in the documented order.
@@ -796,7 +804,7 @@ pub(crate) fn prepare(
         return Err(Fault::Stale);
     }
     let live: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM completion_sagas WHERE pool=?1 AND outcome IS NULL)",
+        "SELECT EXISTS(SELECT 1 FROM completion_sagas WHERE pool=?1 AND stage!='released')",
         [pool_id],
         |r| r.get(0),
     )?;
@@ -912,6 +920,19 @@ pub(crate) fn pending(db: &Connection, after: &str, limit: u32) -> Result<Vec<St
         .collect::<Result<Vec<String>, _>>()?)
 }
 
+/// Keys needed by unresolved sagas, read before the startup filesystem sweep.
+pub(crate) fn retained_keys(db: &Connection) -> Result<std::collections::HashSet<String>, Fault> {
+    let mut stmt = db.prepare("SELECT key_ref FROM completion_sagas WHERE stage!='released'")?;
+    Ok(stmt
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?)
+}
+
+/// Persist driver-wide unavailability without repeatedly incrementing failures.
+pub(crate) fn driver_unavailable(db: &Connection, reason: &str) -> Result<usize, Fault> {
+    Ok(db.execute("UPDATE completion_sagas SET attention=?1,failures=0 WHERE stage!='released' AND attention IS NOT ?1", [reason])?)
+}
+
 fn guarded(db: &mut Connection, sql: &str, args: impl rusqlite::Params) -> Result<(), Fault> {
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     if tx.execute(sql, args)? != 1 {
@@ -924,7 +945,7 @@ fn guarded(db: &mut Connection, sql: &str, args: impl rusqlite::Params) -> Resul
 pub(crate) fn mark_acquire_possible(db: &mut Connection, saga_id: &str) -> Result<(), Fault> {
     guarded(
         db,
-        "UPDATE completion_sagas SET stage='acquire_possible' WHERE id=?1 AND stage='prepared' AND outcome IS NULL",
+        "UPDATE completion_sagas SET stage='acquire_possible',attention=NULL,failures=0 WHERE id=?1 AND stage='prepared' AND outcome IS NULL",
         [saga_id],
     )
 }
@@ -944,7 +965,7 @@ pub(crate) fn record_found_released(
 ) -> Result<(), Fault> {
     guarded(
         db,
-        "UPDATE completion_sagas SET hold_id=?2,hold_observed='released',outcome=coalesce(outcome,'aborted'),abort_reason=coalesce(abort_reason,'hold_released'),stage='released',attention=NULL WHERE id=?1 AND stage='acquire_possible' AND (hold_id IS NULL OR hold_id=?2)",
+        "UPDATE completion_sagas SET hold_id=?2,hold_observed='released',outcome=coalesce(outcome,'aborted'),abort_reason=coalesce(abort_reason,'hold_released'),stage='released',attention=NULL,failures=0 WHERE id=?1 AND stage='acquire_possible' AND (hold_id IS NULL OR hold_id=?2)",
         params![saga_id, hold_id],
     )
 }
@@ -952,7 +973,7 @@ pub(crate) fn record_found_released(
 pub(crate) fn abort(db: &mut Connection, saga_id: &str, reason: &str) -> Result<(), Fault> {
     guarded(
         db,
-        "UPDATE completion_sagas SET outcome='aborted',abort_reason=?2,stage=CASE WHEN stage IN ('prepared','held') THEN 'aborted' ELSE stage END WHERE id=?1 AND outcome IS NULL AND stage IN ('prepared','acquire_possible','held')",
+        "UPDATE completion_sagas SET outcome='aborted',abort_reason=?2,stage=CASE WHEN stage IN ('prepared','held') THEN 'aborted' ELSE stage END,failures=CASE WHEN stage IN ('prepared','held') THEN 0 ELSE failures END,attention=CASE WHEN stage IN ('prepared','held') THEN NULL ELSE attention END WHERE id=?1 AND outcome IS NULL AND stage IN ('prepared','acquire_possible','held')",
         params![saga_id, reason],
     )
 }
@@ -960,7 +981,7 @@ pub(crate) fn abort(db: &mut Connection, saga_id: &str, reason: &str) -> Result<
 pub(crate) fn mark_release_pending(db: &mut Connection, saga_id: &str) -> Result<(), Fault> {
     guarded(
         db,
-        "UPDATE completion_sagas SET stage='release_pending' WHERE id=?1 AND stage IN ('committed','aborted') AND outcome IS NOT NULL AND hold_id IS NOT NULL",
+        "UPDATE completion_sagas SET stage='release_pending',attention=NULL,failures=0 WHERE id=?1 AND stage IN ('committed','aborted') AND outcome IS NOT NULL AND hold_id IS NOT NULL",
         [saga_id],
     )
 }
@@ -968,7 +989,15 @@ pub(crate) fn mark_release_pending(db: &mut Connection, saga_id: &str) -> Result
 pub(crate) fn finish_without_hold(db: &mut Connection, saga_id: &str) -> Result<(), Fault> {
     guarded(
         db,
-        "UPDATE completion_sagas SET stage='released' WHERE id=?1 AND stage='aborted' AND outcome='aborted' AND hold_id IS NULL",
+        "UPDATE completion_sagas SET stage='released',attention=NULL,failures=0 WHERE id=?1 AND stage='aborted' AND outcome='aborted' AND hold_id IS NULL",
+        [saga_id],
+    )
+}
+/// A correlated refusal of the first acquire proves that no hold was created.
+pub(crate) fn refuse_first_acquire(db: &mut Connection, saga_id: &str) -> Result<(), Fault> {
+    guarded(
+        db,
+        "UPDATE completion_sagas SET stage='aborted',outcome='aborted',abort_reason='hold_refused',attention=NULL,failures=0 WHERE id=?1 AND stage='acquire_possible' AND outcome IS NULL AND hold_id IS NULL",
         [saga_id],
     )
 }
@@ -1009,7 +1038,7 @@ pub(crate) fn note_attention(
 ) -> Result<i64, Fault> {
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute(
-        "UPDATE completion_sagas SET attention=?2,failures=failures+1 WHERE id=?1",
+        "UPDATE completion_sagas SET failures=CASE WHEN attention=?2 THEN min(failures+1,100) ELSE 1 END,attention=?2 WHERE id=?1",
         params![saga_id, attention],
     )?;
     let failures: i64 = tx.query_row(
@@ -1019,6 +1048,12 @@ pub(crate) fn note_attention(
     )?;
     tx.commit()?;
     Ok(failures)
+}
+
+/// Clear a resolved route problem before counting failures of a different operation.
+pub(crate) fn clear_route_attention(db: &Connection, saga_id: &str) -> Result<(), Fault> {
+    db.execute("UPDATE completion_sagas SET attention=NULL,failures=0 WHERE id=?1 AND attention='route_changed'", [saga_id])?;
+    Ok(())
 }
 
 fn append_observation(

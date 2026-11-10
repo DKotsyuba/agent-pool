@@ -10,8 +10,9 @@ use crate::{
     completion_key::KeyStore,
     completion_saga::{Driver, SettlementRun, StatusFact},
     domain::{
-        Actor, Ballot, Binding, Change, CheckStatus, Choice, Command, Criterion, CriterionCheck,
-        Event, Fault, Member, MemberState, Pool, Proposal, ProposalState, RunRoute, VoteValidity,
+        Actor, Ballot, BatchJob, Binding, Change, CheckStatus, Choice, Command, Criterion,
+        CriterionCheck, Effect, Event, Fault, Member, MemberState, Pool, Proposal, ProposalState,
+        RunRoute, VoteValidity, Work,
     },
     managed_state::{
         AttemptRef, Incarnation, ManagedActor, ManagedBinding, Route, SuccessorLink,
@@ -399,6 +400,7 @@ struct RunState {
     holds: HashMap<String, FakeHold>,
     lose_acquire_ack: bool,
     drop_acquire: bool,
+    refuse_acquire: bool,
     lose_release_ack: bool,
     created: usize,
     releases: usize,
@@ -424,6 +426,7 @@ impl FakeRun {
             holds: HashMap::new(),
             lose_acquire_ack: false,
             drop_acquire: false,
+            refuse_acquire: false,
             lose_release_ack: false,
             created: 0,
             releases: 0,
@@ -563,6 +566,9 @@ impl SettlementRun for FakeRun {
         if state.drop_acquire {
             state.drop_acquire = false;
             return Err(HoldError::Unknown);
+        }
+        if state.refuse_acquire {
+            return Err(HoldError::Refused);
         }
         if !eligible || prior.is_some() {
             return Err(HoldError::Unknown);
@@ -753,6 +759,225 @@ async fn p3_completion_ready_finish() {
     assert_eq!(record_count(&fixture), 1);
 }
 
+#[tokio::test]
+async fn completion_fences_pending_admission_and_refuses_late_receipt() {
+    let fixture = fixture(Options::default());
+    let run = FakeRun::new();
+    let effect = Effect {
+        effect_id: "late-start".into(),
+        pool_id: POOL.into(),
+        member_id: Some("member-1".into()),
+        state: "queued".into(),
+        work: Work::Start {
+            spec: json!({}),
+            request_key: "start-key".into(),
+            route_fence: false,
+            route: None,
+        },
+    };
+    let raw = serde_json::to_string(&effect).unwrap();
+    fixture.with(|db| {
+        db.execute(
+            "INSERT INTO effects(id,pool,member,state,data) VALUES(?1,?2,?3,'queued',?4)",
+            params![effect.effect_id, POOL, "member-1", raw],
+        )
+        .unwrap();
+    });
+    assert!(
+        fixture
+            .with(|db| completion::snapshot(db, POOL).unwrap())
+            .is_none()
+    );
+    assert!(
+        driver(&fixture, &run)
+            .start(&fixture.store(), POOL)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    fixture.with(|db| {
+        db.execute(
+            "UPDATE effects SET state='cancelled' WHERE id='late-start'",
+            [],
+        )
+        .unwrap();
+    });
+    let mut driver = driver(&fixture, &run);
+    let saga = driver.start(&fixture.store(), POOL).await.unwrap().unwrap();
+    driver.step(&fixture.store(), &saga).await.unwrap();
+    fixture.with(|db| {
+        db.execute(
+            "UPDATE effects SET state='unknown' WHERE id='late-start'",
+            [],
+        )
+        .unwrap();
+    });
+    driver.advance(&fixture.store(), &saga).await.unwrap();
+    assert_eq!(record_count(&fixture), 0);
+    assert_eq!(fixture.stage(&saga).1.as_deref(), Some("aborted"));
+    fixture.with(|db| {
+        db.execute(
+            "UPDATE effects SET state='cancelled' WHERE id='late-start'",
+            [],
+        )
+        .unwrap();
+    });
+    let run = FakeRun::new();
+    run_to_end(&fixture, &run).await.unwrap();
+    fixture.with(|db| {
+        db.execute(
+            "UPDATE effects SET state='unknown' WHERE id='late-start'",
+            [],
+        )
+        .unwrap();
+    });
+    let before = fixture.with(|db| {
+        db.query_row::<String, _, _>("SELECT data FROM pools WHERE id=?1", [POOL], |r| r.get(0))
+            .unwrap()
+    });
+    let store = fixture.store();
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .record_run_admission("late-start", &agent(99), 1),
+        Err(Fault::Closed)
+    );
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .record_run_admission("late-start", &agent(99), 1),
+        Err(Fault::Closed)
+    );
+    assert_eq!(
+        fixture.count(
+            "SELECT count(*) FROM alerts WHERE effect='late-start' AND kind='completed_admission'"
+        ),
+        1
+    );
+    assert_eq!(
+        fixture.with(|db| db
+            .query_row::<String, _, _>("SELECT data FROM pools WHERE id=?1", [POOL], |r| r.get(0))
+            .unwrap()),
+        before
+    );
+}
+
+#[tokio::test]
+async fn completed_pool_refuses_late_batch_and_replacement_receipts() {
+    let fixture = fixture(Options::default());
+    let old: Binding = fixture.with(|db| {
+        serde_json::from_str(
+            &db.query_row::<String, _, _>(
+                "SELECT data FROM members WHERE id='member-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    });
+    let condition = fixture.with(|db| {
+        completion::snapshot(db, POOL).unwrap().unwrap().voters[0]
+            .selector
+            .clone()
+    });
+    let run = FakeRun::new();
+    run_to_end(&fixture, &run).await.unwrap();
+    let route = RunRoute {
+        socket: "/fixture/run.sock".into(),
+        expected_uid: 1000,
+        peer_uid: None,
+        store_id: Some(RUN_STORE.into()),
+    };
+    let job = BatchJob {
+        member_id: "member-1".into(),
+        spec: json!({}),
+        original_spec: None,
+    };
+    let batch = Effect {
+        effect_id: "late-batch".into(),
+        pool_id: POOL.into(),
+        member_id: Some("member-1".into()),
+        state: "unknown".into(),
+        work: Work::StartBatch {
+            request_key: "batch".into(),
+            retain_history: true,
+            store_fence: true,
+            route_fence: true,
+            route: Some(route.clone()),
+            jobs: vec![job.clone()],
+        },
+    };
+    let mut new = old.clone();
+    new.member.member_id = "new-member".into();
+    let replacement = Effect {
+        effect_id: "late-replacement".into(),
+        pool_id: POOL.into(),
+        member_id: Some("member-1".into()),
+        state: "inflight".into(),
+        work: Work::Replace {
+            request_key: "replacement".into(),
+            old: Box::new(old),
+            new: Box::new(new),
+            job,
+            route,
+            condition: Some(condition),
+            submitted: true,
+            claim: Some("claim".into()),
+            send_first: Some(false),
+        },
+    };
+    fixture.with(|db| {
+        for effect in [&batch, &replacement] {
+            db.execute(
+                "INSERT INTO effects(id,pool,member,state,data) VALUES(?1,?2,?3,?4,?5)",
+                params![
+                    effect.effect_id,
+                    POOL,
+                    effect.member_id,
+                    effect.state,
+                    serde_json::to_string(effect).unwrap()
+                ],
+            )
+            .unwrap();
+        }
+    });
+    let receipt = (
+        agent(99),
+        1,
+        format!("ex1_{}", "b".repeat(64)),
+        Some(target(99, 1).pin_id),
+    );
+    let store = fixture.store();
+    assert_eq!(
+        store.lock().unwrap().record_batch_admission(
+            "late-batch",
+            Some(RUN_STORE),
+            std::slice::from_ref(&receipt)
+        ),
+        Err(Fault::Closed)
+    );
+    assert_eq!(
+        store.lock().unwrap().record_replacement_admission(
+            "late-replacement",
+            "claim",
+            RUN_STORE,
+            &receipt
+        ),
+        Err(Fault::Closed)
+    );
+    assert_eq!(
+        fixture.count("SELECT count(*) FROM members WHERE id='new-member'"),
+        0
+    );
+    assert_eq!(
+        fixture.count("SELECT count(*) FROM alerts WHERE kind='completed_admission'"),
+        2
+    );
+}
+
 /// All-voter currentness and the complete roster/epoch/generation CAS refuse stale settlement.
 #[tokio::test]
 async fn p3_completion_all_voters() {
@@ -904,6 +1129,202 @@ async fn p3_hold_lost_ack_release() {
     assert_eq!(run.active_holds(), 1);
     run.state().store_id = "store_ffffffffffffffffffffffffffffffff".into();
     assert!(run.acquire(&loaded.intent, None).await.is_err());
+}
+
+#[tokio::test]
+async fn initial_hold_refusal_terminates_but_uncertain_saga_blocks_new_attempts() {
+    let fixture = fixture(Options::default());
+    let run = FakeRun::new();
+    run.state().refuse_acquire = true;
+    let mut driver = driver(&fixture, &run);
+    let saga = driver.start(&fixture.store(), POOL).await.unwrap().unwrap();
+    driver.advance(&fixture.store(), &saga).await.unwrap();
+    assert_eq!(fixture.stage(&saga).0, "released");
+    assert_eq!(fixture.stage(&saga).1.as_deref(), Some("aborted"));
+    assert_eq!(run.state().created, 0);
+
+    let fixture = self::fixture(Options::default());
+    let run = FakeRun::new();
+    run.state().drop_acquire = true;
+    let mut driver = self::driver(&fixture, &run);
+    let saga = driver.start(&fixture.store(), POOL).await.unwrap().unwrap();
+    driver.step(&fixture.store(), &saga).await.unwrap();
+    run.state().refuse_acquire = true;
+    for _ in 0..3 {
+        driver.step(&fixture.store(), &saga).await.unwrap();
+    }
+    assert_eq!(fixture.stage(&saga).0, "acquire_possible");
+    assert_eq!(fixture.stage(&saga).1.as_deref(), Some("aborted"));
+    assert!(
+        fixture
+            .with(|db| completion::candidates(db, "", 20).unwrap())
+            .is_empty()
+    );
+    assert!(driver.start(&fixture.store(), POOL).await.is_err());
+    assert_eq!(run.state().created, 0);
+}
+
+#[tokio::test]
+async fn completion_attention_does_not_invalidate_inventory_and_route_restore_resets_failures() {
+    let fixture = fixture(Options::default());
+    let run = FakeRun::new();
+    let mut driver = driver(&fixture, &run);
+    let saga = driver.start(&fixture.store(), POOL).await.unwrap().unwrap();
+    fixture.with(|db| {
+        completion::note_attention(db, &saga, "hold_unavailable").unwrap();
+        completion::note_attention(db, &saga, "hold_unavailable").unwrap();
+    });
+    driver.step(&fixture.store(), &saga).await.unwrap();
+    assert_eq!(
+        fixture.with(|db| db
+            .query_row::<i64, _, _>(
+                "SELECT failures FROM completion_sagas WHERE id=?1",
+                [&saga],
+                |r| r.get(0)
+            )
+            .unwrap()),
+        0
+    );
+    let original = run.state().route.clone();
+    let revision = fixture.count("SELECT revision FROM inventory_source");
+    run.state().route.socket = "/changed".into();
+    for _ in 0..5 {
+        driver.step(&fixture.store(), &saga).await.unwrap();
+    }
+    assert_eq!(
+        fixture.count("SELECT revision FROM inventory_source"),
+        revision
+    );
+    assert_eq!(
+        fixture.with(|db| completion::driver_unavailable(db, "key_unavailable").unwrap()),
+        1
+    );
+    let store = fixture.store();
+    let request: crate::observer::Request =
+        serde_json::from_value(json!({"schema_version":1,"operation":"identity","params":{}}))
+            .unwrap();
+    let identity = serde_json::to_value(store.lock().unwrap().observe(&request).unwrap()).unwrap();
+    assert!(
+        identity["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("completion_attention_key_unavailable"))
+    );
+    fixture.with(|db| {
+        completion::note_attention(db, &saga, "route_changed").unwrap();
+    });
+    run.state().route = original;
+    run.state().consensus_unavailable = true;
+    driver.step(&fixture.store(), &saga).await.unwrap();
+    assert_eq!(fixture.stage(&saga).0, "held");
+    assert_eq!(
+        fixture.with(|db| db
+            .query_row::<i64, _, _>(
+                "SELECT failures FROM completion_sagas WHERE id=?1",
+                [&saga],
+                |r| r.get(0)
+            )
+            .unwrap()),
+        1
+    );
+}
+
+#[tokio::test]
+async fn candidate_retry_is_backed_off_until_local_revision_changes() {
+    let fixture = fixture(Options::default());
+    let run = FakeRun::new();
+    run.state().voters.insert(agent(1), VoterState::Live);
+    let mut driver = driver(&fixture, &run);
+    let (_sender, stopped) = tokio::sync::watch::channel(false);
+    driver.tick(&fixture.store(), &stopped).await.unwrap();
+    assert_eq!(
+        run.state()
+            .calls
+            .iter()
+            .filter(|call| **call == "consensus")
+            .count(),
+        1
+    );
+    driver.tick(&fixture.store(), &stopped).await.unwrap();
+    driver.tick(&fixture.store(), &stopped).await.unwrap();
+    assert_eq!(
+        run.state()
+            .calls
+            .iter()
+            .filter(|call| **call == "consensus")
+            .count(),
+        1
+    );
+    fixture.with(|db| { db.execute("UPDATE pools SET data=json_set(data,'$.revision',json_extract(data,'$.revision')+1) WHERE id=?1", [POOL]).unwrap(); });
+    driver.tick(&fixture.store(), &stopped).await.unwrap();
+    driver.tick(&fixture.store(), &stopped).await.unwrap();
+    assert_eq!(
+        run.state()
+            .calls
+            .iter()
+            .filter(|call| **call == "consensus")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn read_only_consensus_probes_never_create_currentness_rows() {
+    let fixture = fixture(Options::default());
+    let candidate = fixture.with(|db| completion::snapshot(db, POOL).unwrap().unwrap());
+    let voter = &candidate.voters[0].ballot;
+    let pin = crate::managed_state::RunPin {
+        route: voter.binding.run_route.clone(),
+        socket: "/fixture/attempt.sock".into(),
+        executable: "/fixture/run".into(),
+        executable_sha256: "a".repeat(64),
+        capabilities: vec!["attempt_consensus_v1".into()],
+    };
+    let before = fixture.count("SELECT count(*) FROM managed_current_requests");
+    for n in 0..100 {
+        crate::managed_run::VoterQuery::read_only(
+            &pin,
+            voter,
+            &format!("read-{n}"),
+            &format!("rpc-{n}"),
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        fixture.count("SELECT count(*) FROM managed_current_requests"),
+        before
+    );
+}
+
+#[tokio::test]
+async fn tick_records_and_backs_off_unexpected_advance_error() {
+    let fixture = fixture(Options::default());
+    let run = FakeRun::new();
+    let mut driver = driver(&fixture, &run);
+    let saga = driver.start(&fixture.store(), POOL).await.unwrap().unwrap();
+    fixture.with(|db| {
+        db.execute_batch("DROP TRIGGER completion_saga_frozen")
+            .unwrap();
+        db.execute(
+            "UPDATE completion_sagas SET frozen='{}' WHERE id=?1",
+            [&saga],
+        )
+        .unwrap();
+    });
+    let (_sender, stopped) = tokio::sync::watch::channel(false);
+    driver.tick(&fixture.store(), &stopped).await.unwrap();
+    assert_eq!(fixture.stage(&saga).2.as_deref(), Some("internal_error"));
+    driver.tick(&fixture.store(), &stopped).await.unwrap();
+    assert_eq!(
+        fixture.with(|db| db
+            .query_row::<i64, _, _>(
+                "SELECT failures FROM completion_sagas WHERE id=?1",
+                [&saga],
+                |r| r.get(0)
+            )
+            .unwrap()),
+        1
+    );
 }
 fn loaded_hold(fixture: &Fixture, saga: &str) -> String {
     fixture.with(|db| {
@@ -1692,10 +2113,73 @@ fn p3_completion_migration_history_and_downgrade() {
         );
         let triggers: i64 = db.query_row("SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name IN (SELECT 'inventory_rev_' || t.name || '_' || a.action FROM (SELECT 'completion_sagas' AS name UNION ALL SELECT 'completion_records' UNION ALL SELECT 'completion_observations' UNION ALL SELECT 'managed_delivery_seeds' UNION ALL SELECT 'managed_delivery_outbox' UNION ALL SELECT 'managed_delivery_scopes' UNION ALL SELECT 'managed_route_pin_history' UNION ALL SELECT 'managed_namespace_retirements') t CROSS JOIN (SELECT 'INSERT' AS action UNION ALL SELECT 'UPDATE' UNION ALL SELECT 'DELETE') a)", [], |r| r.get(0)).unwrap();
         assert_eq!(
-            triggers, 24,
-            "all durable tables fence inventory after v{prior}"
+            triggers, 18,
+            "only inventory-visible durable tables fence inventory after v{prior}"
         );
     }
+}
+
+#[test]
+fn review_v13_migration_preserves_prepared_retirement_and_rolls_back_on_failure() {
+    let dir = private_dir();
+    let path = dir.path().join("pool.db");
+    {
+        let mut store = Store::open(&path).unwrap();
+        let db = store.completion_db();
+        db.execute("INSERT INTO leaders VALUES('owner','address')", [])
+            .unwrap();
+        db.execute("INSERT INTO pools VALUES('p','owner','{}')", [])
+            .unwrap();
+        db.execute("INSERT INTO managed_delivery_scopes(producer_scope,pool_id,state,retire_request_id,bridge_pin,audience) VALUES('open','p','open','a','old','aud'),('drain','p','draining','b','old','aud'),('retire','p','retiring','c','frozen','aud')", []).unwrap();
+        for table in ["completion_sagas", "completion_observations"] {
+            for action in ["INSERT", "UPDATE", "DELETE"] {
+                db.execute_batch(&format!("CREATE TRIGGER inventory_rev_{table}_{action} AFTER {action} ON {table} BEGIN UPDATE inventory_source SET revision=revision+1 WHERE singleton=1; END;")).unwrap();
+            }
+        }
+        db.execute_batch(
+            "PRAGMA user_version=12; DROP TRIGGER inventory_rev_completion_sagas_INSERT;",
+        )
+        .unwrap();
+    }
+    assert!(Store::open(&path).is_err());
+    {
+        let db = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(
+            db.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap(),
+            12
+        );
+        assert_eq!(
+            db.query_row::<String, _, _>(
+                "SELECT bridge_pin FROM managed_delivery_scopes WHERE producer_scope='open'",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+            "old"
+        );
+        db.execute_batch("CREATE TRIGGER inventory_rev_completion_sagas_INSERT AFTER INSERT ON completion_sagas BEGIN UPDATE inventory_source SET revision=revision+1 WHERE singleton=1; END;").unwrap();
+    }
+    let mut store = Store::open(&path).unwrap();
+    let db = store.completion_db();
+    assert_eq!(db.query_row::<i64,_,_>("SELECT count(*) FROM managed_delivery_scopes WHERE state IN ('open','draining') AND bridge_pin IS NULL AND audience IS NULL", [], |r| r.get(0)).unwrap(), 2);
+    assert_eq!(
+        db.query_row::<String, _, _>(
+            "SELECT bridge_pin FROM managed_delivery_scopes WHERE state='retiring'",
+            [],
+            |r| r.get(0)
+        )
+        .unwrap(),
+        "frozen"
+    );
+    assert!(
+        db.execute(
+            "UPDATE managed_delivery_scopes SET bridge_pin='changed' WHERE state='retiring'",
+            []
+        )
+        .is_err()
+    );
+    assert_eq!(db.query_row::<i64,_,_>("SELECT count(*) FROM sqlite_master WHERE type='trigger' AND (name LIKE 'inventory_rev_completion_sagas_%' OR name LIKE 'inventory_rev_completion_observations_%')", [], |r| r.get(0)).unwrap(), 0);
 }
 
 /// Failures in the v11 and v12 steps roll back the entire upgrade; future schemas refuse.

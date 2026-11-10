@@ -266,15 +266,7 @@ impl VoterQuery {
         request_id: &str,
         transport_id: &str,
     ) -> Result<Self, crate::domain::Fault> {
-        if !wire_text(request_id)
-            || !wire_text(transport_id)
-            || pin.route != voter.binding.run_route
-            || voter.generation != voter.binding.binding_generation
-            || voter.attempt != voter.binding.attempt
-            || voter.incarnation.uid != pin.route.worker_uid
-        {
-            return Err(crate::domain::Fault::Invalid);
-        }
+        let query = Self::read_only(pin, voter, request_id, transport_id)?;
         let intent = CurrentIntent::Consensus {
             version: 1,
             expected_store_id: pin.route.component_store_id.clone(),
@@ -285,6 +277,25 @@ impl VoterQuery {
             expected_incarnation: voter.incarnation.clone(),
         };
         crate::managed_state::prepare_current_request(db, pin, &intent)?;
+        Ok(query)
+    }
+
+    /// A read-only consensus probe with no local durable intent or external effect.
+    pub(crate) fn read_only(
+        pin: &RunPin,
+        voter: &VerifiedBallot,
+        request_id: &str,
+        transport_id: &str,
+    ) -> Result<Self, crate::domain::Fault> {
+        if !wire_text(request_id)
+            || !wire_text(transport_id)
+            || pin.route != voter.binding.run_route
+            || voter.generation != voter.binding.binding_generation
+            || voter.attempt != voter.binding.attempt
+            || voter.incarnation.uid != pin.route.worker_uid
+        {
+            return Err(crate::domain::Fault::Invalid);
+        }
         Ok(Self {
             pin: pin.clone(),
             transport_id: transport_id.into(),

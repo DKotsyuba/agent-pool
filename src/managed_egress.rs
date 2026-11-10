@@ -20,6 +20,21 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 
 const ACTIVE_LIMIT: i64 = 100_000;
+/// Check the approved active pin in the transaction that first freezes work.
+fn require_active_bridge(db: &Connection, pin: &BridgePin) -> Result<(), Fault> {
+    let prior: Option<String> = db
+        .query_row(
+            "SELECT pin FROM managed_bridge_routes WHERE route=?1",
+            [encode(&pin.route)?],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match prior {
+        Some(value) if value == encode(pin)? => Ok(()),
+        Some(_) => Err(Fault::Conflict),
+        None => Err(Fault::Unavailable),
+    }
+}
 fn require_capacity(db: &Connection, limit: i64) -> Result<(), Fault> {
     let active:i64=db.query_row("SELECT count(*) FROM managed_delivery_outbox WHERE state IN ('pending','frozen','publishing','known_unsent','unknown','abort_pending')",[],|row|row.get(0))?;
     if active >= limit {
@@ -586,6 +601,7 @@ pub(crate) fn freeze(
         return Err(Fault::Forbidden);
     }
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_active_bridge(&tx, bridge_pin)?;
     crate::managed_state::require_staged_current(
         &tx,
         authority,
@@ -626,28 +642,15 @@ pub(crate) fn freeze(
     {
         return Err(Fault::Stale);
     }
-    let scope_state: (String, Option<String>, Option<String>) = tx.query_row(
-        "SELECT state,bridge_pin,audience FROM managed_delivery_scopes WHERE producer_scope=?1",
+    let scope_state: String = tx.query_row(
+        "SELECT state FROM managed_delivery_scopes WHERE producer_scope=?1",
         [&target.seed.producer_scope],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        |r| r.get(0),
     )?;
-    if !(scope_state.0 == "open" || (target.seed.final_notice && scope_state.0 == "draining")) {
+    if !(scope_state == "open" || (target.seed.final_notice && scope_state == "draining")) {
         return Err(Fault::Stale);
     }
     let bridge_json = encode(bridge_pin)?;
-    if scope_state.1.is_some() != scope_state.2.is_some()
-        || scope_state
-            .1
-            .as_deref()
-            .is_some_and(|pin| pin != bridge_json)
-        || scope_state
-            .2
-            .as_deref()
-            .is_some_and(|value| value != audience)
-    {
-        return Err(Fault::Conflict);
-    }
-    tx.execute("UPDATE managed_delivery_scopes SET bridge_pin=?2,audience=?3 WHERE producer_scope=?1 AND bridge_pin IS NULL",params![target.seed.producer_scope,bridge_json,audience])?;
     let text = verified_text(&tx, &target.seed)?;
     if text != target.text {
         return Err(Fault::Conflict);
@@ -1202,22 +1205,25 @@ pub(crate) fn prepare_scope(
     if unsettled {
         return Err(Fault::Unavailable);
     }
-    let pin_json = encode(pin)?;
-    if old_pin.is_some() != old_audience.is_some()
-        || old_pin.as_deref().is_some_and(|value| value != pin_json)
-        || old_audience
-            .as_deref()
-            .is_some_and(|value| value != audience)
-    {
+    if old_pin.is_some() != old_audience.is_some() {
         return Err(Fault::Conflict);
     }
+    let (pin, audience) = match (old_pin, old_audience) {
+        (Some(old_pin), Some(old_audience)) => (decode::<BridgePin>(&old_pin)?, old_audience),
+        (None, None) if state == "draining" => {
+            require_active_bridge(&tx, pin)?;
+            (pin.clone(), audience.to_owned())
+        }
+        _ => return Err(Fault::Conflict),
+    };
+    let pin_json = encode(&pin)?;
     let needs_retire = matches!(state.as_str(), "draining" | "retiring");
     tx.execute("UPDATE managed_delivery_scopes SET state=?2,bridge_pin=?3,audience=?4 WHERE producer_scope=?1",params![scope,if needs_retire{"retiring"}else{"compacting"},pin_json,audience])?;
     tx.commit()?;
     Ok(ScopePlan {
         producer_scope: scope.into(),
-        bridge_pin: pin.clone(),
-        audience: audience.into(),
+        bridge_pin: pin,
+        audience,
         retire_request_id: request,
         needs_retire,
     })
@@ -1419,6 +1425,25 @@ pub(crate) mod tests {
         next: &str,
         sequence: u32,
     ) -> Frozen {
+        freeze_next_pin(
+            store,
+            binding,
+            incarnation,
+            id,
+            next,
+            sequence,
+            &fake_bridge_pin(binding),
+        )
+    }
+    fn freeze_next_pin(
+        store: &mut Store,
+        binding: &ManagedBinding,
+        incarnation: &Incarnation,
+        id: &str,
+        next: &str,
+        sequence: u32,
+        bridge: &BridgePin,
+    ) -> Frozen {
         let prefix = format!("pool/{}/", binding.pool_store_id);
         let target = store.egress_target(id, &prefix).unwrap();
         let run_pin = pin(&target.binding);
@@ -1437,13 +1462,7 @@ pub(crate) mod tests {
             ))
             .unwrap();
         store
-            .egress_freeze(
-                &target,
-                &authority,
-                &run_pin,
-                &fake_bridge_pin(binding),
-                "pool",
-            )
+            .egress_freeze(&target, &authority, &run_pin, bridge, "pool")
             .unwrap()
     }
     pub(crate) fn result(
@@ -1592,6 +1611,111 @@ pub(crate) mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn repin_allows_new_effects_and_retirement_for_used_member_and_final_scopes() {
+        for final_notice in [false, true] {
+            let (_directory, mut store, binding, incarnation, _run) = fixture();
+            index_managed_member(store.test_db(), &binding);
+            if final_notice {
+                store
+                    .test_db()
+                    .execute("UPDATE members SET current=0 WHERE id='member'", [])
+                    .unwrap();
+            }
+            add_seed(&mut store, &binding, "first-effect", "one", final_notice);
+            let first = freeze_next(
+                &mut store,
+                &binding,
+                &incarnation,
+                "first-effect",
+                "next",
+                2,
+            );
+            let (_, dispatch) = begin_publish(store.test_db(), "first-effect").unwrap();
+            record_result(
+                store.test_db(),
+                "first-effect",
+                Some(&dispatch),
+                &result(&first, ManagedOwnerStateV1::Accepted, None),
+                false,
+            )
+            .unwrap();
+            let mut bridge = fake_bridge_pin(&binding);
+            bridge.server_sha256 = "c".repeat(64);
+            bridge.credential_sha256 = "d".repeat(64);
+            let run = fake_run_endpoint(&binding);
+            let pool_route = crate::managed_state::Route {
+                component_store_id: binding.pool_store_id.clone(),
+                route_id: "pool-route".into(),
+                worker_uid: binding.run_route.worker_uid,
+            };
+            store
+                .managed_repin_routes(&bridge, &run, &pool_route, true)
+                .unwrap();
+            assert_eq!(
+                require_active_bridge(store.test_db(), &first.bridge_pin),
+                Err(Fault::Conflict)
+            );
+            add_seed(&mut store, &binding, "second-effect", "two", final_notice);
+            let second = freeze_next_pin(
+                &mut store,
+                &binding,
+                &incarnation,
+                "second-effect",
+                "next-2",
+                3,
+                &bridge,
+            );
+            let (_, dispatch) = begin_publish(store.test_db(), "second-effect").unwrap();
+            record_result(
+                store.test_db(),
+                "second-effect",
+                Some(&dispatch),
+                &result(&second, ManagedOwnerStateV1::Accepted, None),
+                false,
+            )
+            .unwrap();
+            assert!(
+                frozen(store.test_db(), "first-effect").unwrap().bridge_pin == first.bridge_pin
+            );
+            assert!(second.bridge_pin == bridge);
+            if final_notice {
+                retire_final_scope(store.test_db(), "pool").unwrap();
+            } else {
+                retire_member_scope(store.test_db(), "pool", "member").unwrap();
+            }
+            let plan = prepare_scope(store.test_db(), &first.seed.producer_scope, &bridge, "pool")
+                .unwrap();
+            assert!(plan.bridge_pin == bridge);
+            let original_key = plan.retire_request_id.clone();
+            let replay = prepare_scope(
+                store.test_db(),
+                &first.seed.producer_scope,
+                &first.bridge_pin,
+                "different",
+            )
+            .unwrap();
+            assert!(replay.bridge_pin == bridge);
+            assert_eq!(replay.audience, "pool");
+            assert_eq!(replay.retire_request_id, original_key);
+            let retire = RetireResult {
+                receipt: bridge_sdk::bridge_protocol::RetireReceipt {
+                    producer: plan.bridge_pin.producer.clone(),
+                    request_id: original_key,
+                    scope_key: plan.producer_scope.clone(),
+                    action: RetirementAction::RetireUnhanded,
+                    retired_at_ms: 1,
+                    disposed: 0,
+                    already_terminal: 2,
+                    preserved_possible_effect: 0,
+                    preserved_unhanded: 0,
+                },
+                replayed: false,
+            };
+            record_scope_retired(store.test_db(), &plan, &retire).unwrap();
+        }
     }
 
     #[test]

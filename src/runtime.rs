@@ -1308,7 +1308,7 @@ async fn recover_egress_scope(
     };
     let cfg = config.clone();
     let route = run.bridge_route.clone();
-    let (client, pin) = match tokio::task::spawn_blocking(move || {
+    let (_, pin) = match tokio::task::spawn_blocking(move || {
         crate::managed_bridge::SdkBridge::capture(&cfg, route)
     })
     .await
@@ -1337,6 +1337,19 @@ async fn recover_egress_scope(
     {
         Ok(value) => value,
         Err(_) => return Ok(()),
+    };
+    if config.bridge_audience != plan.audience {
+        return Ok(());
+    }
+    let cfg = config.clone();
+    let original = plan.bridge_pin.clone();
+    let client = match tokio::task::spawn_blocking(move || {
+        crate::managed_bridge::SdkBridge::recover(&cfg, &original)
+    })
+    .await
+    {
+        Ok(Ok(client)) => client,
+        _ => return Ok(()),
     };
     managed_egress_dispatch::scope(store, &lease, plan, client).await
 }
@@ -3239,7 +3252,7 @@ async fn work(
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut observation_cursor = 0;
     // P3-C automatic settlement stays off unless Run and managed consensus routes are configured.
-    let mut completion = crate::completion_saga::Driver::production(&config);
+    let mut completion = None;
     loop {
         tokio::select! {
             biased;
@@ -3249,6 +3262,33 @@ async fn work(
         recover_managed(&config, &store, &stopped, &activity).await?;
         recover_egress_scope(&config, &store, &activity).await?;
         recover_namespace_retirement(&config, &store).await?;
+        if completion.is_none() {
+            if let Some(driver) = crate::completion_saga::Driver::production(&config) {
+                if driver.sweep(&store).await.is_ok() {
+                    completion = Some(driver);
+                } else {
+                    let changed = stored(&store, |store| {
+                        crate::completion::driver_unavailable(
+                            store.completion_db(),
+                            "key_unavailable",
+                        )
+                    })
+                    .await?;
+                    if changed > 0 {
+                        eprintln!("completion settlement unavailable: key_unavailable");
+                    }
+                }
+            } else {
+                let reason = crate::completion_saga::Driver::unavailable_reason(&config);
+                let changed = stored(&store, move |store| {
+                    crate::completion::driver_unavailable(store.completion_db(), reason)
+                })
+                .await?;
+                if changed > 0 {
+                    eprintln!("completion settlement unavailable: {reason}");
+                }
+            }
+        }
         if let Some(driver) = completion.as_mut() {
             driver.tick(&store, &stopped).await?;
         }
