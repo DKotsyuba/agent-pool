@@ -11,9 +11,9 @@ its EOF never starts, stops or replaces the resident.
 - `domain.rs` defines strict flat commands, safe public views and private outbox work.
 - `store.rs` owns the single SQLite writer and synchronous transactions. A process
   lifetime file lock excludes a second writer. WAL, full synchronization, foreign
-  keys and schema version 12 are explicit. Future schema versions refuse to open.
-  Schema v1–v11 upgrades transactionally to v12 before use; older binaries must
-  refuse v12 because they cannot preserve newer durable state. The v5 replacement
+  keys and schema version 15 are explicit. Future schema versions refuse to open.
+  Schema v1–v14 upgrades transactionally to v15 before use; older binaries must
+  refuse v15 because they cannot preserve newer durable state. The v5 replacement
   and stable-slot migration and v6 inventory revision fence remain in that upgrade.
 - `runtime.rs` supervises bounded frontend connections, one serial effect worker
   and rotating observation batches. Blocking database work never spans provider I/O.
@@ -41,8 +41,10 @@ verified `pool_join` binds the actor and confirms the current onboarding revisio
 Run retention can remove a lineage tail and a later resume can reuse its sequence;
 a sampled address also does not identify the current attempt. Managed calls need
 the original Bridge observation and the pinned Run proof described below. Managed
-join remains closed, admission is not proof that onboarding succeeded, and fresh
-managed delivery requires the separately enabled egress path below. Unverified historical mappings are not authority
+join opens only for an owner-enrolled P3 root (see "P3 managed enrollment and
+replacement"); manual or ordinary Run roots stay refused, admission is not proof
+that onboarding succeeded, and fresh managed delivery requires the separately
+enabled egress path below. Unverified historical mappings are not authority
 and their runtime projection is unknown. Old Run-managed ballots remain
 `validity:unknown` and cannot count toward a new acceptance; already accepted
 historical decisions remain unchanged. Bridge-only participants remain available.
@@ -620,11 +622,121 @@ actor-epoch change bumps its binding generation even if the Run attempt is the
 same. The aggregate binding/roster epoch fences consensus CAS, while an unrelated
 member's context is fenced by its own binding generation and the domain roster.
 These refinements follow shared `contracts/attempt-binding-v1-errata.md` E1 and E7.
-The existing managed join and incomplete-tool guards remain closed, and no managed
+Managed join is open only through the P3 enrollment gate below; no other managed
 participant capability is advertised. This code has synthetic coverage; actual Run/Bridge
 endpoints, installed providers and managed-harness role qualification have not
 been qualified together. The grant installs no service, endpoint, credential or
 release.
+
+### P3 managed enrollment and replacement
+
+This implements the Pool side of `contracts/enrollment-p3.md` sections 2–5, 7
+and 9 against Run's `contracts/run-p3-wire.md`. It is opt-in:
+`managed_run_transport.enrollment_enabled = true` requires `frontend_enabled`
+and an exact `managed_role` (configuration refuses either alone). Only then do
+the owner's `pool_start_agent`, `pool_start_batch` and `pool_replace` take the
+managed path; without the switch they keep the legacy behavior above. Turning
+the switch off refuses every not-yet-submitted enrollment (no Run I/O occurred)
+while exact-key recovery of submitted keys continues on their original route.
+
+**Owner reservation.** The owner is authorized by the existing leader check in
+the domain transaction before anything is reserved; participants, copied IDs
+or receipts and managed participant sessions cannot reach these operations.
+The owner calls through a frontend configuration without `frontend_enabled`
+(the native Bridge-assertion path) against the same resident.
+One transaction reserves the pending members (roster bound 20 includes them),
+advances the pool revision, queues P2 onboarding seeds (awaiting binding) and
+writes the schema v15 journal: `managed_enrollments` (owner, domain scope/key/
+digest, Run request ID `agent-pool.enroll.<uuid>`, frozen route = Run endpoint,
+Pool, Bridge routes, producer, role and public status route) and ordered
+`managed_enrollment_jobs` (member, retained original spec). For a start the
+complete `_managed_start_batch_v1` params and fingerprint
+(`SHA256("agent-mcp/enrollment/start/v1" || 00 || C(params))`, the published
+597-byte vector is a unit test) are frozen in the same transaction. Each spec
+must name `profile = managed_role`; Pool adds `explicit_finish:true` and
+`write:false` when absent, refuses other values, `required_mcp`,
+`orchestrator` and `request_id`, and appends the onboarding text to `task`. The
+receipt's `created_id` is the enrollment ID and `created_ids` the members.
+Single start is a one-job batch. Identity, keys, routes, params, fingerprint,
+receipt and replacement source are trigger-immutable; rows are never deleted.
+
+**Run I/O.** A serial resident pass handles each pending enrollment outside
+SQLite. `reserved` -> capability check (`managed_enrollment_v1` and
+`attempt_current_egress_v1`; absence refuses definitively) -> durable
+`submit_possible` -> submit. A typed refusal is definitive only on that first
+possible submission; later refusals are attention only. Recovery always
+increments its attempt counter before I/O and then uses the original key:
+`lookup` (an `absent` snapshot is never a fence) followed by same-key submit
+replay, including after `request_in_progress` (a Run-prepared key, e.g. after a
+Run configuration revision change). An owner `pool_cancel_replacement` of an
+uncertain replacement records `abort_requested`; the resident then calls the
+same-key abort: a tombstone settles `aborted` and fences any delayed submit, an
+admitted key returns its original receipt and nothing is cancelled. A changed
+configured route or endpoint never retargets a key (`route_changed`
+attention, no I/O). The receipt is validated (store, request, fingerprint,
+order, member, role, Run ID grammar, distinct roots/pins/refs, never an
+already enrolled root) and installed in one transaction: start members gain
+their Run root, sequence, execution reference, pin and store. A member removed
+before admission, or a completed pool, leaves the job `unassigned`.
+
+**Generation 1.** For each admitted unbound job the resident stages a
+`current_request_id` before calling `_managed_enrollment_current_v1`; the
+receipt is re-read through `_attempt_current_receipt_v1` before use. A reply to
+a key whose earlier exchange was uncertain resolves that key but is never used
+as fresh authority. The CAS requires the live owner enrollment, the exact
+admitted root, the current pending unbound member with matching Run facts, an
+egress receipt anchored at the admitted execution, matching launch and role
+digest qualification and an unused address; it installs the managed binding at
+generation 1, sets the member address and leaves the pool revision unchanged.
+`attempt_not_ready` keeps the same key and reports the Run job snapshot
+(`qualification_pending`, `execution_failed`, ...) as job attention. The first
+protected hook may win instead: rootless ingress whose root is an admitted,
+unbound start job installs generation 1 under the same CAS, so exactly one first
+binding exists; a replacement candidate is `not_ready` until switched and an
+unknown root is forbidden. Binding, delivery accepted and join are separate
+facts: delivery never activates a member.
+
+**Join.** `pool_join` runs through the normal P1 context, Bridge consume, Run
+admission and domain CAS. `managed_enrollment::join_gate` additionally requires
+the owner enrollment receipt mapping this root, its recorded enrollment binding,
+and the job still `bound_pending_join`; the domain CAS then checks the
+acknowledged revision and pending -> active. While pending, an enrollee may only
+read (`pool_get`) and join. The legacy Bridge-only path still refuses every
+Run-started member.
+
+**Replacement.** `pool_replace` freezes the old binding, its managed generation,
+slot, the reserved candidate (not yet a member), and the candidate spec (explicit
+or the retained original), and freezes roster edits, close, join, proposals and
+votes like the legacy replacement. The resident reads Run status for the old
+lineage: a proven terminal, cleaned tip with active pin, complete coverage and no
+restart becomes the frozen `precondition` (proven busy/unclean refuses before
+submission). After admission and a fresh qualified candidate attestation the
+resident re-reads the old tip; a moved tip (`old_resumed`) or changed old
+generation (`old_rebound`) leaves attention and changes nothing. Otherwise one
+transaction retires the old member (scope draining, unfrozen seeds not
+delivered, frozen unknown effects retained, one final notice), installs the
+candidate as a current pending member in the same slot with generation 1,
+advances the revision, stales the open proposal, journals `member_replaced`
+and queues the candidate's onboarding. A roster change or completion abandons
+the qualified candidate as `unassigned` (root and pin retained). Retiring a
+member does not forbid a Run resume of its lineage; it never regains membership.
+
+**Owner controls and reads.** `pool_enrollment_get {pool_id,enrollment_id}` and
+the observer `enrollment_get` (capability `managed_enrollment_v1`) return the
+mode, state (`reserved`, `submit_possible`, `admitted`, `refused`, `aborted`,
+`switched`, `abandoned`, `resolved`), revision, attention and per-job state
+(`reserved`, `admitted`, `bound_pending_join`, `active`, `unassigned`,
+`retired`), root, pin and binding generation; no sockets, payloads or sessions.
+They never contact Run. `pool_enrollment_resolve {pool_id,enrollment_id,
+expected_enrollment_revision,request_key,disposition:"retain_unassigned"}`
+closes only an admitted enrollment (uncertain submissions conflict): unbound
+jobs become `unassigned`, still-pending start members leave the roster, a
+failed replacement keeps the old member; no process is cancelled and no pin
+released. Pending enrollments also fence formal completion.
+
+E11 issuer discovery failures in namespace retirement are durable
+(`managed_route_attention`), retried with capped backoff and visible to the owner
+as identity capability `namespace_retirement_attention_<code>`.
 
 ### Managed owner delivery
 
@@ -789,7 +901,7 @@ delivery are separate facts. Inventory orders by pool ID; archive orders by
 retained proposal insertion sequence; other sections preserve existing cursor
 semantics. Pages observe current state independently; mutable offset sections
 require the revision fence on continuation.
-Store schema v14 has no historical timestamps: `source_timestamp:null` and
+Store schema v15 has no historical timestamps: `source_timestamp:null` and
 coverage text disclose that absence. Complete encoded envelopes including the
 newline are capped at 1 MiB; oversized results fail explicitly without partial
 publication or silently advancing a cursor. Resident exchanges use the existing
