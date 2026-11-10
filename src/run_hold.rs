@@ -99,6 +99,18 @@ impl HoldIntent {
         &self.fingerprint
     }
 
+    /// Exposes frozen public fields to synthetic Run hold fixtures only.
+    #[cfg(test)]
+    pub(crate) fn fixture_view(&self) -> (&str, &str, &[Target], &[String], [u8; 32]) {
+        (
+            &self.store_id,
+            &self.request_id,
+            &self.targets,
+            &self.expected_roots,
+            self.verifying_key,
+        )
+    }
+
     /// Constructs the producer's length-prefixed v1 hash preimage without normalization.
     fn canonical_bytes(&self) -> Result<Vec<u8>, HoldError> {
         let mut bytes = Vec::new();

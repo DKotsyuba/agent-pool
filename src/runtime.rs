@@ -3238,6 +3238,8 @@ async fn work(
     let mut interval = tokio::time::interval(OBSERVATION_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut observation_cursor = 0;
+    // P3-C automatic settlement stays off unless Run and managed consensus routes are configured.
+    let mut completion = crate::completion_saga::Driver::production(&config);
     loop {
         tokio::select! {
             biased;
@@ -3247,6 +3249,9 @@ async fn work(
         recover_managed(&config, &store, &stopped, &activity).await?;
         recover_egress_scope(&config, &store, &activity).await?;
         recover_namespace_retirement(&config, &store).await?;
+        if let Some(driver) = completion.as_mut() {
+            driver.tick(&store, &stopped).await?;
+        }
         for _ in 0..32 {
             if *stopped.borrow() {
                 return Ok(());

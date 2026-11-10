@@ -24,6 +24,12 @@
 
 ### Added
 
+- Formal Pool completion (P3-C, schema v12, following v10 egress and v11 re-pin
+  and issuer retirement): automatic resident settlement with a
+  durable Run lineage-hold saga, per-saga protected Ed25519 release keys, one
+  atomic CAS that appends an immutable digest-bound completion record, owner
+  `completion_get` pages (`completion_record_v1`) and non-null inventory
+  `open`/`completed` counts (`inventory_completion_v1`). Completion freezes the pool.
 - Recoverable Run-member replacement with atomic Run preconditions and a frozen roster on unknown outcomes.
 - Optional structured acceptance criteria and durable per-criterion vote checks.
 - Recoverable grouped Run admission with local all-or-nothing membership reservation;

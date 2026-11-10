@@ -245,6 +245,11 @@ pub enum ProofOutcomeScope {
     RetainedLatest,
 }
 impl ProofProjection {
+    /// Exact validated selector of this projection.
+    pub(crate) fn selector(&self) -> &Target {
+        &self.status.selector
+    }
+
     /// Rejects contradictory proof fields when the owner frontend decodes a resident response.
     pub(crate) fn valid(&self) -> bool {
         valid_target(&self.status.selector)

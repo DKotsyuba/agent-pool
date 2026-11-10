@@ -1,8 +1,13 @@
-# Pool immutable completion record — design only
+# Pool immutable completion record — design
 
-This document describes a proposed future contract. None of the record, saga,
-completion classification, digest, owner read or retention behavior below is
-implemented or advertised by `inventory_snapshot_v1`. Accepted proposals,
+Status: P3-C implements the v1 subset chosen by owner decisions C1–C4 (automatic
+settlement, non-gating notice, final completion, per-saga protected key); see
+`docs/architecture.md` "Formal completion ledger" and the Completion section of
+`contracts/pool-p1-wire.md`. The open questions below record the remaining
+trust-model limits; anti-rollback anchoring, key rotation, export and deletion
+policy are not implemented.
+
+The original design text follows. Accepted proposals,
 closure, delivery, and Run success are separate facts. Completion requires the
 later attempt-binding agreement, an authenticated Run hold, and one atomic Pool
 transaction; an observer must never acquire a hold.

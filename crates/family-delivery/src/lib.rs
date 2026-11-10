@@ -17,7 +17,7 @@ pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + S
 pub const MAX_BINARY_BYTES: u64 = 512 * 1024 * 1024;
 /// The product's current on-disk state schema. Packaging stamps
 /// this into new manifests; keep it in lockstep with the store layout.
-pub const CURRENT_STATE_SCHEMA: u32 = 11;
+pub const CURRENT_STATE_SCHEMA: u32 = 12;
 
 /// The explicit single-binary profile is separate from the older bundle manifest.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
