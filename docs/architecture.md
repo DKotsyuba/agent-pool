@@ -766,7 +766,16 @@ can expose typed, nonsecret attention such as `awaiting_root_hook`,
 
 An exact known-unsent effect may be sent again only with its frozen target and
 digest. Unknown effects are looked up or aborted under their original identity;
-they never resend automatically or lock the member against unrelated effects.
+they never resend the original or lock the member against unrelated effects.
+Erratum E12 (liveness): exact lookups use capped exponential backoff; after
+three non-decisive results (for example `binding_unavailable`/`same_key_lookup`
+when the publish never reached Bridge) Pool fences and aborts the exact original
+effect with `abort_managed_owner_v1`. `accepted` resolves delivered; transport
+loss or `unknown` keeps retrying with `outcome_unknown` attention. Only a durable
+`aborted` lets Pool create one NEW effect (new effect ID, same event, payload
+and scope) that is frozen again under the normal rules; the original stays
+aborted and is never retargeted, so at most one live effect exists per event.
+The link is kept in `managed_delivery_liveness` (schema v15).
 Removal or replacement before freezing makes an ordinary seed not delivered.
 A final notice is the exception: it may be frozen for the exact removed
 membership's previously bound lineage, with a fresh Run receipt and a same-lineage

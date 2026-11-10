@@ -2172,7 +2172,7 @@ fn p3_schema_v15_migration_and_rollback() {
             )
             .unwrap();
         let db = store.test_db();
-        db.execute_batch("DROP TABLE managed_enrollment_jobs; DROP TABLE managed_enrollments; DROP TABLE managed_route_attention; PRAGMA user_version=14;").unwrap();
+        db.execute_batch("DROP TABLE managed_enrollment_jobs; DROP TABLE managed_enrollments; DROP TABLE managed_route_attention; DROP TABLE managed_delivery_liveness; PRAGMA user_version=14;").unwrap();
     }
     // A failing v15 step rolls back to the intact v14 schema and data.
     {

@@ -405,6 +405,21 @@ impl Store {
     ) -> Result<(crate::managed_egress::Frozen, String), Fault> {
         crate::managed_egress::begin_abort(&mut self.db, id)
     }
+    pub(crate) fn egress_liveness_due(&self, id: &str, now: i64) -> Result<bool, Fault> {
+        crate::managed_egress::liveness_due(&self.db, id, now)
+    }
+    pub(crate) fn egress_liveness_failed(&mut self, id: &str, now: i64) -> Result<i64, Fault> {
+        crate::managed_egress::liveness_failed(&mut self.db, id, now)
+    }
+    pub(crate) fn egress_begin_liveness_abort(&mut self, id: &str) -> Result<(), Fault> {
+        crate::managed_egress::begin_liveness_abort(&mut self.db, id)
+    }
+    pub(crate) fn egress_liveness_aborting(&self, id: &str) -> Result<bool, Fault> {
+        crate::managed_egress::liveness_aborting(&self.db, id)
+    }
+    pub(crate) fn egress_republish(&mut self, id: &str) -> Result<Option<String>, Fault> {
+        crate::managed_egress::republish(&mut self.db, id)
+    }
     pub(crate) fn egress_not_sent(
         &mut self,
         id: &str,
@@ -1441,6 +1456,7 @@ PRAGMA user_version=5;")?;
         if version < 15 {
             crate::managed_enrollment::migrate(&db)?;
             db.execute_batch("CREATE TABLE managed_route_attention(subject TEXT PRIMARY KEY CHECK(subject='namespace_discovery'),attention TEXT NOT NULL,attempts INTEGER NOT NULL CHECK(attempts>0),next_attempt INTEGER NOT NULL CHECK(next_attempt>=0));")?;
+            crate::managed_egress::migrate_liveness(&db)?;
             db.execute_batch("PRAGMA user_version=15;")?;
         }
         if version < crate::completion::SCHEMA_VERSION {

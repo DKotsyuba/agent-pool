@@ -1521,6 +1521,78 @@ mod managed_egress_dispatch {
         client: C,
         abort: bool,
     ) -> Result<(), Fault> {
+        reconcile_outcome(store, lease, frozen, client, abort)
+            .await
+            .map(|_| ())
+    }
+
+    /// E12 liveness: exact lookups with capped backoff; after
+    /// `LIVENESS_LOOKUPS` non-decisive results the exact original effect is
+    /// aborted. Only a durable `aborted` creates ONE new effect for the same
+    /// event; `accepted` is delivered; uncertainty keeps retrying with attention.
+    pub(super) async fn liveness<C: OwnerClient + Clone + 'static>(
+        store: &SharedStore,
+        lease: &ManagedLease,
+        frozen: Frozen,
+        client: C,
+        state: State,
+        now: i64,
+    ) -> Result<(), Fault> {
+        let id = frozen.seed.effect_id.clone();
+        require_effect_lease(lease, &id)?;
+        let key = id.clone();
+        if !stored_managed(store, lease, move |store| {
+            store.egress_liveness_due(&key, now)
+        })
+        .await?
+        {
+            return Ok(());
+        }
+        let aborting = state == State::AbortPending;
+        let outcome = reconcile_outcome(store, lease, frozen, client, aborting).await?;
+        let key = id.clone();
+        match outcome {
+            Some(State::Aborted) if aborting => {
+                let fenced = key.clone();
+                if stored_managed(store, lease, move |store| {
+                    store.egress_liveness_aborting(&fenced)
+                })
+                .await?
+                {
+                    stored_managed(store, lease, move |store| store.egress_republish(&key)).await?;
+                }
+                Ok(())
+            }
+            Some(State::Accepted | State::Aborted) => Ok(()),
+            _ => {
+                let failures = stored_managed(store, lease, move |store| {
+                    store.egress_liveness_failed(&key, now)
+                })
+                .await?;
+                if !aborting && failures >= crate::managed_egress::LIVENESS_LOOKUPS {
+                    let key = id.clone();
+                    match stored_managed(store, lease, move |store| {
+                        store.egress_begin_liveness_abort(&key)
+                    })
+                    .await
+                    {
+                        Ok(()) | Err(Fault::Stale) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// One exact lookup or abort; returns the decisive recorded state, if any.
+    async fn reconcile_outcome<C: OwnerClient + Clone + 'static>(
+        store: &SharedStore,
+        lease: &ManagedLease,
+        frozen: Frozen,
+        client: C,
+        abort: bool,
+    ) -> Result<Option<State>, Fault> {
         let id = frozen.seed.effect_id.clone();
         require_effect_lease(lease, &id)?;
         let (request, original) = if abort {
@@ -1547,7 +1619,7 @@ mod managed_egress_dispatch {
             Ok(value) => value,
             Err(_) => {
                 note(store, lease, &id, "outcome_unknown").await?;
-                return Ok(());
+                return Ok(None);
             }
         };
         match result {
@@ -1558,6 +1630,7 @@ mod managed_egress_dispatch {
                 })
                 .await;
                 match recorded {
+                    Ok(state @ (State::Accepted | State::Aborted)) => return Ok(Some(state)),
                     Ok(_) | Err(Fault::Stale) => {}
                     Err(Fault::Conflict | Fault::Invalid) => {
                         note(store, lease, &id, "outcome_unknown").await?
@@ -1570,7 +1643,7 @@ mod managed_egress_dispatch {
             }
             Err(_) => note(store, lease, &id, "outcome_unknown").await?,
         }
-        Ok(())
+        Ok(None)
     }
 
     /// A retired scope is compacted only after all local effects are terminal.
@@ -1750,6 +1823,16 @@ mod managed_egress_dispatch {
             store.egress_scope_draining(&key)
         })
         .await?;
+        if matches!(state, State::Unknown | State::AbortPending) && !draining {
+            let now = i64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|_| Fault::Unavailable)?
+                    .as_secs(),
+            )
+            .map_err(|_| Fault::Unavailable)?;
+            return liveness(store, &lease, frozen, bridge, state, now).await;
+        }
         if matches!(state, State::Unknown | State::AbortPending)
             || (state == State::KnownUnsent && draining && !frozen.seed.final_notice)
         {
@@ -7723,6 +7806,264 @@ mod tests {
         })
         .await?;
         assert_eq!(state, "committed");
+        Ok(())
+    }
+
+    /// E12: a publish killed before reaching Bridge resolves by bounded exact
+    /// lookups, then exact abort, then exactly one NEW effect for the same
+    /// event that is delivered once; a publish Bridge already accepted resolves
+    /// by lookup with no abort or republish.
+    #[tokio::test]
+    async fn e12_unknown_publish_aborts_then_republishes_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::managed_egress::tests::{add_seed, freeze_next, result};
+        use crate::managed_egress::{Frozen, OwnerClient, OwnerFailure, ScopePlan, State};
+        use crate::managed_state::tests::{fixture, index_managed_member};
+        use bridge_sdk::bridge_protocol::{
+            RetireResult,
+            managed_owner::{
+                CompactManagedOwnerScopeResultV1, ManagedOwnerResultV1, ManagedOwnerStateV1,
+            },
+        };
+        #[derive(Clone, Default)]
+        struct Owner {
+            calls: Arc<Mutex<Vec<(String, String)>>>,
+        }
+        impl Owner {
+            fn log(&self, kind: &str, frozen: &Frozen) -> Result<(), OwnerFailure> {
+                self.calls
+                    .lock()
+                    .map_err(|_| OwnerFailure::Unknown)?
+                    .push((kind.into(), frozen.seed.effect_id.clone()));
+                Ok(())
+            }
+            fn count(&self, kind: &str) -> usize {
+                self.calls
+                    .lock()
+                    .map(|calls| calls.iter().filter(|(k, _)| k == kind).count())
+                    .unwrap_or(usize::MAX)
+            }
+        }
+        impl OwnerClient for Owner {
+            fn capabilities(&self, _: &str) -> Result<(), OwnerFailure> {
+                Ok(())
+            }
+            fn publish(
+                &self,
+                _: &str,
+                frozen: &Frozen,
+            ) -> Result<ManagedOwnerResultV1, OwnerFailure> {
+                self.log("publish", frozen)?;
+                Ok(result(frozen, ManagedOwnerStateV1::Accepted, None))
+            }
+            fn lookup(
+                &self,
+                _: &str,
+                frozen: &Frozen,
+            ) -> Result<ManagedOwnerResultV1, OwnerFailure> {
+                self.log("lookup", frozen)?;
+                if frozen.seed.effect_id == "e12-accepted" {
+                    Ok(result(frozen, ManagedOwnerStateV1::Accepted, None))
+                } else {
+                    // Missing Bridge custody: binding_unavailable/same_key_lookup.
+                    Err(OwnerFailure::Unknown)
+                }
+            }
+            fn abort(
+                &self,
+                _: &str,
+                frozen: &Frozen,
+            ) -> Result<ManagedOwnerResultV1, OwnerFailure> {
+                self.log("abort", frozen)?;
+                if self.count("abort") == 1 {
+                    return Err(OwnerFailure::Unknown);
+                }
+                Ok(result(frozen, ManagedOwnerStateV1::Aborted, None))
+            }
+            fn retire(&self, _: &str, _: &ScopePlan) -> Result<RetireResult, OwnerFailure> {
+                Err(OwnerFailure::Unknown)
+            }
+            fn compact(
+                &self,
+                _: &str,
+                _: &ScopePlan,
+            ) -> Result<CompactManagedOwnerScopeResultV1, OwnerFailure> {
+                Err(OwnerFailure::Unknown)
+            }
+        }
+        let (dir, mut initial, binding, incarnation, _run) = fixture();
+        index_managed_member(initial.test_db(), &binding);
+        let event = add_seed(&mut initial, &binding, "e12-lost", "payload", false);
+        add_seed(&mut initial, &binding, "e12-accepted", "accepted", false);
+        let lost = freeze_next(&mut initial, &binding, &incarnation, "e12-lost", "next", 2);
+        let rebound: crate::managed_state::ManagedBinding =
+            serde_json::from_str(&initial.test_db().query_row(
+                "SELECT binding FROM managed_bindings WHERE member='member'",
+                [],
+                |row| row.get::<_, String>(0),
+            )?)?;
+        let accepted = freeze_next(
+            &mut initial,
+            &rebound,
+            &incarnation,
+            "e12-accepted",
+            "third",
+            3,
+        );
+        // Both publishes are claimed, then the resident is killed before any
+        // byte reached Bridge (lost) or after Bridge accepted (accepted).
+        initial.egress_begin_publish("e12-lost")?;
+        initial.egress_begin_publish("e12-accepted")?;
+        drop(initial);
+        let reopened = Store::open(&dir.path().join("pool.db"))?;
+        let store = Arc::new(Mutex::new(reopened));
+        assert_eq!(
+            stored(&store, |store| store.egress_state("e12-lost")).await?,
+            Some(State::Unknown)
+        );
+        let owner = Owner::default();
+        let activity = Arc::new(ManagedActivity::default());
+        // Accepted after kill: exact lookup resolves delivered; no abort/republish.
+        let lease = activity
+            .acquire(ManagedWork::Egress("e12-accepted".into()))?
+            .ok_or("lease")?;
+        managed_egress_dispatch::liveness(
+            &store,
+            &lease,
+            accepted,
+            owner.clone(),
+            State::Unknown,
+            100,
+        )
+        .await?;
+        drop(lease);
+        assert_eq!(
+            stored(&store, |store| store.egress_state("e12-accepted")).await?,
+            Some(State::Accepted)
+        );
+        assert_eq!((owner.count("abort"), owner.count("publish")), (0, 0));
+        // Lost before Bridge: bounded lookups with backoff, never a resend.
+        let lease = activity
+            .acquire(ManagedWork::Egress("e12-lost".into()))?
+            .ok_or("lease")?;
+        for (now, lookups) in [(100, 2), (101, 2), (105, 3), (114, 3), (115, 4)] {
+            let state = stored(&store, |store| store.egress_state("e12-lost"))
+                .await?
+                .ok_or("state")?;
+            managed_egress_dispatch::liveness(
+                &store,
+                &lease,
+                lost.clone(),
+                owner.clone(),
+                state,
+                now,
+            )
+            .await?;
+            assert_eq!(owner.count("lookup"), lookups, "at {now}");
+        }
+        assert_eq!(
+            stored(&store, |store| store.egress_state("e12-lost")).await?,
+            Some(State::AbortPending)
+        );
+        assert_eq!(owner.count("publish"), 0);
+        // Abort transport loss stays fenced with attention, retried after backoff.
+        managed_egress_dispatch::liveness(
+            &store,
+            &lease,
+            lost.clone(),
+            owner.clone(),
+            State::AbortPending,
+            135,
+        )
+        .await?;
+        assert_eq!(owner.count("abort"), 1);
+        assert_eq!(
+            stored(&store, |store| store.egress_state("e12-lost")).await?,
+            Some(State::AbortPending)
+        );
+        let attention = stored(&store, |store| {
+            crate::managed_egress::owner_attention(store.test_db(), "e12-lost")
+        })
+        .await?;
+        assert_eq!(attention.0.as_deref(), Some("outcome_unknown"));
+        managed_egress_dispatch::liveness(
+            &store,
+            &lease,
+            lost.clone(),
+            owner.clone(),
+            State::AbortPending,
+            1000,
+        )
+        .await?;
+        assert_eq!(
+            stored(&store, |store| store.egress_state("e12-lost")).await?,
+            Some(State::Aborted)
+        );
+        drop(lease);
+        // Exactly one NEW effect for the same event; the original is never retargeted.
+        let (fresh, live, event_key) = stored(&store, |store| {
+            let db = store.test_db();
+            let fresh: String = db.query_row(
+                "SELECT republished_as FROM managed_delivery_liveness WHERE effect_id='e12-lost'",
+                [],
+                |row| row.get(0),
+            )?;
+            let live: i64 = db.query_row(
+                "SELECT count(*) FROM managed_delivery_seeds s JOIN managed_delivery_outbox o ON o.effect_id=s.effect_id WHERE s.event_key=(SELECT event_key FROM managed_delivery_seeds WHERE effect_id='e12-lost') AND o.state NOT IN ('aborted','accepted','not_delivered')",
+                [],
+                |row| row.get(0),
+            )?;
+            let key: String = db.query_row(
+                "SELECT event_key FROM managed_delivery_seeds WHERE effect_id=?1",
+                [&fresh],
+                |row| row.get(0),
+            )?;
+            Ok((fresh, live, key))
+        })
+        .await?;
+        assert_ne!(fresh, "e12-lost");
+        assert_eq!(live, 1);
+        assert_eq!(event_key, format!("event/{event}"));
+        let replay = fresh.clone();
+        assert_eq!(
+            stored(&store, move |store| store.egress_republish("e12-lost")).await?,
+            Some(replay)
+        );
+        // The new effect follows the normal freeze rules and is delivered once.
+        let current: crate::managed_state::ManagedBinding = serde_json::from_str(
+            &stored(&store, |store| {
+                Ok(store.test_db().query_row(
+                    "SELECT binding FROM managed_bindings WHERE member='member'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )?)
+            })
+            .await?,
+        )?;
+        let fresh_frozen = {
+            let mut guard = store.lock().map_err(|_| "store")?;
+            freeze_next(&mut guard, &current, &incarnation, &fresh, "fourth", 4)
+        };
+        assert_eq!(fresh_frozen.seed.event_key, lost.seed.event_key);
+        assert_ne!(fresh_frozen.digest, lost.digest);
+        let lease = activity
+            .acquire(ManagedWork::Egress(fresh.clone()))?
+            .ok_or("lease")?;
+        managed_egress_dispatch::publish(&store, &lease, fresh_frozen, owner.clone()).await?;
+        let state_id = fresh.clone();
+        assert_eq!(
+            stored(&store, move |store| store.egress_state(&state_id)).await?,
+            Some(State::Accepted)
+        );
+        assert_eq!(owner.count("publish"), 1);
+        assert!(
+            owner
+                .calls
+                .lock()
+                .map_err(|_| "calls")?
+                .iter()
+                .all(|(kind, id)| kind != "publish" || *id == fresh)
+        );
         Ok(())
     }
 

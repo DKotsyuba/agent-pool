@@ -32,6 +32,9 @@
   (`namespace_retirement_attention_<code>`) with capped backoff when Bridge
   issuer discovery fails, instead of silently skipping retirement; `repin`
   reports which discovery failed.
+- Erratum E12 egress liveness: an unknown managed publish whose exact lookups
+  stay non-decisive is aborted for the exact original effect after bounded
+  backoff; only a durable `aborted` creates one new effect for the same event.
 - `bind_run` never overwrites a terminal (`refused`, `cancelled`,
   `reconciliation_needed`) effect or a completed pool.
 - Isolate completion release keys per durable Pool store

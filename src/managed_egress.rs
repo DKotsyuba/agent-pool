@@ -20,6 +20,161 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 
 const ACTIVE_LIMIT: i64 = 100_000;
+/// E12: non-decisive exact lookups tolerated before the exact-effect abort.
+pub(crate) const LIVENESS_LOOKUPS: i64 = 3;
+
+/// Schema v15 (E12): per-effect liveness bookkeeping and the permanent link
+/// from an aborted original to the one new effect republished for its event.
+pub(crate) fn migrate_liveness(db: &Connection) -> Result<(), Fault> {
+    db.execute_batch("\
+CREATE TABLE managed_delivery_liveness(effect_id TEXT PRIMARY KEY REFERENCES managed_delivery_outbox(effect_id),failures INTEGER NOT NULL DEFAULT 0 CHECK(failures>=0),next_attempt INTEGER NOT NULL DEFAULT 0 CHECK(next_attempt>=0),aborting INTEGER NOT NULL DEFAULT 0 CHECK(aborting IN (0,1)),republished_as TEXT UNIQUE REFERENCES managed_delivery_seeds(effect_id));\
+CREATE TRIGGER managed_delivery_liveness_link BEFORE UPDATE OF effect_id,republished_as ON managed_delivery_liveness WHEN OLD.effect_id IS NOT NEW.effect_id OR (OLD.republished_as IS NOT NULL AND OLD.republished_as IS NOT NEW.republished_as) OR (OLD.aborting=1 AND NEW.aborting=0) BEGIN SELECT RAISE(ABORT,'immutable managed delivery liveness'); END;\
+CREATE TRIGGER managed_delivery_liveness_retained BEFORE DELETE ON managed_delivery_liveness BEGIN SELECT RAISE(ABORT,'retained managed delivery liveness'); END;")?;
+    Ok(())
+}
+
+/// Whether an unresolved effect's liveness backoff has elapsed.
+pub(crate) fn liveness_due(db: &Connection, effect_id: &str, now: i64) -> Result<bool, Fault> {
+    Ok(db.query_row(
+        "SELECT NOT EXISTS(SELECT 1 FROM managed_delivery_liveness WHERE effect_id=?1 AND next_attempt>?2)",
+        params![effect_id, now],
+        |row| row.get(0),
+    )?)
+}
+
+/// Count one non-decisive exact lookup or abort and schedule capped backoff.
+pub(crate) fn liveness_failed(
+    db: &mut Connection,
+    effect_id: &str,
+    now: i64,
+) -> Result<i64, Fault> {
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let failures: i64 = tx
+        .query_row(
+            "SELECT failures FROM managed_delivery_liveness WHERE effect_id=?1",
+            [effect_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(0_i64)
+        .saturating_add(1);
+    let shift = u32::try_from((failures - 1).clamp(0, 6)).map_err(|_| Fault::Internal)?;
+    let next = now.saturating_add(5_i64.saturating_mul(1_i64 << shift).min(300));
+    tx.execute(
+        "INSERT INTO managed_delivery_liveness(effect_id,failures,next_attempt) VALUES(?1,?2,?3) ON CONFLICT(effect_id) DO UPDATE SET failures=excluded.failures,next_attempt=excluded.next_attempt",
+        params![effect_id, failures, next.max(0)],
+    )?;
+    tx.commit()?;
+    Ok(failures)
+}
+
+/// After bounded non-decisive lookups, fence the exact original effect for abort.
+pub(crate) fn begin_liveness_abort(db: &mut Connection, effect_id: &str) -> Result<(), Fault> {
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if state(&tx, effect_id)? != Some(State::Unknown) {
+        return Err(Fault::Stale);
+    }
+    tx.execute(
+        "INSERT INTO managed_delivery_liveness(effect_id,aborting) VALUES(?1,1) ON CONFLICT(effect_id) DO UPDATE SET aborting=1",
+        [effect_id],
+    )?;
+    let prior: Option<String> = tx.query_row(
+        "SELECT abort_request_id FROM managed_delivery_outbox WHERE effect_id=?1",
+        [effect_id],
+        |row| row.get(0),
+    )?;
+    tx.execute(
+        "UPDATE managed_delivery_outbox SET state='abort_pending',abort_request_id=?2,attention='outcome_unknown' WHERE effect_id=?1 AND state='unknown'",
+        params![effect_id, prior.unwrap_or_else(crate::domain::id)],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Whether an abort-pending effect was fenced by E12 liveness (not scope retirement).
+pub(crate) fn liveness_aborting(db: &Connection, effect_id: &str) -> Result<bool, Fault> {
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM managed_delivery_liveness WHERE effect_id=?1 AND aborting=1)",
+        [effect_id],
+        |row| row.get(0),
+    )?)
+}
+
+/// After a durable `aborted` for a liveness-fenced original, create exactly one
+/// NEW effect (new effect_id) for the same event under the normal freeze rules.
+/// The original stays aborted and is never retargeted. Returns the new ID, or
+/// `None` when the membership/scope no longer permits delivery.
+pub(crate) fn republish(db: &mut Connection, effect_id: &str) -> Result<Option<String>, Fault> {
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let row: Option<(bool, Option<String>)> = tx
+        .query_row(
+            "SELECT aborting=1,republished_as FROM managed_delivery_liveness WHERE effect_id=?1",
+            [effect_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((true, prior)) = row else {
+        return Ok(None);
+    };
+    if let Some(prior) = prior {
+        return Ok(Some(prior));
+    }
+    if state(&tx, effect_id)? != Some(State::Aborted) {
+        return Err(Fault::Stale);
+    }
+    let seed = seed(&tx, effect_id)?;
+    let scope_state: String = tx.query_row(
+        "SELECT state FROM managed_delivery_scopes WHERE producer_scope=?1",
+        [&seed.producer_scope],
+        |row| row.get(0),
+    )?;
+    let current: bool = tx.query_row(
+        "SELECT current FROM members WHERE id=?1 AND pool=?2",
+        params![seed.member_id, seed.pool_id],
+        |row| row.get(0),
+    )?;
+    let deliverable = if seed.final_notice {
+        !current && matches!(scope_state.as_str(), "open" | "draining")
+    } else {
+        current && scope_state == "open"
+    };
+    if !deliverable {
+        return Ok(None);
+    }
+    require_capacity(&tx, ACTIVE_LIMIT)?;
+    let mut copy = effect(&tx, effect_id)?;
+    let fresh = crate::domain::id();
+    copy.effect_id = fresh.clone();
+    copy.state = match &copy.work {
+        Work::Deliver { address, .. } if address.is_empty() => "awaiting_binding".into(),
+        Work::Deliver { .. } => "queued".into(),
+        _ => return Err(Fault::Internal),
+    };
+    tx.execute(
+        "INSERT INTO effects(id,pool,member,state,data) VALUES(?1,?2,?3,?4,?5)",
+        params![
+            fresh,
+            copy.pool_id,
+            copy.member_id,
+            copy.state,
+            encode(&copy)?
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO managed_delivery_seeds(effect_id,pool_id,member_id,event_key,payload_sha256,payload_length,producer_scope,final_notice,issuer_namespace) SELECT ?2,pool_id,member_id,event_key,payload_sha256,payload_length,producer_scope,final_notice,issuer_namespace FROM managed_delivery_seeds WHERE effect_id=?1",
+        params![effect_id, fresh],
+    )?;
+    tx.execute(
+        "INSERT INTO managed_delivery_outbox(effect_id,state) VALUES(?1,'pending')",
+        [&fresh],
+    )?;
+    tx.execute(
+        "UPDATE managed_delivery_liveness SET republished_as=?2 WHERE effect_id=?1 AND republished_as IS NULL",
+        params![effect_id, fresh],
+    )?;
+    tx.commit()?;
+    Ok(Some(fresh))
+}
 /// Check the approved active pin in the transaction that first freezes work.
 fn require_active_bridge(db: &Connection, pin: &BridgePin) -> Result<(), Fault> {
     let prior: Option<String> = db
@@ -866,7 +1021,7 @@ pub(crate) fn begin_abort(db: &mut Connection, effect_id: &str) -> Result<(Froze
         |row| row.get(0),
     )?;
     let abort_id = prior.unwrap_or_else(crate::domain::id);
-    tx.execute("UPDATE managed_delivery_outbox SET state='abort_pending',abort_request_id=?2,attention='scope_retiring' WHERE effect_id=?1 AND state IN ('frozen','publishing','known_unsent','unknown','abort_pending')",params![effect_id,abort_id])?;
+    tx.execute("UPDATE managed_delivery_outbox SET state='abort_pending',abort_request_id=?2,attention=CASE WHEN EXISTS(SELECT 1 FROM managed_delivery_liveness WHERE effect_id=?1 AND aborting=1) THEN 'outcome_unknown' ELSE 'scope_retiring' END WHERE effect_id=?1 AND state IN ('frozen','publishing','known_unsent','unknown','abort_pending')",params![effect_id,abort_id])?;
     tx.execute(
         "UPDATE effects SET state='unknown' WHERE id=?1",
         [effect_id],
@@ -1417,7 +1572,7 @@ pub(crate) mod tests {
             },
         }
     }
-    fn freeze_next(
+    pub(crate) fn freeze_next(
         store: &mut Store,
         binding: &ManagedBinding,
         incarnation: &Incarnation,

@@ -37,7 +37,7 @@ const CONTENT_CHUNK: usize = 16384;
 
 /// Test fixtures simulate a pre-completion store by removing exactly this step.
 #[cfg(test)]
-pub(crate) const TEST_DROP_SCHEMA: &str = "DROP TABLE managed_route_attention; DROP TABLE managed_enrollment_jobs; DROP TABLE managed_enrollments; DROP TABLE completed_admissions; DROP TABLE completion_observations; DROP TABLE completion_records; DROP TABLE completion_sagas;";
+pub(crate) const TEST_DROP_SCHEMA: &str = "DROP TABLE managed_delivery_liveness; DROP TABLE managed_route_attention; DROP TABLE managed_enrollment_jobs; DROP TABLE managed_enrollments; DROP TABLE completed_admissions; DROP TABLE completion_observations; DROP TABLE completion_records; DROP TABLE completion_sagas;";
 
 /// Installs saga, record and observation tables with immutability triggers.
 /// Pre-feature pools receive no record: they are classified open, never inferred completed.
