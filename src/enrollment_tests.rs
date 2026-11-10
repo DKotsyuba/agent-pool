@@ -1350,23 +1350,25 @@ async fn p3_batch_enrollment() {
         Some(Fault::Conflict),
         "roster bound includes reserved members"
     );
-    h.run.state().refuse_submit = Some(("capacity_exhausted", "operator"));
+    h.run.state().refuse_submit = Some(("role_mismatch", "none"));
     h.drive(&twenty).await;
     let view = h.view(&twenty);
     assert_eq!(view.state, "refused");
+    assert_eq!(h.run.state().aborts, 1, "refused key is fenced in Run once");
     assert!(view.jobs.iter().all(|job| job.lineage_root_id.is_none()));
     assert!(
         members
             .iter()
             .all(|member| h.member(member).0.run_id.is_none())
     );
+    // The refusal released every reserved member and slot.
+    assert_eq!(
+        h.count(
+            "SELECT count(*) FROM members WHERE current=1 AND json_extract(data,'$.run_id') IS NULL"
+        ),
+        0
+    );
     // A fresh owner batch admits all; qualification/join progress per member.
-    for member in &members {
-        h.db(|db| {
-            db.execute("UPDATE members SET current=0 WHERE id=?1", [member])
-                .unwrap()
-        });
-    }
     let (batch, members) = h.batch(3).unwrap();
     h.drive(&batch).await;
     let view = h.view(&batch);
@@ -1856,6 +1858,27 @@ async fn p3_early_hook_after_ack_loss() {
         }],
     };
     assert_eq!(h.first_hook(foreign).err(), Some(Fault::Forbidden));
+}
+
+/// `capacity_exhausted` is not a definitive refusal: Run keeps the key
+/// prepared, so Pool keeps the enrollment submit_possible and replays the SAME
+/// key until capacity frees, admitting exactly once and never aborting.
+#[tokio::test]
+async fn p3_capacity_exhausted_retries_same_key() {
+    let mut h = Harness::new();
+    let (id, _) = h.batch(20).unwrap();
+    h.run.state().refuse_submit = Some(("capacity_exhausted", "operator"));
+    h.drive(&id).await;
+    assert_eq!(
+        owner_view_state(&h, &id),
+        ("submit_possible".into(), Some("capacity_exhausted".into()))
+    );
+    assert_eq!(h.run.state().aborts, 0);
+    h.drive(&id).await;
+    assert_eq!(h.view(&id).state, "admitted");
+    assert_eq!(h.run.state().admissions, 1);
+    assert_eq!(h.run.state().aborts, 0);
+    assert_eq!(h.run.state().submits, 2);
 }
 
 /// The early-root route match is not truncated by a page of unrelated

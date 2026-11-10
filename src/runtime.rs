@@ -894,6 +894,26 @@ pub(crate) mod enrollment_dispatch {
                 }
             }
             Err(Failure::Refused(code)) => {
+                if first {
+                    // Fence Run's key (idempotent) before settling, so a key it
+                    // left prepared becomes a tombstone instead of leaking.
+                    match client.abort(&enrollment.key()?).await {
+                        Ok(lookup) if lookup.state == "aborted" => {}
+                        Ok(lookup) => {
+                            apply_lookup(store, enrollment, lookup).await?;
+                            return Ok(());
+                        }
+                        Err(failure) => {
+                            // Retry the exact-key abort on later passes.
+                            let id = id.clone();
+                            stored(store, move |store| {
+                                journal::request_abort(store.completion_db(), &id)
+                            })
+                            .await?;
+                            return note(store, &enrollment.id, failure.code()).await;
+                        }
+                    }
+                }
                 stored(store, move |store| {
                     journal::record_refusal(store.completion_db(), &id, code, first)
                 })

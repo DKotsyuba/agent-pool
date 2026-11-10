@@ -209,7 +209,7 @@ pub(crate) enum Failure {
 impl Failure {
     /// Classifies one authenticated closed Run error envelope.
     pub(crate) fn classify(code: &str, recovery: &str) -> Self {
-        const DEFINITIVE: [&str; 11] = [
+        const DEFINITIVE: [&str; 10] = [
             "unsupported_version",
             "capability_missing",
             "peer_not_authorized",
@@ -219,7 +219,6 @@ impl Failure {
             "intent_conflict",
             "route_mismatch",
             "attempt_mismatch",
-            "capacity_exhausted",
             "invalid",
         ];
         match (code, recovery) {
@@ -227,7 +226,9 @@ impl Failure {
             ("attempt_not_ready", "same_key_lookup") => Self::NotReady,
             ("request_in_progress" | "outcome_unknown", "same_key_lookup") => Self::InProgress,
             ("binding_stale", "fresh_invocation") => Self::Stale,
-            ("capacity_exhausted", "operator") => Self::Refused("capacity_exhausted"),
+            // Not a definitive refusal in the P3 wire contract: Run keeps the
+            // key prepared, so Pool keeps it submit_possible and replays it.
+            ("capacity_exhausted", _) => Self::Operator("capacity_exhausted"),
             ("recovery_required", "operator") => Self::Operator("recovery_required"),
             (_, "operator") => Self::Operator("binding_unavailable"),
             (code, "none") => DEFINITIVE
@@ -669,6 +670,7 @@ pub(crate) fn refuse_unsubmitted(db: &mut Connection, id: &str, code: &str) -> R
     {
         return Err(Fault::Conflict);
     }
+    release_refused(&tx, id)?;
     tx.commit()?;
     Ok(())
 }
@@ -739,6 +741,55 @@ pub(crate) fn begin_recovery(db: &mut Connection, id: &str) -> Result<(), Fault>
     Ok(())
 }
 
+/// Retire the reserved, never-admitted members of a refused start enrollment
+/// and release their roster slots; replacements keep their old member.
+fn release_refused(tx: &Connection, id: &str) -> Result<(), Fault> {
+    use crate::domain::Author;
+    let (enrollment, jobs) = load(tx, id)?;
+    if enrollment.mode != "start" {
+        return Ok(());
+    }
+    let (mut pool, _) = crate::store::pool(tx, &enrollment.pool)?;
+    let mut removed = Vec::new();
+    for job in &jobs {
+        let (member, current) = crate::store::binding_any(tx, &job.member)?;
+        if current && member.run_id.is_none() {
+            crate::store::save_binding(tx, &member, false)?;
+            tx.execute(
+                "UPDATE effects SET state='cancelled' WHERE member=?1 AND state IN ('queued','awaiting_binding')",
+                [&member.member.member_id],
+            )?;
+            crate::managed_egress::retire_member_scope(
+                tx,
+                &pool.pool_id,
+                &member.member.member_id,
+            )?;
+            removed.push(member.member.member_id.clone());
+        }
+    }
+    if removed.is_empty() {
+        return Ok(());
+    }
+    pool.revision = pool.revision.checked_add(1).ok_or(Fault::Internal)?;
+    crate::store::stale(&mut pool);
+    crate::store::save_pool(tx, &pool)?;
+    let event = crate::store::append_event(
+        tx,
+        &pool,
+        "enrollment_refused",
+        Author::Leader,
+        format!(
+            "Enrollment {} was refused by Run; its {} reserved member(s) were released.",
+            enrollment.id,
+            removed.len()
+        ),
+        None,
+    )?;
+    let roster = crate::store::bindings(tx, &pool.pool_id)?;
+    crate::store::system_deliveries(tx, &pool, &event, &roster, None)?;
+    Ok(())
+}
+
 /// A correlated definitive refusal settles only the first possible submission;
 /// after any earlier uncertainty it is merely recorded as attention.
 pub(crate) fn record_refusal(
@@ -753,7 +804,9 @@ pub(crate) fn record_refusal(
             "UPDATE managed_enrollments SET state='refused',attention=?2,revision=revision+1 WHERE id=?1 AND state='submit_possible' AND submit_attempts=1",
             params![id, code],
         )? == 1;
-    if !settled {
+    if settled {
+        release_refused(&tx, id)?;
+    } else {
         tx.execute(
             "UPDATE managed_enrollments SET attention=?2,revision=revision+1 WHERE id=?1 AND attention IS NOT ?2",
             params![id, code],
