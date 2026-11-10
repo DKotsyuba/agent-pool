@@ -790,18 +790,6 @@ impl Harness {
     }
     /// Stage a rootless first-hook ingress receipt and select the binding as the resident does.
     fn first_hook(&mut self, receipt: CurrentReceipt) -> Result<ManagedBinding, Fault> {
-        self.keys += 1;
-        let tag = format!("hook-{}", self.keys);
-        let pin = crate::managed_bridge::BridgePin {
-            route: self.route.bridge_route.clone(),
-            producer: "pool".into(),
-            registration_socket: "/fixture/adapter.sock".into(),
-            core_socket: "/fixture/core.sock".into(),
-            server_executable: "/fixture/bridge".into(),
-            server_sha256: "a".repeat(64),
-            credential_file: "/fixture/token".into(),
-            credential_sha256: "b".repeat(64),
-        };
         let command = Command::Get(crate::domain::Get {
             pool_id: self.pool.clone(),
             after: 0,
@@ -814,6 +802,25 @@ impl Harness {
             field: None,
             expected_revision: None,
         });
+        self.first_hook_with(receipt, command)
+    }
+    fn first_hook_with(
+        &mut self,
+        receipt: CurrentReceipt,
+        command: Command,
+    ) -> Result<ManagedBinding, Fault> {
+        self.keys += 1;
+        let tag = format!("hook-{}", self.keys);
+        let pin = crate::managed_bridge::BridgePin {
+            route: self.route.bridge_route.clone(),
+            producer: "pool".into(),
+            registration_socket: "/fixture/adapter.sock".into(),
+            core_socket: "/fixture/core.sock".into(),
+            server_executable: "/fixture/bridge".into(),
+            server_sha256: "a".repeat(64),
+            credential_file: "/fixture/token".into(),
+            credential_sha256: "b".repeat(64),
+        };
         let mut guard = self.store.lock().unwrap();
         let db = guard.test_db();
         crate::managed_state::persist_bridge_route(db, &pin)?;
@@ -1849,6 +1856,52 @@ async fn p3_early_hook_after_ack_loss() {
         }],
     };
     assert_eq!(h.first_hook(foreign).err(), Some(Fault::Forbidden));
+}
+
+/// The early-root route match is not truncated by a page of unrelated
+/// submit_possible keys: the match sits at row 65 and a `pool_list` hook
+/// (no target pool) still sees it; with no matching row it is refused.
+#[tokio::test]
+async fn p3_early_root_match_beyond_first_page() {
+    let mut h = Harness::new();
+    let (id, member) = h.start("early65");
+    h.run.state().lose_submit_ack = true;
+    h.drive(&id).await;
+    assert_eq!(h.view(&id).state, "submit_possible");
+    let list = || Command::List(crate::domain::List { after: None });
+    h.db(|db| {
+        for n in 0..64 {
+            db.execute(
+                "INSERT INTO managed_enrollments(id,pool,owner,mode,domain_scope,domain_key,domain_digest,request_id,route,params,fingerprint,replacement,state,receipt) SELECT ?1||id,pool,owner,mode,domain_scope,?1||domain_key,domain_digest,?1||request_id,json_set(route,'$.run.route.route_id','former-'||?1),params,fingerprint,replacement,state,receipt FROM managed_enrollments WHERE id=?2",
+                rusqlite::params![format!("filler{n}-"), id],
+            )
+            .unwrap();
+        }
+        // Move the real key behind the 64 former-route keys.
+        db.execute("UPDATE managed_enrollments SET rowid=1000000 WHERE id=?1", [&id])
+            .unwrap();
+    });
+    assert_eq!(
+        h.count("SELECT count(*) FROM managed_enrollments WHERE state='submit_possible'"),
+        65
+    );
+    assert_eq!(
+        h.first_hook_with(h.ingress_for(&member, "p65"), list())
+            .err(),
+        Some(Fault::Unavailable)
+    );
+    h.db(|db| {
+        db.execute(
+            "UPDATE managed_enrollments SET state='refused' WHERE id=?1",
+            [&id],
+        )
+        .unwrap();
+    });
+    assert_eq!(
+        h.first_hook_with(h.ingress_for(&member, "p65-none"), list())
+            .err(),
+        Some(Fault::Forbidden)
+    );
 }
 
 #[tokio::test]

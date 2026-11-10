@@ -1242,22 +1242,32 @@ fn early_root(
     if known {
         return Ok(false);
     }
+    // Keyset-page in row order so a match is never hidden behind a page of
+    // unrelated routes.
     let mut stmt = tx.prepare(
-        "SELECT route FROM managed_enrollments WHERE state='submit_possible' AND (?1 IS NULL OR pool=?1) ORDER BY rowid LIMIT 64",
+        "SELECT rowid,route FROM managed_enrollments WHERE state='submit_possible' AND (?1 IS NULL OR pool=?1) AND rowid>?2 ORDER BY rowid LIMIT 64",
     )?;
-    let routes = stmt
-        .query_map([target_pool], |row| row.get::<_, String>(0))?
-        .collect::<Result<Vec<_>, _>>()?;
-    for route in routes {
-        let route: EnrollmentRoute = decoded(&route)?;
-        if &route.run.route == authority.route()
-            && &route.bridge_route == bridge_route
-            && receipt.attempt.run_store_id == route.run.route.component_store_id
-        {
-            return Ok(true);
+    let mut after = 0_i64;
+    loop {
+        let page = stmt
+            .query_map(params![target_pool, after], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let Some(&(last, _)) = page.last() else {
+            return Ok(false);
+        };
+        for (_, route) in &page {
+            let route: EnrollmentRoute = decoded(route)?;
+            if &route.run.route == authority.route()
+                && &route.bridge_route == bridge_route
+                && receipt.attempt.run_store_id == route.run.route.component_store_id
+            {
+                return Ok(true);
+            }
         }
+        after = last;
     }
-    Ok(false)
 }
 
 /// Outcome of the conditioned replacement switch.
