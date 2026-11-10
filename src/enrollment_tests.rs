@@ -61,6 +61,7 @@ struct RunState {
     status_calls: usize,
     enabled_calls: usize,
     lose_submit_ack: bool,
+    lose_abort_ack: bool,
     refuse_submit: Option<(&'static str, &'static str)>,
     lose_current_ack: bool,
     qualified: BTreeSet<String>,
@@ -366,7 +367,16 @@ impl Client for SyntheticRun {
         })
     }
     fn abort<'a>(&'a self, key: &'a Key) -> Response<'a, Lookup> {
-        Box::pin(async move { Ok(self.lookup_now(key, true)) })
+        Box::pin(async move {
+            // The abort lands in Run, but its response is lost on the wire.
+            let lose = std::mem::take(&mut self.state().lose_abort_ack);
+            let lookup = self.lookup_now(key, true);
+            if lose {
+                Err(Failure::Unknown)
+            } else {
+                Ok(lookup)
+            }
+        })
     }
     fn current<'a>(
         &'a self,
@@ -1684,6 +1694,65 @@ async fn p3_prepared_key_replays_same_key() {
     assert_eq!(
         (state.submits, state.admissions, state.keys.len()),
         (2, 1, 1)
+    );
+}
+
+/// Definitive refusal, then the exact-key abort response is lost: recovery by
+/// lookup records the tombstone AND releases the never-admitted start members.
+#[tokio::test]
+async fn m2_abort_response_loss_recovery_releases_start_members() {
+    let mut h = Harness::new();
+    let (id, member) = h.start("leak");
+    let released =
+        "SELECT count(*) FROM members WHERE current=1 AND json_extract(data,'$.run_id') IS NULL";
+    let events =
+        "SELECT count(*) FROM events WHERE json_extract(data,'$.kind')='enrollment_refused'";
+    assert_eq!(h.count(released), 1);
+    h.run.state().refuse_submit = Some(("role_mismatch", "none"));
+    h.run.state().lose_abort_ack = true;
+    h.drive(&id).await;
+    assert_eq!(h.run.state().aborts, 1);
+    assert_eq!(h.view(&id).state, "submit_possible");
+    assert_eq!(
+        h.count(released),
+        1,
+        "reserved member is held while uncertain"
+    );
+    h.drive(&id).await;
+    assert_eq!(h.view(&id).state, "aborted");
+    assert!(!h.member(&member).1, "reserved start member released");
+    assert_eq!(h.count(released), 0);
+    assert_eq!(h.count(events), 1);
+    // Idempotent: no second release or event.
+    h.drive(&id).await;
+    assert_eq!(h.count(events), 1);
+    assert_eq!(h.run.state().admissions, 0);
+}
+
+/// Pool crashes after Run's abort but before `record_refusal`: the next pass
+/// finds the tombstone by lookup and releases the reserved members once.
+#[tokio::test]
+async fn m2_crash_between_abort_and_refusal_releases_start_members() {
+    let mut h = Harness::new();
+    let (id, member) = h.start("crash");
+    h.db(|db| journal::begin_submit(db, &id).unwrap());
+    let key = h.db(|db| journal::load(db, &id).unwrap().0.key().unwrap());
+    assert_eq!(h.run.abort(&key).await.unwrap().state, "aborted");
+    h.drive(&id).await;
+    assert_eq!(h.view(&id).state, "aborted");
+    assert!(!h.member(&member).1, "reserved start member released");
+    assert_eq!(
+        h.count(
+            "SELECT count(*) FROM events WHERE json_extract(data,'$.kind')='enrollment_refused'"
+        ),
+        1
+    );
+    h.drive(&id).await;
+    assert_eq!(
+        h.count(
+            "SELECT count(*) FROM events WHERE json_extract(data,'$.kind')='enrollment_refused'"
+        ),
+        1
     );
 }
 

@@ -817,6 +817,8 @@ pub(crate) fn record_refusal(
 }
 
 /// Install a durable abort tombstone result; never after a known admission.
+/// Never-admitted start members/scopes/effects are released with it, so a lost
+/// abort response or a crash before `record_refusal` cannot leak them.
 pub(crate) fn record_aborted(db: &mut Connection, id: &str) -> Result<(), Fault> {
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let state: String = tx.query_row(
@@ -833,6 +835,9 @@ pub(crate) fn record_aborted(db: &mut Connection, id: &str) -> Result<(), Fault>
         "UPDATE managed_enrollments SET state='aborted',attention='enrollment_aborted',revision=revision+1 WHERE id=?1",
         [id],
     )?;
+    // The abort tombstone proves the key was never admitted: release the
+    // reserved start members in the same transaction (replacements keep theirs).
+    release_refused(&tx, id)?;
     tx.commit()?;
     Ok(())
 }

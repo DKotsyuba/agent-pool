@@ -35,10 +35,14 @@
 - Erratum E12 egress liveness: an unknown managed publish whose exact lookups
   stay non-decisive is aborted for the exact original effect after bounded
   backoff; only a durable `aborted` creates one new effect for the same event.
-  A successor aborted again in the same binding generation is not republished
-  (`delivery_refused_outcome_unknown`), and `known_unsent` `attempt_mismatch` is
-  terminal `not_delivered` (`delivery_refused_attempt_mismatch`) for its
-  generation, so a Run pinned to an older Bridge build cannot cause a loop.
+  A successor aborted again is republished after a durable exponential pause
+  (cap 300 s, attention `delivery_retrying_outcome_unknown`; one live effect
+  per event), and `known_unsent` `attempt_mismatch` is terminal `not_delivered`
+  (`delivery_refused_attempt_mismatch`) for its generation, so a Run pinned to
+  an older Bridge build cannot cause a loop.
+- Enrollment abort tombstones release never-admitted start members, scopes and
+  effects in the same transaction, so a lost abort response or a crash before
+  the refusal is recorded no longer leaks reserved members.
 - Mutations refused because a pool is formally completed keep the `closed`
   code but no longer claim the pool was explicitly closed.
 - `bind_run` never overwrites a terminal (`refused`, `cancelled`,

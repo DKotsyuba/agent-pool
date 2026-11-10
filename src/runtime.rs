@@ -2006,6 +2006,16 @@ mod managed_egress_dispatch {
         Ok(())
     }
 
+    fn unix_now() -> Result<i64, Fault> {
+        i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| Fault::Unavailable)?
+                .as_secs(),
+        )
+        .map_err(|_| Fault::Unavailable)
+    }
+
     /// One managed effect; disabling new egress never turns uncertain recovery into a resend.
     pub(super) async fn drive(
         store: &SharedStore,
@@ -2034,6 +2044,16 @@ mod managed_egress_dispatch {
         };
         let transport = config.managed_run_transport.as_ref();
         if state == State::Pending {
+            // E14(d): a republished successor waits out its durable backoff.
+            let now = unix_now()?;
+            let key = id.clone();
+            if !stored_managed(store, &lease, move |store| {
+                store.egress_liveness_due(&key, now)
+            })
+            .await?
+            {
+                return Ok(());
+            }
             let Some(transport) = transport.filter(|value| value.egress_enabled) else {
                 return note(store, &lease, &id, "route_unavailable").await;
             };
@@ -2122,13 +2142,7 @@ mod managed_egress_dispatch {
         })
         .await?;
         if matches!(state, State::Unknown | State::AbortPending) && !draining {
-            let now = i64::try_from(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_err(|_| Fault::Unavailable)?
-                    .as_secs(),
-            )
-            .map_err(|_| Fault::Unavailable)?;
+            let now = unix_now()?;
             return liveness(store, &lease, frozen, bridge, state, now).await;
         }
         if matches!(state, State::Unknown | State::AbortPending)

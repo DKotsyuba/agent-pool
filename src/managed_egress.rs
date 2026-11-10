@@ -104,39 +104,22 @@ pub(crate) fn republish(db: &mut Connection, effect_id: &str) -> Result<Option<S
     Ok(fresh)
 }
 
-/// At most one successor per original: a liveness-aborted effect that is itself
-/// a successor is republished again only when the member's binding generation
-/// has moved past the generation it was frozen for (a rebind or new launch
-/// legitimately allows one new attempt for the new generation).
-fn republish_allowed(tx: &Connection, effect_id: &str) -> Result<bool, Fault> {
-    let successor: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM managed_delivery_liveness WHERE republished_as=?1)",
+/// E14(d): a proven-unsent (aborted) publish is never by itself a deterministic
+/// refusal. A successor that is liveness-aborted again is republished after a
+/// durable, exponentially backed-off pause (cap 300 s); the first successor is
+/// immediate. The pause is the only loop bound, and the successor is created in
+/// the transaction that records the abort, so one live effect exists per event.
+fn republish_delay(tx: &Connection, effect_id: &str) -> Result<i64, Fault> {
+    let ancestors: i64 = tx.query_row(
+        "WITH RECURSIVE anc(id) AS (SELECT effect_id FROM managed_delivery_liveness WHERE republished_as=?1 UNION ALL SELECT l.effect_id FROM managed_delivery_liveness l JOIN anc ON l.republished_as=anc.id) SELECT count(*) FROM anc",
         [effect_id],
         |row| row.get(0),
     )?;
-    if !successor {
-        return Ok(true);
+    if ancestors == 0 {
+        return Ok(0);
     }
-    let intent: String = tx.query_row(
-        "SELECT intent FROM managed_delivery_outbox WHERE effect_id=?1",
-        [effect_id],
-        |row| row.get(0),
-    )?;
-    let frozen_generation = decode::<OutboxIntentV1>(&intent)?
-        .target_binding
-        .binding_generation;
-    let current: Option<Vec<u8>> = tx
-        .query_row(
-            "SELECT b.generation FROM managed_bindings b JOIN managed_delivery_seeds s ON s.member_id=b.member AND s.pool_id=b.pool WHERE s.effect_id=?1",
-            [effect_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let Some(current) = current else {
-        return Ok(false);
-    };
-    let bytes: [u8; 8] = current.as_slice().try_into().map_err(|_| Fault::Internal)?;
-    Ok(u64::from_be_bytes(bytes) > frozen_generation)
+    let shift = u32::try_from((ancestors - 1).clamp(0, 6)).map_err(|_| Fault::Internal)?;
+    Ok(5_i64.saturating_mul(1_i64 << shift).min(300))
 }
 
 /// The successor insert itself, inside the caller's transaction. `record_result`
@@ -163,16 +146,7 @@ fn republish_in(tx: &Connection, effect_id: &str) -> Result<Option<String>, Faul
     if state(tx, effect_id)? != Some(State::Aborted) {
         return Err(Fault::Stale);
     }
-    if !republish_allowed(tx, effect_id)? {
-        // A successor that is itself liveness-aborted in the same binding
-        // generation is a deterministic refusal, not a transient stall: keep
-        // the event visibly not delivered instead of looping.
-        tx.execute(
-            "UPDATE managed_delivery_outbox SET attention='delivery_refused_outcome_unknown' WHERE effect_id=?1",
-            [effect_id],
-        )?;
-        return Ok(None);
-    }
+    let delay = republish_delay(tx, effect_id)?;
     let seed = seed(tx, effect_id)?;
     let scope_state: String = tx.query_row(
         "SELECT state FROM managed_delivery_scopes WHERE producer_scope=?1",
@@ -217,8 +191,16 @@ fn republish_in(tx: &Connection, effect_id: &str) -> Result<Option<String>, Faul
         params![effect_id, fresh],
     )?;
     tx.execute(
-        "INSERT INTO managed_delivery_outbox(effect_id,state) VALUES(?1,'pending')",
-        [&fresh],
+        "INSERT INTO managed_delivery_outbox(effect_id,state,attention) VALUES(?1,'pending',?2)",
+        params![
+            fresh,
+            (delay > 0).then_some("delivery_retrying_outcome_unknown")
+        ],
+    )?;
+    // The successor inherits the pause: `liveness_due` gates its first publish.
+    tx.execute(
+        "INSERT INTO managed_delivery_liveness(effect_id,next_attempt) VALUES(?1,CAST(strftime('%s','now') AS INTEGER)+?2)",
+        params![fresh, delay],
     )?;
     tx.execute(
         "UPDATE managed_delivery_liveness SET republished_as=?2 WHERE effect_id=?1 AND republished_as IS NULL",
@@ -569,7 +551,7 @@ pub(crate) fn owner_attention(
                 | "capacity"
                 | "conflict"
                 | "delivery_refused_attempt_mismatch"
-                | "delivery_refused_outcome_unknown"
+                | "delivery_retrying_outcome_unknown"
         )
     }) {
         return Err(Fault::Internal);
@@ -2548,49 +2530,127 @@ pub(crate) mod tests {
         );
     }
 
-    #[test]
-    fn e12_successor_liveness_aborted_again_is_not_republished() {
-        let (_directory, mut store, binding, incarnation, _run) = fixture();
-        index_managed_member(store.test_db(), &binding);
-        add_seed(&mut store, &binding, "orig", "hello", false);
-        let first = freeze_next(&mut store, &binding, &incarnation, "orig", "next", 2);
-        liveness_abort(&mut store, &first);
-        let successor = successor_of(&mut store, "orig").unwrap();
-        assert_eq!(effects_for_event(&mut store, "orig"), 2);
-        // Same generation: the successor is frozen on the same attempt.
-        let second = freeze_current(&mut store, &binding, &incarnation, &successor);
-        assert_eq!(second.intent.target_binding.binding_generation, 2);
-        liveness_abort(&mut store, &second);
-        assert_eq!(successor_of(&mut store, &successor), None);
-        assert_eq!(
-            effects_for_event(&mut store, "orig"),
-            2,
-            "exactly two effects: the original and its one successor"
-        );
-        assert_eq!(
-            owner_attention(store.test_db(), &successor)
-                .unwrap()
-                .0
-                .as_deref(),
-            Some("delivery_refused_outcome_unknown")
-        );
-        assert_eq!(
-            state(store.test_db(), &successor).unwrap(),
-            Some(State::Aborted)
-        );
-        let live: i64 = store.test_db().query_row(
+    fn live_effects(store: &mut Store) -> i64 {
+        store.test_db().query_row(
             "SELECT count(*) FROM managed_delivery_outbox WHERE state NOT IN ('aborted','accepted','not_delivered')",
             [],
             |row| row.get(0),
-        ).unwrap();
-        assert_eq!(live, 0, "nothing left to republish");
-        // A replayed republish is idempotent and still refuses.
-        assert_eq!(republish(store.test_db(), &successor).unwrap(), None);
-        assert_eq!(effects_for_event(&mut store, "orig"), 2);
+        ).unwrap()
+    }
+    fn unix_now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .try_into()
+            .unwrap()
+    }
+    fn pause(store: &mut Store, effect_id: &str) -> i64 {
+        let next: i64 = store
+            .test_db()
+            .query_row(
+                "SELECT next_attempt FROM managed_delivery_liveness WHERE effect_id=?1",
+                [effect_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        next - unix_now()
     }
 
+    /// E14(d): a proven-unsent abort is not a refusal. A successor that is
+    /// aborted again is republished after an exponentially growing durable
+    /// pause (cap 300 s), with one live effect at a time, and finally delivers once.
     #[test]
-    fn e12_successor_aborted_after_a_new_generation_gets_one_more_attempt() {
+    fn e12_successor_liveness_aborted_again_is_republished_after_backoff() {
+        let (_directory, mut store, binding, incarnation, _run) = fixture();
+        index_managed_member(store.test_db(), &binding);
+        add_seed(&mut store, &binding, "orig", "hello", false);
+        let first = freeze_next(&mut store, &binding, &incarnation, "orig", "next", 2);
+        liveness_abort(&mut store, &first);
+        let mut current = successor_of(&mut store, "orig").unwrap();
+        assert_eq!(effects_for_event(&mut store, "orig"), 2);
+        assert_eq!(live_effects(&mut store), 1);
+        assert!(
+            pause(&mut store, &current) <= 1,
+            "first successor is immediate"
+        );
+        assert_eq!(owner_attention(store.test_db(), &current).unwrap().0, None);
+        let mut chain = vec!["orig".to_owned(), current.clone()];
+        for (round, expected) in [5_i64, 10, 20, 40, 80, 160, 300, 300]
+            .into_iter()
+            .enumerate()
+        {
+            // Same generation: the successor is frozen on the same attempt.
+            let frozen = freeze_current(&mut store, &binding, &incarnation, &current);
+            assert_eq!(frozen.intent.target_binding.binding_generation, 2);
+            liveness_abort(&mut store, &frozen);
+            let next = successor_of(&mut store, &current)
+                .unwrap_or_else(|| panic!("round {round}: aborted again must be republished"));
+            assert_ne!(next, current);
+            assert_eq!(
+                state(store.test_db(), &current).unwrap(),
+                Some(State::Aborted)
+            );
+            assert_eq!(
+                live_effects(&mut store),
+                1,
+                "at most one live effect per event"
+            );
+            assert_eq!(
+                effects_for_event(&mut store, "orig"),
+                i64::try_from(chain.len() + 1).unwrap()
+            );
+            assert_eq!(
+                owner_attention(store.test_db(), &next)
+                    .unwrap()
+                    .0
+                    .as_deref(),
+                Some("delivery_retrying_outcome_unknown")
+            );
+            let delay = pause(&mut store, &next);
+            assert!(
+                (expected - 2..=expected).contains(&delay),
+                "round {round}: pause {delay} vs {expected}"
+            );
+            assert!(!liveness_due(store.test_db(), &next, unix_now()).unwrap());
+            assert!(liveness_due(store.test_db(), &next, unix_now() + expected + 1).unwrap());
+            // A replayed republish is idempotent.
+            assert_eq!(
+                republish(store.test_db(), &current).unwrap(),
+                Some(next.clone())
+            );
+            chain.push(next.clone());
+            current = next;
+        }
+        // The event is finally delivered exactly once.
+        let last = freeze_current(&mut store, &binding, &incarnation, &current);
+        let (_, dispatch) = begin_publish(store.test_db(), &current).unwrap();
+        let accepted = result(&last, ManagedOwnerStateV1::Accepted, None);
+        assert_eq!(
+            record_result(store.test_db(), &current, Some(&dispatch), &accepted, false).unwrap(),
+            State::Accepted
+        );
+        assert_eq!(live_effects(&mut store), 0);
+        assert_eq!(successor_of(&mut store, &current), None);
+        let accepted_count: i64 = store
+            .test_db()
+            .query_row(
+                "SELECT count(*) FROM managed_delivery_outbox WHERE state='accepted'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(accepted_count, 1);
+        assert_eq!(
+            begin_publish(store.test_db(), &current).err(),
+            Some(Fault::Stale)
+        );
+    }
+
+    /// Only deterministic reasons end delivery: once the member is no longer
+    /// current, an aborted successor gets no further republish.
+    #[test]
+    fn e12_successor_aborted_for_a_removed_member_is_not_republished() {
         let (_directory, mut store, binding, incarnation, _run) = fixture();
         index_managed_member(store.test_db(), &binding);
         add_seed(&mut store, &binding, "orig", "hello", false);
@@ -2598,27 +2658,25 @@ pub(crate) mod tests {
         liveness_abort(&mut store, &first);
         let successor = successor_of(&mut store, "orig").unwrap();
         let second = freeze_current(&mut store, &binding, &incarnation, &successor);
-        // A new launch rebinds the member to generation 3 before the abort lands.
-        add_seed(&mut store, &binding, "later", "newer", false);
-        let later = freeze_next(&mut store, &binding, &incarnation, "later", "next-2", 3);
-        assert_eq!(later.intent.target_binding.binding_generation, 3);
-        liveness_abort(&mut store, &second);
-        let third = successor_of(&mut store, &successor).unwrap();
-        assert_ne!(third, successor);
-        assert_eq!(effects_for_event(&mut store, "orig"), 3);
-        // Frozen for generation 3 and aborted again: bounded, no further attempt.
-        let fourth = freeze_current(&mut store, &binding, &incarnation, &third);
-        assert_eq!(fourth.intent.target_binding.binding_generation, 3);
-        liveness_abort(&mut store, &fourth);
-        assert_eq!(successor_of(&mut store, &third), None);
-        assert_eq!(effects_for_event(&mut store, "orig"), 3);
+        let id = second.seed.effect_id.clone();
+        begin_publish(store.test_db(), &id).unwrap();
+        attention(store.test_db(), &id, "outcome_unknown").unwrap();
+        begin_liveness_abort(store.test_db(), &id).unwrap();
+        store
+            .test_db()
+            .execute(
+                "UPDATE members SET current=0 WHERE id=?1",
+                [&binding.member_id],
+            )
+            .unwrap();
+        let aborted = result(&second, ManagedOwnerStateV1::Aborted, None);
         assert_eq!(
-            owner_attention(store.test_db(), &third)
-                .unwrap()
-                .0
-                .as_deref(),
-            Some("delivery_refused_outcome_unknown")
+            record_result(store.test_db(), &id, None, &aborted, true).unwrap(),
+            State::Aborted
         );
+        assert_eq!(successor_of(&mut store, &successor), None);
+        assert_eq!(effects_for_event(&mut store, "orig"), 2);
+        assert_eq!(live_effects(&mut store), 0);
     }
 
     #[test]

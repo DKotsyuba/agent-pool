@@ -688,6 +688,11 @@ order, member, role, Run ID grammar, distinct roots/pins/refs, never an
 already enrolled root) and installed in one transaction: start members gain
 their Run root, sequence, execution reference, pin and store. A member removed
 before admission, or a completed pool, leaves the job `unassigned`.
+A definitive refusal fences the key with an exact-key abort; the durable abort
+tombstone (`record_aborted`, reached directly, by lookup after a lost abort
+response, or after a crash before `record_refusal`) releases the never-admitted
+start members, scopes and queued effects in the same transaction through the
+same guarded helper as a refusal (once; replacement members stay untouched).
 
 **Generation 1.** For each admitted unbound job the resident stages a
 `current_request_id` before calling `_managed_enrollment_current_v1`; the
@@ -794,13 +799,17 @@ The `aborted` result and the successor (with its `managed_delivery_liveness`
 link, schema v15) commit in one transaction: a crash cannot separate them, and
 a successor refused for outbox capacity rolls the result back, keeping the
 original fenced `abort_pending` until a later same-key abort succeeds.
-The republish is bounded: only an original (or a successor frozen for a newer
-binding generation than the one just aborted) is republished after a liveness
-abort. A successor that is liveness-aborted again in the same binding
-generation is not republished: its event stays not delivered with owner
-attention `delivery_refused_outcome_unknown`, so there are at most two effects
-for the event until a rebind or new launch advances the generation (which
-allows one new attempt for that generation). A `known_unsent` result with
+Erratum E14(d): a proven-unsent (aborted) publish is never by itself a
+deterministic refusal, so the republish is paced rather than terminal. The first
+successor is created immediately; a successor that is liveness-aborted again is
+republished with exponential backoff (5 s doubling, capped at 300 s, durable in
+`managed_delivery_liveness.next_attempt` and gating the successor's first
+publish) and owner attention `delivery_retrying_outcome_unknown` while it
+retries. The pause is the only loop bound; there is never more than one live
+effect per event, and delivery ends only for deterministic reasons: a
+`known_unsent` `attempt_mismatch` (below), a retired scope, a removed or
+replaced member, or a closed or completed pool.
+A `known_unsent` result with
 reason `attempt_mismatch` (Run pinned to another Bridge build) is terminal for
 that generation: the effect becomes `not_delivered` with attention
 `delivery_refused_attempt_mismatch`, is never resent or republished, and later
