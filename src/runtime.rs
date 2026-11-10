@@ -1135,10 +1135,17 @@ pub(crate) mod enrollment_dispatch {
                 };
                 note_job(store, &enrollment.id, index, reason).await
             }
-            Err(failure @ (Failure::Stale | Failure::Refused(_) | Failure::Aborted)) => {
+            // A typed refusal created no receipt; the next observation uses a fresh key.
+            Err(
+                failure @ (Failure::Stale
+                | Failure::Refused(_)
+                | Failure::Aborted
+                | Failure::Operator(_)),
+            ) => {
                 settle(false).await?;
                 note_job(store, &enrollment.id, index, failure.code()).await
             }
+            // Uncertain transport: the same key is recovered next, never trusted as fresh.
             Err(failure) => note_job(store, &enrollment.id, index, failure.code()).await,
         }
     }
