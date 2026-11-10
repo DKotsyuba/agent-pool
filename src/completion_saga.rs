@@ -235,12 +235,13 @@ fn retry_delay(base: Duration, failures: u32) -> Duration {
 
 impl Driver<ConfiguredRun> {
     /// Enabled only with a configured Run operator socket and managed consensus
-    /// transport; otherwise settlement stays off and pools remain open.
-    pub(crate) fn production(config: &Config) -> Option<Self> {
+    /// transport; otherwise settlement stays off and pools remain open. Keys
+    /// live in the directory of the durable Pool store identity `store_id`.
+    pub(crate) fn production(config: &Config, store_id: &str) -> Option<Self> {
         if config.run_socket.is_none() || config.managed_run_transport.is_none() {
             return None;
         }
-        let keys = KeyStore::open(&config.database_path, config.expected_uid).ok()?;
+        let keys = KeyStore::open(&config.database_path, config.expected_uid, store_id).ok()?;
         Some(Self::new(ConfiguredRun::new(config.clone()), keys))
     }
 
@@ -254,12 +255,22 @@ impl Driver<ConfiguredRun> {
 }
 
 impl<R: SettlementRun> Driver<R> {
+    /// Startup key custody: migrate this store's legacy flat keys, then sweep
+    /// crash leftovers inside this store's own key directory only.
     pub(crate) async fn sweep(&self, store: &SharedStore) -> Result<(), Fault> {
-        let references = stored(store, |store| {
-            completion::retained_keys(store.completion_db())
+        let (owned, references) = stored(store, |store| {
+            let db = store.completion_db();
+            Ok((completion::owned_keys(db)?, completion::retained_keys(db)?))
         })
         .await?;
-        self.keys.sweep(&references)
+        let left = self.keys.migrate_legacy(&owned)?;
+        self.keys.sweep(&references)?;
+        if left > 0 {
+            eprintln!(
+                "completion keys: {left} legacy key file(s) not owned by this store left in place"
+            );
+        }
+        Ok(())
     }
     pub(crate) fn new(run: R, keys: KeyStore) -> Self {
         Self {

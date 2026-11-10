@@ -23,7 +23,7 @@ use crate::{
         ReleaseResult,
     },
     run_status::Target,
-    store::Store,
+    store::{Admitted, Store},
 };
 use ed25519_dalek::{Signature, VerifyingKey};
 use rusqlite::params;
@@ -151,7 +151,7 @@ impl Fixture {
         })
     }
     fn key_files(&self) -> usize {
-        std::fs::read_dir(self.dir.path().join("completion-keys"))
+        std::fs::read_dir(self.keys.directory())
             .map(|entries| entries.count())
             .unwrap_or(0)
     }
@@ -170,11 +170,11 @@ fn fixture(options: Options) -> Fixture {
     let dir = private_dir();
     let mut store = Store::open(&dir.path().join("pool.db")).unwrap();
     let uid = std::fs::metadata(dir.path()).unwrap().uid();
-    let keys = KeyStore::open(&dir.path().join("pool.db"), uid).unwrap();
     let db = store.completion_db();
     let pool_store_id: String = db
         .query_row("SELECT store_id FROM inventory_source", [], |r| r.get(0))
         .unwrap();
+    let keys = KeyStore::open(&dir.path().join("pool.db"), uid, &pool_store_id).unwrap();
     db.execute(
         "INSERT INTO leaders(actor,address) VALUES('owner','owner-address')",
         [],
@@ -836,19 +836,59 @@ async fn completion_fences_pending_admission_and_refuses_late_receipt() {
             .unwrap()
     });
     let store = fixture.store();
+    // The late receipt is retained exactly and the effect becomes terminal.
+    for _ in 0..2 {
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .record_run_admission("late-start", &agent(99), 1),
+            Ok(Admitted::ReconciliationNeeded)
+        );
+    }
     assert_eq!(
         store
             .lock()
             .unwrap()
-            .record_run_admission("late-start", &agent(99), 1),
-        Err(Fault::Closed)
+            .record_run_admission("late-start", &agent(98), 1),
+        Err(Fault::Conflict)
     );
     assert_eq!(
+        fixture.with(|db| db
+            .query_row::<String, _, _>(
+                "SELECT receipt FROM completed_admissions WHERE effect='late-start'",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap()),
+        json!({"kind":"start","agent_id":agent(99),"sequence":1}).to_string()
+    );
+    assert_eq!(
+        fixture.count(
+            "SELECT count(*) FROM effects WHERE id='late-start' AND state='reconciliation_needed'"
+        ),
+        1
+    );
+    // A later settlement cannot overwrite the retained terminal outcome.
+    store
+        .lock()
+        .unwrap()
+        .settle_effect("late-start", "unknown")
+        .unwrap();
+    assert_eq!(
+        fixture.count(
+            "SELECT count(*) FROM effects WHERE id='late-start' AND state='reconciliation_needed'"
+        ),
+        1
+    );
+    assert!(
         store
             .lock()
             .unwrap()
-            .record_run_admission("late-start", &agent(99), 1),
-        Err(Fault::Closed)
+            .pending_unknown()
+            .unwrap()
+            .iter()
+            .all(|effect| effect.effect_id != "late-start")
     );
     assert_eq!(
         fixture.count(
@@ -951,22 +991,40 @@ async fn completed_pool_refuses_late_batch_and_replacement_receipts() {
         Some(target(99, 1).pin_id),
     );
     let store = fixture.store();
+    for _ in 0..2 {
+        assert_eq!(
+            store.lock().unwrap().record_batch_admission(
+                "late-batch",
+                Some(RUN_STORE),
+                std::slice::from_ref(&receipt)
+            ),
+            Ok(Admitted::ReconciliationNeeded)
+        );
+        assert_eq!(
+            store.lock().unwrap().record_replacement_admission(
+                "late-replacement",
+                "claim",
+                RUN_STORE,
+                &receipt
+            ),
+            Ok(Admitted::ReconciliationNeeded)
+        );
+    }
+    let retained = json!({"kind":"replace","store_id":RUN_STORE,"admissions":[{
+        "agent_id":receipt.0,"sequence":1,"execution_ref":receipt.2,"pin_id":receipt.3}]});
     assert_eq!(
-        store.lock().unwrap().record_batch_admission(
-            "late-batch",
-            Some(RUN_STORE),
-            std::slice::from_ref(&receipt)
-        ),
-        Err(Fault::Closed)
+        fixture.with(|db| db
+            .query_row::<String, _, _>(
+                "SELECT receipt FROM completed_admissions WHERE effect='late-replacement'",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap()),
+        retained.to_string()
     );
     assert_eq!(
-        store.lock().unwrap().record_replacement_admission(
-            "late-replacement",
-            "claim",
-            RUN_STORE,
-            &receipt
-        ),
-        Err(Fault::Closed)
+        fixture.count("SELECT count(*) FROM effects WHERE id IN ('late-batch','late-replacement') AND state='reconciliation_needed' AND json_extract(data,'$.work.claim') IS NULL"),
+        2
     );
     assert_eq!(
         fixture.count("SELECT count(*) FROM members WHERE id='new-member'"),
@@ -2117,6 +2175,26 @@ fn p3_completion_migration_history_and_downgrade() {
             "only inventory-visible durable tables fence inventory after v{prior}"
         );
     }
+    // Step v14 only adds the immutable late-admission receipt table.
+    let dir = private_dir();
+    let path = dir.path().join("pool.db");
+    drop(Store::open(&path).unwrap());
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("DROP TABLE completed_admissions; PRAGMA user_version=13;")
+        .unwrap();
+    drop(Store::open(&path).unwrap());
+    let db = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(
+        db.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap(),
+        14
+    );
+    assert_eq!(
+        db.query_row::<i64, _, _>("SELECT count(*) FROM sqlite_master WHERE name IN ('completed_admissions','completed_admission_immutable','completed_admission_retained')", [], |r| r.get(0))
+            .unwrap(),
+        3
+    );
 }
 
 #[test]
@@ -2137,7 +2215,7 @@ fn review_v13_migration_preserves_prepared_retirement_and_rolls_back_on_failure(
             }
         }
         db.execute_batch(
-            "PRAGMA user_version=12; DROP TRIGGER inventory_rev_completion_sagas_INSERT;",
+            "DROP TABLE completed_admissions; PRAGMA user_version=12; DROP TRIGGER inventory_rev_completion_sagas_INSERT;",
         )
         .unwrap();
     }
@@ -2508,7 +2586,7 @@ async fn p3_hold_lost_ack_release_over_operator_socket() {
         managed_run_transport: None,
     };
     // Settlement stays off without the managed consensus transport.
-    assert!(Driver::production(&config).is_none());
+    assert!(Driver::production(&config, &crate::domain::id()).is_none());
     let run = HybridRun {
         fake: FakeRun::new(),
         real: crate::completion_saga::ConfiguredRun::new(config.clone()),
@@ -2563,4 +2641,322 @@ async fn p3_hold_lost_ack_release_over_operator_socket() {
     );
     assert_eq!(server.lock().unwrap().created, 1);
     task.abort();
+}
+
+/// Fixture-local Pool config pointing Run at a private synthetic socket.
+fn worker_config(fixture: &Fixture, sockets: &tempfile::TempDir) -> crate::config::Config {
+    let uid = std::fs::metadata(sockets.path()).unwrap().uid();
+    crate::config::Config {
+        socket_path: sockets.path().join("pool.sock"),
+        database_path: fixture.db_path(),
+        expected_uid: uid,
+        bridge_registration_socket: sockets.path().join("bridge.sock"),
+        bridge_core_socket: sockets.path().join("core.sock"),
+        bridge_credential_file: sockets.path().join("token"),
+        bridge_producer_id: "test".into(),
+        bridge_audience: "test".into(),
+        bridge_server_executable: "/fixture/bridge".into(),
+        bridge_server_sha256: "0".repeat(64),
+        bridge_observer_socket: None,
+        bridge_observer_credential_file: None,
+        owner_observer_credential_file: None,
+        run_socket: Some(sockets.path().join("run.sock")),
+        run_peer_uid: None,
+        managed_run_reader: None,
+        managed_run_transport: None,
+    }
+}
+
+/// Polls a fixture condition while the worker runs, failing if the worker exits.
+async fn wait_for(
+    fixture: &Fixture,
+    worker: &mut tokio::task::JoinHandle<Result<(), Fault>>,
+    label: &str,
+    condition: impl Fn(&Fixture) -> bool,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !condition(fixture) {
+        if worker.is_finished() {
+            let result = worker.await;
+            panic!("resident worker exited before {label}: {result:?}");
+        }
+        assert!(std::time::Instant::now() < deadline, "timed out: {label}");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Recovery that finds an admission receipt after completion settles the
+/// effect as terminal `reconciliation_needed` with the exact receipt; the
+/// resident worker stays up, queues one owner notice, keeps dispatching later
+/// effects and never redelivers the settled one.
+#[tokio::test]
+async fn completed_pool_late_start_recovery_keeps_worker_running() {
+    use tokio::io::AsyncWriteExt;
+    let fixture = fixture(Options::default());
+    let run = FakeRun::new();
+    run_to_end(&fixture, &run).await.unwrap();
+    let sockets = private_dir();
+    let config = worker_config(&fixture, &sockets);
+    let socket = config.run_socket.clone().unwrap();
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let route = RunRoute {
+        socket: socket.to_str().unwrap().into(),
+        expected_uid: config.expected_uid,
+        peer_uid: None,
+        store_id: Some(RUN_STORE.into()),
+    };
+    // A current, never-bound member whose single-batch start outcome is unknown.
+    let late = Binding {
+        member: Member {
+            member_id: "member-late".into(),
+            name: "late worker".into(),
+            role: "builder".into(),
+            task: "late task".into(),
+            state: MemberState::Active,
+            runtime: "unknown".into(),
+        },
+        pool_id: POOL.into(),
+        actor: None,
+        address: None,
+        run_id: None,
+        run_sequence: None,
+        run_execution_ref: None,
+        run_pin_id: None,
+        run_store_id: None,
+    };
+    let start = Effect {
+        effect_id: "late-start".into(),
+        pool_id: POOL.into(),
+        member_id: Some("member-late".into()),
+        state: "unknown".into(),
+        work: Work::StartBatch {
+            request_key: "late-request".into(),
+            retain_history: true,
+            store_fence: true,
+            route_fence: true,
+            route: Some(route.clone()),
+            jobs: vec![BatchJob {
+                member_id: "member-late".into(),
+                spec: json!({}),
+                original_spec: None,
+            }],
+        },
+    };
+    let released = target(96, 1).pin_id;
+    let other = Effect {
+        effect_id: "later-release".into(),
+        pool_id: POOL.into(),
+        member_id: None,
+        state: "unknown".into(),
+        work: Work::ReleasePin {
+            pin_id: released.clone(),
+            route: Some(route),
+        },
+    };
+    fixture.with(|db| {
+        // Deliverable owner notices need a real Bridge address; the completion
+        // notice already queued for the placeholder address is not under test.
+        db.execute(
+            "UPDATE leaders SET address='local/codex/main/owner' WHERE actor='owner'",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE effects SET state='accepted' WHERE state='queued' AND json_extract(data,'$.work.scope')='owner:pool-c'",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO members(id,pool,actor,address,current,data) VALUES('member-late',?1,NULL,NULL,1,?2)",
+            params![POOL, serde_json::to_string(&late).unwrap()],
+        )
+        .unwrap();
+        for effect in [&start, &other] {
+            db.execute(
+                "INSERT INTO effects(id,pool,member,state,data) VALUES(?1,?2,?3,'unknown',?4)",
+                params![
+                    effect.effect_id,
+                    POOL,
+                    effect.member_id,
+                    serde_json::to_string(effect).unwrap()
+                ],
+            )
+            .unwrap();
+        }
+    });
+    let execution_ref = format!("ex1_{}", "c".repeat(64));
+    let pin = target(97, 1).pin_id;
+    let receipt = json!({"version":1,"request_id":"late-request","store_id":RUN_STORE,"jobs":[
+        {"index":0,"agent_id":agent(97),"sequence":1,"execution_ref":execution_ref,"pin_id":pin}]});
+    let methods = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen = Arc::clone(&methods);
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let Ok(frame) = crate::integrations::read_frame(&mut stream).await else {
+                continue;
+            };
+            let request: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+            let method = request["method"].as_str().unwrap_or_default().to_owned();
+            seen.lock().unwrap().push(method.clone());
+            let result = match method.as_str() {
+                "capabilities" => {
+                    json!({"schema_version":1,"product":"agent-run","store_id":RUN_STORE})
+                }
+                "batch_receipt" => json!({"found":true,"receipt":receipt}),
+                "history_pins" => json!({"pin_id":request["params"]["pin_id"],
+                    "status":"released","already_released":false}),
+                _ => continue,
+            };
+            let mut bytes =
+                serde_json::to_vec(&json!({"jsonrpc":"2.0","id":request["id"],"result":result}))
+                    .unwrap();
+            bytes.push(b'\n');
+            let _ = stream.write_all(&bytes).await;
+        }
+    });
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let mut worker = tokio::spawn(crate::runtime::fixture_work(
+        config,
+        fixture.store(),
+        stopped,
+    ));
+    wait_for(&fixture, &mut worker, "late start settles and later effect runs", |f| {
+        f.count("SELECT count(*) FROM effects WHERE id='late-start' AND state='reconciliation_needed'") == 1
+            && f.count("SELECT count(*) FROM effects WHERE id='later-release' AND state='accepted'") == 1
+    })
+    .await;
+    // The next pass processes the queued owner notice; the settled effect stays settled.
+    let notice = "SELECT count(*) FROM effects WHERE json_extract(data,'$.work.scope')='owner:pool-c' AND json_extract(data,'$.work.text') LIKE '%admission late-start needs owner reconciliation%'";
+    wait_for(&fixture, &mut worker, "owner notice dispatched", |f| {
+        f.count(&format!("{notice} AND state!='queued'")) == 1
+    })
+    .await;
+    assert!(!worker.is_finished(), "resident worker must keep running");
+    assert_eq!(fixture.count(notice), 1);
+    assert_eq!(
+        fixture.count(
+            "SELECT count(*) FROM alerts WHERE effect='late-start' AND kind='completed_admission'"
+        ),
+        1
+    );
+    assert_eq!(
+        fixture.with(|db| db
+            .query_row::<String, _, _>(
+                "SELECT receipt FROM completed_admissions WHERE effect='late-start'",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap()),
+        json!({"kind":"start_batch","store_id":RUN_STORE,"admissions":[{
+            "agent_id":agent(97),"sequence":1,"execution_ref":execution_ref,"pin_id":pin}]})
+        .to_string()
+    );
+    let binding: Binding = fixture.with(|db| {
+        serde_json::from_str(
+            &db.query_row::<String, _, _>(
+                "SELECT data FROM members WHERE id='member-late'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    });
+    assert_eq!(
+        binding.run_id, None,
+        "a completed pool installs no late member"
+    );
+    assert_eq!(
+        methods
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|method| *method == "batch_receipt")
+            .count(),
+        1,
+        "the settled admission is never redelivered"
+    );
+    stop.send(true).unwrap();
+    assert_eq!(worker.await.unwrap(), Ok(()));
+    server.abort();
+}
+
+/// Two Pool databases share one private parent: starting B (migration and
+/// sweep) while A holds an active hold never removes A's release key, and A
+/// still releases with it.
+#[tokio::test]
+async fn two_pool_stores_in_one_parent_keep_active_release_keys() {
+    let fixture = fixture(Options::default());
+    let run = FakeRun::new();
+    let mut driver = driver(&fixture, &run);
+    let saga = driver.start(&fixture.store(), POOL).await.unwrap().unwrap();
+    driver.step(&fixture.store(), &saga).await.unwrap();
+    assert_eq!(fixture.stage(&saga).0, "held");
+    assert_eq!(run.active_holds(), 1);
+    assert_eq!(fixture.key_files(), 1);
+    let other: SharedStore = Arc::new(Mutex::new(
+        Store::open(&fixture.dir.path().join("other.db")).unwrap(),
+    ));
+    let other_id: String = other
+        .lock()
+        .unwrap()
+        .completion_db()
+        .query_row("SELECT store_id FROM inventory_source", [], |r| r.get(0))
+        .unwrap();
+    let uid = std::fs::metadata(fixture.dir.path()).unwrap().uid();
+    for _ in 0..3 {
+        let keys = KeyStore::open(&fixture.dir.path().join("other.db"), uid, &other_id).unwrap();
+        Driver::new(FakeRun::new(), keys)
+            .sweep(&other)
+            .await
+            .unwrap();
+    }
+    // A restarted A driver also sweeps only its own directory and keeps the key.
+    driver.sweep(&fixture.store()).await.unwrap();
+    assert_eq!(fixture.key_files(), 1, "B's startup kept A's active key");
+    driver.advance(&fixture.store(), &saga).await.unwrap();
+    assert_eq!(fixture.stage(&saga).0, "released");
+    assert_eq!(record_count(&fixture), 1);
+    assert_eq!(run.active_holds(), 0);
+    assert_eq!(fixture.key_files(), 0);
+}
+
+/// Startup moves only this store's still-owned keys out of the legacy shared
+/// directory; other legacy files stay untouched and the saga still releases.
+#[tokio::test]
+async fn driver_startup_migrates_owned_legacy_keys_only() {
+    let fixture = fixture(Options::default());
+    let run = FakeRun::new();
+    let mut driver = driver(&fixture, &run);
+    let saga = driver.start(&fixture.store(), POOL).await.unwrap().unwrap();
+    driver.step(&fixture.store(), &saga).await.unwrap();
+    let key_ref: String = fixture.with(|db| {
+        db.query_row(
+            "SELECT key_ref FROM completion_sagas WHERE id=?1",
+            [&saga],
+            |r| r.get(0),
+        )
+        .unwrap()
+    });
+    // Recreate the pre-isolation layout: the saga key and foreign files share the root.
+    let root = fixture.dir.path().join("completion-keys");
+    let legacy = root.join(format!("{key_ref}.key"));
+    std::fs::rename(fixture.keys.key_path(&key_ref), &legacy).unwrap();
+    let foreign = root.join(format!("{}.key", crate::domain::id()));
+    std::fs::write(&foreign, [7_u8; 32]).unwrap();
+    std::fs::set_permissions(&foreign, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let staged = root.join(format!("{}.tmp", crate::domain::id()));
+    std::fs::write(&staged, [8_u8; 32]).unwrap();
+    assert_eq!(fixture.key_files(), 0);
+    driver.sweep(&fixture.store()).await.unwrap();
+    assert_eq!(fixture.key_files(), 1);
+    assert!(!legacy.exists());
+    assert_eq!(std::fs::read(&foreign).unwrap(), [7_u8; 32]);
+    assert_eq!(std::fs::read(&staged).unwrap(), [8_u8; 32]);
+    driver.advance(&fixture.store(), &saga).await.unwrap();
+    assert_eq!(fixture.stage(&saga).0, "released");
+    assert_eq!(fixture.key_files(), 0);
+    assert!(foreign.exists() && staged.exists());
 }

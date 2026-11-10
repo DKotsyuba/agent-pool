@@ -19,8 +19,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
-/// Schema step owned by the completion ledger, following managed route pins.
-pub(crate) const SCHEMA_VERSION: i64 = 13;
+/// Current Pool schema step; steps 12-14 belong to the completion ledger.
+pub(crate) const SCHEMA_VERSION: i64 = 14;
 /// Version of the frozen record body and its canonical integrity preimage.
 pub(crate) const RECORD_VERSION: u32 = 1;
 /// Published integrity algorithm label: SHA-256 over domain, NUL and canonical C.
@@ -37,7 +37,7 @@ const CONTENT_CHUNK: usize = 16384;
 
 /// Test fixtures simulate a pre-completion store by removing exactly this step.
 #[cfg(test)]
-pub(crate) const TEST_DROP_SCHEMA: &str = "DROP TABLE completion_observations; DROP TABLE completion_records; DROP TABLE completion_sagas;";
+pub(crate) const TEST_DROP_SCHEMA: &str = "DROP TABLE completed_admissions; DROP TABLE completion_observations; DROP TABLE completion_records; DROP TABLE completion_sagas;";
 
 /// Installs saga, record and observation tables with immutability triggers.
 /// Pre-feature pools receive no record: they are classified open, never inferred completed.
@@ -923,6 +923,17 @@ pub(crate) fn pending(db: &Connection, after: &str, limit: u32) -> Result<Vec<St
 /// Keys needed by unresolved sagas, read before the startup filesystem sweep.
 pub(crate) fn retained_keys(db: &Connection) -> Result<std::collections::HashSet<String>, Fault> {
     let mut stmt = db.prepare("SELECT key_ref FROM completion_sagas WHERE stage!='released'")?;
+    Ok(stmt
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?)
+}
+
+/// Keys this store's sagas still own (unreleased or awaiting destruction); only
+/// these may be migrated out of the legacy shared key directory.
+pub(crate) fn owned_keys(db: &Connection) -> Result<std::collections::HashSet<String>, Fault> {
+    let mut stmt = db.prepare(
+        "SELECT key_ref FROM completion_sagas WHERE stage!='released' OR key_state='present'",
+    )?;
     Ok(stmt
         .query_map([], |row| row.get(0))?
         .collect::<Result<_, _>>()?)

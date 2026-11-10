@@ -29,6 +29,15 @@ pub struct Store {
     /// Changes on every store open, invalidating cursors across resident restarts.
     read_epoch: String,
 }
+/// Durable result of recording one verified Run admission receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Admitted {
+    /// The receipt is installed (or an identical replay of an installed receipt).
+    Installed,
+    /// The pool completed first: the exact receipt was retained, the effect is
+    /// terminal `reconciliation_needed` and one owner notice is queued.
+    ReconciliationNeeded,
+}
 /// One owner-selected binding and its original route read at a single Pool revision.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct RunProofBinding {
@@ -93,6 +102,16 @@ DROP TRIGGER inventory_rev_completion_sagas_DELETE;\
 DROP TRIGGER inventory_rev_completion_observations_INSERT;\
 DROP TRIGGER inventory_rev_completion_observations_UPDATE;\
 DROP TRIGGER inventory_rev_completion_observations_DELETE;")?;
+    Ok(())
+}
+
+/// Version 14 retains the exact Run receipt of an admission that arrived after
+/// pool completion. The receipt is immutable evidence for owner reconciliation.
+fn migrate_completed_admissions(db: &Connection) -> Result<(), Fault> {
+    db.execute_batch("\
+CREATE TABLE completed_admissions(effect TEXT PRIMARY KEY REFERENCES effects(id),receipt TEXT NOT NULL);\
+CREATE TRIGGER completed_admission_immutable BEFORE UPDATE ON completed_admissions BEGIN SELECT RAISE(ABORT,'immutable completed admission'); END;\
+CREATE TRIGGER completed_admission_retained BEFORE DELETE ON completed_admissions BEGIN SELECT RAISE(ABORT,'retained completed admission'); END;")?;
     Ok(())
 }
 
@@ -1354,6 +1373,10 @@ PRAGMA user_version=5;")?;
             migrate_review_v13(&db)?;
             db.execute_batch("PRAGMA user_version=13;")?;
         }
+        if version < 14 {
+            migrate_completed_admissions(&db)?;
+            db.execute_batch("PRAGMA user_version=14;")?;
+        }
         if version < crate::completion::SCHEMA_VERSION {
             db.execute_batch("COMMIT;")?;
         }
@@ -1830,6 +1853,10 @@ PRAGMA user_version=5;")?;
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut effect = effect(&tx, effect_id)?;
+        if effect.state == RECONCILIATION_NEEDED {
+            // A retained late receipt is terminal; no later settlement overwrites it.
+            return Ok(());
+        }
         let single_batch = effect.is_single_batch()?;
         let replacement_can_refuse = if let Work::Replace {
             claim,
@@ -1970,12 +1997,13 @@ PRAGMA user_version=5;")?;
     }
     /// Persists a successful Run admission immediately, even when its native binding is not ready.
     /// Repeated identical admission is harmless; differing agent or sequence is refused.
+    /// After pool completion the receipt is retained, not installed (`ReconciliationNeeded`).
     pub fn record_run_admission(
         &mut self,
         effect_id: &str,
         agent_id: &str,
         sequence: u64,
-    ) -> Result<(), Fault> {
+    ) -> Result<Admitted, Fault> {
         if !crate::run_status::valid_agent_id(agent_id)
             || sequence == 0
             || sequence > u64::from(u32::MAX)
@@ -1996,11 +2024,14 @@ PRAGMA user_version=5;")?;
                 && b.run_id.as_deref() == Some(agent_id)
                 && b.run_sequence == Some(sequence)
             {
-                return Ok(());
+                return Ok(Admitted::Installed);
             }
-            completed_admission_notice(&tx, &e)?;
-            tx.commit()?;
-            return Err(Fault::Closed);
+            let receipt = serde_json::json!({
+                "kind": "start",
+                "agent_id": agent_id,
+                "sequence": sequence,
+            });
+            return completed_commit(tx, |tx| completed_admission(tx, &e, &receipt));
         }
         if b.run_id.as_deref().is_some_and(|v| v != agent_id)
             || b.run_sequence.is_some_and(|v| v != sequence)
@@ -2013,16 +2044,17 @@ PRAGMA user_version=5;")?;
         // Admission is known; custody remains monitored until native binding or a final removal notice.
         tx.execute("UPDATE effects SET state='custody' WHERE id=?1 AND state NOT IN ('accepted','refused','cancelled')",[effect_id])?;
         tx.commit()?;
-        Ok(())
+        Ok(Admitted::Installed)
     }
     /// Records every batch admission and queues binding reconciliation in one Pool transaction.
     /// Exact replay never creates a second resolver; inconsistent receipts fail closed.
+    /// After pool completion the receipt is retained, not installed (`ReconciliationNeeded`).
     pub fn record_batch_admission(
         &mut self,
         effect_id: &str,
         receipt_store_id: Option<&str>,
         admissions: &[(String, u64, String, Option<String>)],
-    ) -> Result<(), Fault> {
+    ) -> Result<Admitted, Fault> {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2050,9 +2082,21 @@ PRAGMA user_version=5;")?;
             return Err(Fault::Conflict);
         }
         if e.state != "accepted" && crate::completion::completed(&tx, &e.pool_id)? {
-            completed_admission_notice(&tx, &e)?;
-            tx.commit()?;
-            return Err(Fault::Closed);
+            if admissions
+                .iter()
+                .any(|(agent_id, sequence, reference, pin)| {
+                    !crate::run_status::valid_agent_id(agent_id)
+                        || *sequence == 0
+                        || *sequence > u64::from(u32::MAX)
+                        || execution_ref(reference).is_err()
+                        || *retain_history != pin.is_some()
+                        || pin.as_ref().is_some_and(|value| pin_id(value).is_err())
+                })
+            {
+                return Err(Fault::Invalid);
+            }
+            let receipt = admission_receipt("start_batch", receipt_store_id, admissions);
+            return completed_commit(tx, |tx| completed_admission(tx, &e, &receipt));
         }
         let mut seen = BTreeSet::new();
         let mut seen_refs = BTreeSet::new();
@@ -2122,17 +2166,18 @@ PRAGMA user_version=5;")?;
             [effect_id],
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(Admitted::Installed)
     }
     /// Atomically installs a replacement only after the exact conditioned Run receipt is verified.
     /// A crash before this commit leaves the old roster frozen for receipt reconciliation.
+    /// After pool completion the receipt is retained, not installed (`ReconciliationNeeded`).
     pub(crate) fn record_replacement_admission(
         &mut self,
         effect_id: &str,
         token: &str,
         expected_store: &str,
         admission: &(String, u64, String, Option<String>),
-    ) -> Result<(), Fault> {
+    ) -> Result<Admitted, Fault> {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2149,7 +2194,7 @@ PRAGMA user_version=5;")?;
         else {
             return Err(Fault::Conflict);
         };
-        if effect.state != "accepted"
+        if !matches!(effect.state.as_str(), "accepted" | RECONCILIATION_NEEDED)
             && (effect.state != "inflight" || claim.as_deref() != Some(token))
         {
             return Err(Fault::Conflict);
@@ -2181,15 +2226,18 @@ PRAGMA user_version=5;")?;
                 && stored.run_pin_id.as_deref() == Some(pin)
                 && stored.run_store_id.as_deref() == Some(expected_store)
             {
-                Ok(())
+                Ok(Admitted::Installed)
             } else {
                 Err(Fault::Conflict)
             };
         }
         if crate::completion::completed(&tx, &effect.pool_id)? {
-            completed_admission_notice(&tx, &effect)?;
-            tx.commit()?;
-            return Err(Fault::Closed);
+            let receipt = admission_receipt(
+                "replace",
+                Some(expected_store),
+                std::slice::from_ref(admission),
+            );
+            return completed_commit(tx, |tx| completed_admission(tx, &effect, &receipt));
         }
         if effect.state != "inflight" {
             return Err(Fault::Conflict);
@@ -2271,7 +2319,7 @@ PRAGMA user_version=5;")?;
             params![effect_id, encode(&effect)?],
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(Admitted::Installed)
     }
     /// Storage primitive for a future proof-backed native binding; the runtime does not call it yet.
     /// Global leader and current membership reservations are rechecked; removed members stay removed.
@@ -3925,6 +3973,92 @@ pub(crate) fn completion_admission_pending(db: &Connection, pool_id: &str) -> Re
         }
     }
     Ok(false)
+}
+
+/// Terminal effect state for a Run admission that arrived after pool completion.
+const RECONCILIATION_NEEDED: &str = "reconciliation_needed";
+
+/// Resolves an admission receipt that arrived after completion without changing
+/// the pool. The exact receipt is retained, the effect becomes terminal
+/// `reconciliation_needed` (never redelivered) and one owner notice is queued.
+/// An identical replay is harmless; a different receipt for the same effect
+/// conflicts. An effect that already reached another terminal state keeps it and
+/// is refused as `closed`; the caller commits the notice either way.
+fn completed_admission(
+    db: &Connection,
+    effect: &Effect,
+    receipt: &serde_json::Value,
+) -> Result<Admitted, Fault> {
+    let receipt = serde_json::to_string(receipt).map_err(|_| Fault::Internal)?;
+    if effect.state == RECONCILIATION_NEEDED {
+        let retained: String = db.query_row(
+            "SELECT receipt FROM completed_admissions WHERE effect=?1",
+            [&effect.effect_id],
+            |r| r.get(0),
+        )?;
+        return if retained == receipt {
+            Ok(Admitted::ReconciliationNeeded)
+        } else {
+            Err(Fault::Conflict)
+        };
+    }
+    completed_admission_notice(db, effect)?;
+    if matches!(effect.state.as_str(), "accepted" | "refused" | "cancelled") {
+        return Err(Fault::Closed);
+    }
+    db.execute(
+        "INSERT INTO completed_admissions(effect,receipt) VALUES(?1,?2)",
+        params![effect.effect_id, receipt],
+    )?;
+    let mut settled = effect.clone();
+    settled.state = RECONCILIATION_NEEDED.into();
+    if let Work::Replace {
+        claim, send_first, ..
+    } = &mut settled.work
+    {
+        *claim = None;
+        *send_first = None;
+    }
+    db.execute(
+        "UPDATE effects SET state=?2,data=?3 WHERE id=?1",
+        params![settled.effect_id, settled.state, encode(&settled)?],
+    )?;
+    Ok(Admitted::ReconciliationNeeded)
+}
+
+/// Canonical retained form of one verified batch or replacement Run receipt.
+fn admission_receipt(
+    kind: &str,
+    store_id: Option<&str>,
+    admissions: &[(String, u64, String, Option<String>)],
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": kind,
+        "store_id": store_id,
+        "admissions": admissions
+            .iter()
+            .map(|(agent_id, sequence, execution_ref, pin_id)| serde_json::json!({
+                "agent_id": agent_id,
+                "sequence": sequence,
+                "execution_ref": execution_ref,
+                "pin_id": pin_id,
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// Commits a completed-pool admission outcome together with its owner notice.
+/// A `closed` refusal of an already terminal effect still commits the
+/// deduplicated notice; any other failure rolls the transaction back.
+fn completed_commit(
+    tx: rusqlite::Transaction<'_>,
+    settle: impl FnOnce(&Connection) -> Result<Admitted, Fault>,
+) -> Result<Admitted, Fault> {
+    let result = settle(&tx);
+    if matches!(result, Ok(_) | Err(Fault::Closed)) {
+        tx.commit()?;
+    }
+    result
 }
 
 /// Preserve the external admission evidence and alert the owner without changing a completed pool.

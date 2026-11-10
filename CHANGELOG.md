@@ -12,6 +12,13 @@
 
 ### Fixed
 
+- Isolate completion release keys per durable Pool store
+  (`completion-keys/<store UUID>/`) so Pool databases sharing one private parent
+  never sweep each other's keys; startup migrates only this store's owned legacy
+  flat keys and never deletes from the shared root.
+- A late admission receipt for a completed pool (schema v14) is retained exactly
+  and settles its effect as terminal `reconciliation_needed` with one owner
+  notice instead of stopping the resident worker.
 - Refuse direct installation or activation of a bundle for another product or platform,
   and preserve existing installation-directory permissions.
 - Allow only the explicitly pinned Bridge SDK repository in the dependency source check.

@@ -442,9 +442,14 @@ immediate recheck.
 
 The saga stages are `prepared -> acquire_possible -> held -> committed|aborted ->
 release_pending -> released`, stored in `completion_sagas`. A fresh key file
-(32-byte seed, mode 0600, in the 0700 `completion-keys` directory beside the
-database) is fsynced before the saga row records only its opaque reference and
-public key. The row freezes the complete settlement (`agent-mcp/pool/completion-settlement/v1`
+(32-byte seed, mode 0600, in the store's own 0700 directory
+`completion-keys/<Pool store UUID>/` beside the database) is fsynced before the
+saga row records only its opaque reference and public key. Several Pool
+databases may share one private parent: each durable store identity has its
+own key directory, so one store's startup can never remove or race another
+store's keys. Every key operation rechecks owner, mode and non-symlink status of
+the shared root and the store directory, whose device and inode are pinned when
+the resident opens it. The row freezes the complete settlement (`agent-mcp/pool/completion-settlement/v1`
 digest, also the hold `intent_digest`), the configured Run route and store, the
 hold request ID `agent-pool.completion.<saga>`, ordered targets and roots and the
 hold fingerprint; triggers make these fields and the terminal outcome immutable.
@@ -478,15 +483,27 @@ original key file or route resumes the same saga. Unexpected driver errors are
 recorded as `internal_error` and retried with backoff. If the driver cannot
 start, unfinished sagas receive `key_unavailable` or `route_changed`, the
 resident logs the condition, and owner identity capabilities include
-`completion_attention_<code>` while that condition persists. Startup removes
-unreferenced key and temporary files while preserving keys of all unreleased
-sagas. Ed25519 signing keys and transient seeds are zeroized on drop. The
+`completion_attention_<code>` while that condition persists. Startup first
+migrates the earlier shared flat layout once: only `<reference>.key` files that
+this database's sagas still own (unreleased, or released with the key not yet
+destroyed) are atomically renamed into the store's directory, never over an
+existing key, and both directories are fsynced. Nothing in the shared root is
+ever deleted; other legacy files (other stores' keys, staging files) stay and
+the resident logs only their count. Startup then removes unreferenced key and
+temporary files inside the store's own directory while preserving keys of all
+unreleased sagas. Ed25519 signing keys and transient seeds are zeroized on drop. The
 record preserves Run's exact status timestamp text.
 
 C3: once a record exists, update, add, start, batch, replace, cancel
 replacement, assignment change, remove, join, propose and vote return `closed`.
-Late admission receipts cannot change a completed pool; the owner receives a
-deduplicated reconciliation notice. Eligibility is checked again in the
+Late admission receipts cannot change a completed pool. When a start, batch or
+replacement admission (including one found by recovery) arrives after
+completion, one transaction retains the exact receipt identifiers in the
+immutable `completed_admissions` table (schema v14), moves the effect to the
+terminal state `reconciliation_needed` (never redelivered, never overwritten by
+a later settlement) and queues one deduplicated owner reconciliation notice;
+the resident worker continues with other work. An identical replay returns the
+same outcome; a different receipt for that effect conflicts. Eligibility is checked again in the
 completion transaction, including pending admission effects.
 Reads, messages, explicit close, history-pin release and recovery continue.
 Records and observations cannot be updated or deleted. Saga intent fields and
@@ -655,7 +672,7 @@ freezes the active pin and audience when retirement is first prepared, before
 I/O, and uses the SDK's same-connection pinned Bridge method, retaining that
 pin and original key after an uncertain reply. Schema v13 clears delivery-era
 scope pins only on open or draining scopes; prepared retirement pins remain
-immutable. Synthetic fakes do not qualify the Run/Bridge endpoints
+immutable. Schema v14 adds only the immutable late-admission receipt table. Synthetic fakes do not qualify the Run/Bridge endpoints
 or native provider delivery.
 
 The B1 issuer namespace seal covers P1 ingress contexts, consumes and admissions.
@@ -772,7 +789,7 @@ delivery are separate facts. Inventory orders by pool ID; archive orders by
 retained proposal insertion sequence; other sections preserve existing cursor
 semantics. Pages observe current state independently; mutable offset sections
 require the revision fence on continuation.
-Store schema v13 has no historical timestamps: `source_timestamp:null` and
+Store schema v14 has no historical timestamps: `source_timestamp:null` and
 coverage text disclose that absence. Complete encoded envelopes including the
 newline are capped at 1 MiB; oversized results fail explicitly without partial
 publication or silently advancing a cursor. Resident exchanges use the existing

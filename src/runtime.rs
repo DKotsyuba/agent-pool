@@ -3,7 +3,7 @@ use crate::{
     config::{Config, private_file, private_parent, private_socket},
     domain::{Actor, Binding, Command, Effect, Fault, Reply, Work},
     integrations::{self, Assertion, EXCHANGE_TIMEOUT, MAX_FRAME},
-    store::Store,
+    store::{Admitted, Store},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -2533,10 +2533,14 @@ async fn effect(
                     let effect_id = effect.effect_id.clone();
                     let agent_id = admission.agent_id.clone();
                     let sequence = admission.sequence;
-                    stored(store, move |store| {
+                    let recorded = stored(store, move |store| {
                         store.record_run_admission(&effect_id, &agent_id, sequence)
                     })
                     .await?;
+                    if recorded == Admitted::ReconciliationNeeded {
+                        // The completed pool retained the receipt; the effect is terminal.
+                        return Ok(());
+                    }
                     resolve_run(
                         store,
                         config,
@@ -2598,9 +2602,14 @@ async fn effect(
                     .await
                     {
                         Ok(Some(admissions)) => {
-                            record_batch(store, &effect.effect_id, Some(expected), admissions)
-                                .await?;
-                            settle(store, effect.effect_id, "accepted").await
+                            match record_batch(store, &effect.effect_id, Some(expected), admissions)
+                                .await?
+                            {
+                                Admitted::Installed => {
+                                    settle(store, effect.effect_id, "accepted").await
+                                }
+                                Admitted::ReconciliationNeeded => Ok(()),
+                            }
                         }
                         _ => settle(store, effect.effect_id, "unknown").await,
                     };
@@ -2643,14 +2652,19 @@ async fn effect(
                 .await
                 {
                     Ok(Some(admissions)) => {
-                        record_batch(
+                        return match record_batch(
                             store,
                             &effect.effect_id,
                             expected_store_id.as_deref(),
                             admissions,
                         )
-                        .await?;
-                        return settle(store, effect.effect_id, "accepted").await;
+                        .await?
+                        {
+                            Admitted::Installed => {
+                                settle(store, effect.effect_id, "accepted").await
+                            }
+                            Admitted::ReconciliationNeeded => Ok(()),
+                        };
                     }
                     Ok(None) => {}
                     Err(_) => return settle(store, effect.effect_id, "unknown").await,
@@ -2666,14 +2680,17 @@ async fn effect(
             .await
             {
                 Ok(admissions) => {
-                    record_batch(
+                    match record_batch(
                         store,
                         &effect.effect_id,
                         expected_store_id.as_deref(),
                         admissions,
                     )
-                    .await?;
-                    "accepted"
+                    .await?
+                    {
+                        Admitted::Installed => "accepted",
+                        Admitted::ReconciliationNeeded => return Ok(()),
+                    }
                 }
                 Err(error) if error.known_unadmitted && !reconcile => {
                     eprintln!("Run batch admission refused: {}", error.code);
@@ -2828,6 +2845,7 @@ async fn replacement_effect(
         .await
         {
             Ok(Some(admissions)) => {
+                // Installed, or retained after completion: the effect is settled either way.
                 record_replacement(store, effect_id, &token, expected, admissions).await?;
                 return Ok(None);
             }
@@ -2870,13 +2888,14 @@ async fn replacement_effect(
 }
 
 /// Commits exactly one correlated replacement receipt and its roster transition.
+/// After pool completion the receipt is retained and the effect is already terminal.
 async fn record_replacement(
     store: &SharedStore,
     effect_id: &str,
     token: &str,
     expected_store: &str,
     mut admissions: Vec<integrations::BatchAdmission>,
-) -> Result<(), Fault> {
+) -> Result<Admitted, Fault> {
     if admissions.len() != 1 {
         return Err(Fault::Unavailable);
     }
@@ -2897,12 +2916,13 @@ async fn record_replacement(
 }
 
 /// Persists one fully verified Run receipt and all member mappings in one Pool transaction.
+/// After pool completion the receipt is retained instead and the effect is already terminal.
 async fn record_batch(
     store: &SharedStore,
     effect_id: &str,
     expected_store_id: Option<&str>,
     admissions: Vec<integrations::BatchAdmission>,
-) -> Result<(), Fault> {
+) -> Result<Admitted, Fault> {
     let id = effect_id.to_owned();
     let expected = expected_store_id.map(str::to_owned);
     let values: Vec<_> = admissions
@@ -3263,7 +3283,8 @@ async fn work(
         recover_egress_scope(&config, &store, &activity).await?;
         recover_namespace_retirement(&config, &store).await?;
         if completion.is_none() {
-            if let Some(driver) = crate::completion_saga::Driver::production(&config) {
+            let pool_store = stored(&store, |store| store.managed_store_id()).await?;
+            if let Some(driver) = crate::completion_saga::Driver::production(&config, &pool_store) {
                 if driver.sweep(&store).await.is_ok() {
                     completion = Some(driver);
                 } else {
@@ -3335,6 +3356,16 @@ async fn work(
             (observation_cursor + 20) % targets.len()
         };
     }
+}
+
+/// Test-only entry into the resident's serial outbox worker with fresh managed activity.
+#[cfg(test)]
+pub(crate) async fn fixture_work(
+    config: Config,
+    store: SharedStore,
+    stopped: watch::Receiver<bool>,
+) -> Result<(), Fault> {
+    work(config, store, stopped, Arc::new(ManagedActivity::default())).await
 }
 
 /// Local lifecycle checks exercise supervisor contracts without bypassing production authentication.
