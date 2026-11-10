@@ -910,20 +910,84 @@ pub(crate) mod enrollment_dispatch {
         Ok(())
     }
 
-    /// Advance one enrollment at most one Run step per call.
+    /// Advance one enrollment at most one Run step per call, observing every
+    /// admitted job (no pacing). The resident uses the paced `reconcile`.
+    #[cfg(test)]
     pub(crate) async fn drive<C: Client>(
         store: &SharedStore,
         client: &C,
         id: &str,
     ) -> Result<(), Fault> {
+        advance(store, client, id, &mut Unpaced).await.map(|_| ())
+    }
+
+    /// Per-job admission of one reconciliation pass.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Turn {
+        /// Observe this job now.
+        Go,
+        /// Backed off: skip it this pass.
+        Skip,
+        /// Pass budget exhausted: stop before this job.
+        Stop,
+    }
+
+    /// Pacing of the admitted jobs of one enrollment.
+    pub(crate) trait Pace: Send {
+        fn turn(&mut self, id: &str, index: usize) -> Turn;
+        /// `waiting`: no progress (not ready, refusal or uncertainty), back off.
+        fn observed(&mut self, id: &str, index: usize, waiting: bool);
+    }
+
+    struct Unpaced;
+    impl Pace for Unpaced {
+        fn turn(&mut self, _: &str, _: usize) -> Turn {
+            Turn::Go
+        }
+        fn observed(&mut self, _: &str, _: usize, _: bool) {}
+    }
+
+    /// One Run step for `id`; returns `false` only when the pace stopped it
+    /// before every due admitted job had its turn.
+    async fn advance<C: Client>(
+        store: &SharedStore,
+        client: &C,
+        id: &str,
+        pace: &mut dyn Pace,
+    ) -> Result<bool, Fault> {
         let load_id = id.to_owned();
-        let (mut enrollment, jobs) = stored(store, move |store| {
+        let (enrollment, jobs) = stored(store, move |store| {
             journal::load(store.completion_db(), &load_id)
         })
         .await?;
         if !client.route().same_identity(&enrollment.route) {
-            return note(store, id, "route_changed").await;
+            return note(store, id, "route_changed").await.map(|()| true);
         }
+        if enrollment.state == "admitted" {
+            let key = enrollment.key()?;
+            for job in jobs.iter().filter(|job| job.state == "admitted") {
+                match pace.turn(id, job.index) {
+                    Turn::Go => {}
+                    Turn::Skip => continue,
+                    Turn::Stop => return Ok(false),
+                }
+                let waiting = observe(store, client, &enrollment, &key, job).await?;
+                pace.observed(id, job.index, waiting);
+            }
+            return Ok(true);
+        }
+        submit_step(store, client, id, enrollment)
+            .await
+            .map(|()| true)
+    }
+
+    /// The next Run step of one unsubmitted or uncertain enrollment.
+    async fn submit_step<C: Client>(
+        store: &SharedStore,
+        client: &C,
+        id: &str,
+        mut enrollment: journal::Enrollment,
+    ) -> Result<(), Fault> {
         match enrollment.state.as_str() {
             "reserved" => {
                 if !client.switch_enabled() {
@@ -1025,24 +1089,19 @@ pub(crate) mod enrollment_dispatch {
                     Err(failure) => note(store, id, failure.code()).await,
                 }
             }
-            "admitted" => {
-                let key = enrollment.key()?;
-                for job in jobs.iter().filter(|job| job.state == "admitted") {
-                    observe(store, client, &enrollment, &key, job).await?;
-                }
-                Ok(())
-            }
             _ => Ok(()),
         }
     }
 
+    /// Observe one admitted job; returns whether it is still waiting (not
+    /// ready, refused or uncertain), so the scheduler backs it off.
     async fn observe<C: Client>(
         store: &SharedStore,
         client: &C,
         enrollment: &journal::Enrollment,
         key: &Key,
         job: &journal::Job,
-    ) -> Result<(), Fault> {
+    ) -> Result<bool, Fault> {
         let id = enrollment.id.clone();
         let index = job.index;
         let Some((request, fresh)) = stored(store, move |store| {
@@ -1050,7 +1109,7 @@ pub(crate) mod enrollment_dispatch {
         })
         .await?
         else {
-            return Ok(());
+            return Ok(false);
         };
         let settle = |retain: bool| {
             let id = enrollment.id.clone();
@@ -1064,7 +1123,7 @@ pub(crate) mod enrollment_dispatch {
         };
         match client.current(key, &job.member, &request).await {
             // A replay of an uncertain earlier observation is never fresh authority.
-            Ok(_) if !fresh => settle(false).await,
+            Ok(_) if !fresh => settle(false).await.map(|()| false),
             Ok(attested) => {
                 let attested = Arc::new(attested);
                 if enrollment.mode == "start" {
@@ -1076,12 +1135,14 @@ pub(crate) mod enrollment_dispatch {
                     .await;
                     settle(false).await?;
                     match result {
-                        Ok(_) => Ok(()),
+                        Ok(_) => Ok(false),
                         Err(Fault::Conflict) => {
-                            note_job(store, &enrollment.id, index, "address_conflict").await
+                            note_job(store, &enrollment.id, index, "address_conflict").await?;
+                            Ok(true)
                         }
                         Err(_) => {
-                            note_job(store, &enrollment.id, index, "attestation_mismatch").await
+                            note_job(store, &enrollment.id, index, "attestation_mismatch").await?;
+                            Ok(true)
                         }
                     }
                 } else {
@@ -1112,13 +1173,18 @@ pub(crate) mod enrollment_dispatch {
                     };
                     settle(false).await?;
                     match outcome {
-                        Ok(Switch::Attention(code)) => note(store, &enrollment.id, code).await,
-                        Ok(_) => Ok(()),
+                        Ok(Switch::Attention(code)) => {
+                            note(store, &enrollment.id, code).await?;
+                            Ok(true)
+                        }
+                        Ok(_) => Ok(false),
                         Err(Fault::Conflict) => {
-                            note_job(store, &enrollment.id, index, "address_conflict").await
+                            note_job(store, &enrollment.id, index, "address_conflict").await?;
+                            Ok(true)
                         }
                         Err(_) => {
-                            note_job(store, &enrollment.id, index, "attestation_mismatch").await
+                            note_job(store, &enrollment.id, index, "attestation_mismatch").await?;
+                            Ok(true)
                         }
                     }
                 }
@@ -1133,7 +1199,8 @@ pub(crate) mod enrollment_dispatch {
                         .map_or("attempt_not_ready", job_reason),
                     _ => "attempt_not_ready",
                 };
-                note_job(store, &enrollment.id, index, reason).await
+                note_job(store, &enrollment.id, index, reason).await?;
+                Ok(true)
             }
             // A typed refusal created no receipt; the next observation uses a fresh key.
             Err(
@@ -1143,29 +1210,247 @@ pub(crate) mod enrollment_dispatch {
                 | Failure::Operator(_)),
             ) => {
                 settle(false).await?;
-                note_job(store, &enrollment.id, index, failure.code()).await
+                note_job(store, &enrollment.id, index, failure.code()).await?;
+                Ok(true)
             }
             // Uncertain transport: the same key is recovered next, never trusted as fresh.
-            Err(failure) => note_job(store, &enrollment.id, index, failure.code()).await,
+            Err(failure) => {
+                note_job(store, &enrollment.id, index, failure.code()).await?;
+                Ok(true)
+            }
         }
     }
 
-    /// Bounded pass over pending enrollments; one enrollment's failure never stops others.
+    /// Pending enrollments read per keyset page.
+    pub(crate) const PAGE: u32 = 64;
+    /// Run calls one reconciliation pass may make; the rest of the tick
+    /// (egress, scope retirement, completion) always runs after it.
+    pub(crate) const PASS_BUDGET: usize = 64;
+    /// Worst-case Run calls of one enrollment step (status, enabled, submit).
+    const STEP_CALLS: usize = 3;
+    /// Worst-case Run calls of one job observation (current, lookup or status).
+    const JOB_CALLS: usize = 2;
+    /// Exponential backoff of a waiting enrollment or job, in seconds.
+    const BACKOFF_BASE: u64 = 5;
+    const BACKOFF_CAP: u64 = 300;
+
+    /// A scheduled unit: an unsubmitted/uncertain enrollment or one admitted job.
+    type Slot = (String, Option<usize>);
+
+    #[derive(Clone, Copy, Debug)]
+    struct Backoff {
+        failures: u32,
+        due: u64,
+        revision: Option<u64>,
+    }
+
+    /// Resident in-memory reconciliation schedule: a rotating keyset cursor and
+    /// per-enrollment/per-job exponential backoff (capped at 300 s). Losing it
+    /// on restart only makes every unit due again; it is never authority.
+    #[derive(Debug, Default)]
+    pub(crate) struct Schedule {
+        /// Next keyset position (inclusive); 0 restarts the rotation.
+        next: i64,
+        slots: std::collections::HashMap<Slot, Backoff>,
+        /// Enrollments seen since the rotation last restarted, for pruning.
+        seen: std::collections::HashSet<String>,
+    }
+    impl Schedule {
+        /// A unit is due once its backoff elapsed; an enrollment is also due
+        /// when its revision moved (for example an owner abort request).
+        fn due(&self, slot: &Slot, revision: Option<u64>, now: u64) -> bool {
+            self.slots.get(slot).is_none_or(|backoff| {
+                now >= backoff.due || (revision.is_some() && backoff.revision != revision)
+            })
+        }
+        fn wait(&mut self, slot: Slot, revision: Option<u64>, now: u64) {
+            let backoff = self.slots.entry(slot).or_insert(Backoff {
+                failures: 0,
+                due: now,
+                revision,
+            });
+            backoff.failures = backoff.failures.saturating_add(1);
+            let delay = (BACKOFF_BASE << (backoff.failures - 1).min(6)).min(BACKOFF_CAP);
+            backoff.due = now.saturating_add(delay);
+            backoff.revision = revision;
+        }
+        fn clear(&mut self, slot: &Slot) {
+            self.slots.remove(slot);
+        }
+        /// Backoff deadline of a unit, for diagnostics and tests.
+        #[cfg(test)]
+        pub(crate) fn due_at(&self, id: &str, index: Option<usize>) -> Option<u64> {
+            self.slots
+                .get(&(id.to_owned(), index))
+                .map(|backoff| backoff.due)
+        }
+    }
+
+    /// Counts every Run call of one pass.
+    struct Metered<'a, C> {
+        inner: &'a C,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl<C> Metered<'_, C> {
+        fn tick(&self) {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        fn fits(&self, cost: usize) -> bool {
+            self.calls().saturating_add(cost) <= PASS_BUDGET
+        }
+    }
+    impl<C: Client> Client for Metered<'_, C> {
+        fn route(&self) -> EnrollmentRoute {
+            self.inner.route()
+        }
+        fn switch_enabled(&self) -> bool {
+            self.inner.switch_enabled()
+        }
+        fn enabled(&self) -> Response<'_, ()> {
+            self.tick();
+            self.inner.enabled()
+        }
+        fn submit<'a>(&'a self, params: &'a Value) -> Response<'a, StartReceipt> {
+            self.tick();
+            self.inner.submit(params)
+        }
+        fn lookup<'a>(&'a self, key: &'a Key) -> Response<'a, Lookup> {
+            self.tick();
+            self.inner.lookup(key)
+        }
+        fn abort<'a>(&'a self, key: &'a Key) -> Response<'a, Lookup> {
+            self.tick();
+            self.inner.abort(key)
+        }
+        fn current<'a>(
+            &'a self,
+            key: &'a Key,
+            member: &'a str,
+            request: &'a str,
+        ) -> Response<'a, Attested> {
+            self.tick();
+            self.inner.current(key, member, request)
+        }
+        fn status<'a>(
+            &'a self,
+            store: &'a str,
+            target: &'a Target,
+        ) -> Pin<Box<dyn Future<Output = OldStatus> + Send + 'a>> {
+            self.tick();
+            self.inner.status(store, target)
+        }
+    }
+
+    /// Per-job pacing of one pass: backoff and the shared I/O budget.
+    struct Paced<'a, C> {
+        schedule: &'a mut Schedule,
+        meter: &'a Metered<'a, C>,
+        now: u64,
+    }
+    impl<C: Client> Pace for Paced<'_, C> {
+        fn turn(&mut self, id: &str, index: usize) -> Turn {
+            if !self
+                .schedule
+                .due(&(id.to_owned(), Some(index)), None, self.now)
+            {
+                Turn::Skip
+            } else if self.meter.fits(JOB_CALLS) {
+                Turn::Go
+            } else {
+                Turn::Stop
+            }
+        }
+        fn observed(&mut self, id: &str, index: usize, waiting: bool) {
+            let slot = (id.to_owned(), Some(index));
+            if waiting {
+                self.schedule.wait(slot, None, self.now);
+            } else {
+                self.schedule.clear(&slot);
+            }
+        }
+    }
+
+    /// One bounded, fair pass over pending enrollments; returns the Run calls
+    /// made (never above `PASS_BUDGET`). The keyset cursor rotates through the
+    /// whole journal, units that keep waiting back off exponentially, and a
+    /// pass that exhausts its budget resumes at the same enrollment next time.
+    /// One enrollment's failure never stops the others.
     pub(crate) async fn reconcile<C: Client>(
         store: &SharedStore,
         client: &C,
         stopped: &watch::Receiver<bool>,
-    ) -> Result<(), Fault> {
-        let pending = stored(store, |store| journal::pending(store.completion_db())).await?;
-        for id in pending {
+        schedule: &mut Schedule,
+        now: u64,
+    ) -> Result<usize, Fault> {
+        let meter = Metered {
+            inner: client,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let from = schedule.next;
+        let page = stored(store, move |store| {
+            journal::pending(store.completion_db(), from, PAGE)
+        })
+        .await?;
+        let last_page = page.len() < usize::try_from(PAGE).map_err(|_| Fault::Internal)?;
+        for pending in page {
             if *stopped.borrow() {
-                return Ok(());
+                return Ok(meter.calls());
             }
-            if drive(store, client, &id).await.is_err() {
-                eprintln!("managed enrollment reconciliation deferred");
+            schedule.seen.insert(pending.id.clone());
+            let enrollment_slot = (pending.id.clone(), None);
+            let complete = if pending.state == "admitted" {
+                let mut pace = Paced {
+                    schedule: &mut *schedule,
+                    meter: &meter,
+                    now,
+                };
+                advance(store, &meter, &pending.id, &mut pace).await
+            } else if !schedule.due(&enrollment_slot, Some(pending.revision), now) {
+                Ok(true)
+            } else if !meter.fits(STEP_CALLS) {
+                Ok(false)
+            } else {
+                let result = advance(store, &meter, &pending.id, &mut Unpaced).await;
+                let load_id = pending.id.clone();
+                let after = stored(store, move |store| {
+                    journal::load(store.completion_db(), &load_id)
+                })
+                .await
+                .map(|(enrollment, _)| (enrollment.state, enrollment.revision));
+                match after {
+                    Ok((state, _)) if result.is_ok() && state != pending.state => {
+                        schedule.clear(&enrollment_slot);
+                    }
+                    Ok((_, revision)) => schedule.wait(enrollment_slot, Some(revision), now),
+                    Err(_) => schedule.wait(enrollment_slot, None, now),
+                }
+                result
+            };
+            match complete {
+                Ok(true) => schedule.next = pending.rowid.saturating_add(1),
+                // Budget exhausted: the next pass resumes at this enrollment.
+                Ok(false) => {
+                    schedule.next = pending.rowid;
+                    return Ok(meter.calls());
+                }
+                Err(_) => {
+                    eprintln!("managed enrollment reconciliation deferred");
+                    schedule.next = pending.rowid.saturating_add(1);
+                }
             }
         }
-        Ok(())
+        if last_page {
+            // The rotation saw every pending enrollment: restart it and forget
+            // backoff of enrollments that are no longer pending.
+            let seen = std::mem::take(&mut schedule.seen);
+            schedule.slots.retain(|(id, _), _| seen.contains(id));
+            schedule.next = 0;
+        }
+        Ok(meter.calls())
     }
 }
 
@@ -1529,7 +1814,9 @@ mod managed_egress_dispatch {
     /// E12 liveness: exact lookups with capped backoff; after
     /// `LIVENESS_LOOKUPS` non-decisive results the exact original effect is
     /// aborted. Only a durable `aborted` creates ONE new effect for the same
-    /// event; `accepted` is delivered; uncertainty keeps retrying with attention.
+    /// event, in the same transaction that records it; `accepted` is delivered;
+    /// uncertainty (or a successor refused for capacity) keeps retrying the
+    /// same-key abort with backoff and attention.
     pub(super) async fn liveness<C: OwnerClient + Clone + 'static>(
         store: &SharedStore,
         lease: &ManagedLease,
@@ -1552,17 +1839,6 @@ mod managed_egress_dispatch {
         let outcome = reconcile_outcome(store, lease, frozen, client, aborting).await?;
         let key = id.clone();
         match outcome {
-            Some(State::Aborted) if aborting => {
-                let fenced = key.clone();
-                if stored_managed(store, lease, move |store| {
-                    store.egress_liveness_aborting(&fenced)
-                })
-                .await?
-                {
-                    stored_managed(store, lease, move |store| store.egress_republish(&key)).await?;
-                }
-                Ok(())
-            }
             Some(State::Accepted | State::Aborted) => Ok(()),
             _ => {
                 let failures = stored_managed(store, lease, move |store| {
@@ -1631,7 +1907,9 @@ mod managed_egress_dispatch {
                 .await;
                 match recorded {
                     Ok(state @ (State::Accepted | State::Aborted)) => return Ok(Some(state)),
-                    Ok(_) | Err(Fault::Stale) => {}
+                    // Unavailable: the E12 successor was refused (capacity), so
+                    // nothing committed; the same-key abort is retried later.
+                    Ok(_) | Err(Fault::Stale | Fault::Unavailable) => {}
                     Err(Fault::Conflict | Fault::Invalid) => {
                         note(store, lease, &id, "outcome_unknown").await?
                     }
@@ -3909,6 +4187,9 @@ async fn work(
     let mut interval = tokio::time::interval(OBSERVATION_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut observation_cursor = 0;
+    // P3 enrollment reconciliation: rotating cursor, backoff and a per-pass budget.
+    let mut enrollment_schedule = enrollment_dispatch::Schedule::default();
+    let started = std::time::Instant::now();
     // P3-C automatic settlement stays off unless Run and managed consensus routes are configured.
     let mut completion = None;
     loop {
@@ -3921,7 +4202,15 @@ async fn work(
         if config.managed_run_transport.is_some() {
             let pool_store = stored(&store, |store| store.managed_store_id()).await?;
             if let Some(client) = enrollment_dispatch::Live::new(&config, &pool_store) {
-                enrollment_dispatch::reconcile(&store, &client, &stopped).await?;
+                let now = started.elapsed().as_secs();
+                enrollment_dispatch::reconcile(
+                    &store,
+                    &client,
+                    &stopped,
+                    &mut enrollment_schedule,
+                    now,
+                )
+                .await?;
             }
         }
         recover_egress_scope(&config, &store, &activity).await?;
@@ -8064,6 +8353,213 @@ mod tests {
                 .iter()
                 .all(|(kind, id)| kind != "publish" || *id == fresh)
         );
+        Ok(())
+    }
+
+    /// E12 failure boundaries: the durable `aborted` and its ONE successor
+    /// commit together. A successor refused for capacity rolls the abort result
+    /// back (the original stays fenced, no successor); after a restart and
+    /// capacity recovery the same-key abort creates exactly one successor, and a
+    /// replayed abort result after another restart creates none.
+    #[tokio::test]
+    async fn e12_abort_result_and_successor_commit_atomically()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::managed_egress::tests::{add_seed, freeze_next, result};
+        use crate::managed_egress::{Frozen, OwnerClient, OwnerFailure, ScopePlan, State};
+        use crate::managed_state::tests::{fixture, index_managed_member};
+        use bridge_sdk::bridge_protocol::{
+            RetireResult,
+            managed_owner::{
+                CompactManagedOwnerScopeResultV1, ManagedOwnerResultV1, ManagedOwnerStateV1,
+            },
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Clone, Default)]
+        struct Owner {
+            aborts: Arc<AtomicUsize>,
+        }
+        impl OwnerClient for Owner {
+            fn capabilities(&self, _: &str) -> Result<(), OwnerFailure> {
+                Ok(())
+            }
+            fn publish(&self, _: &str, _: &Frozen) -> Result<ManagedOwnerResultV1, OwnerFailure> {
+                Err(OwnerFailure::Unknown)
+            }
+            fn lookup(&self, _: &str, _: &Frozen) -> Result<ManagedOwnerResultV1, OwnerFailure> {
+                Err(OwnerFailure::Unknown)
+            }
+            fn abort(
+                &self,
+                _: &str,
+                frozen: &Frozen,
+            ) -> Result<ManagedOwnerResultV1, OwnerFailure> {
+                self.aborts.fetch_add(1, Ordering::SeqCst);
+                Ok(result(frozen, ManagedOwnerStateV1::Aborted, None))
+            }
+            fn retire(&self, _: &str, _: &ScopePlan) -> Result<RetireResult, OwnerFailure> {
+                Err(OwnerFailure::Unknown)
+            }
+            fn compact(
+                &self,
+                _: &str,
+                _: &ScopePlan,
+            ) -> Result<CompactManagedOwnerScopeResultV1, OwnerFailure> {
+                Err(OwnerFailure::Unknown)
+            }
+        }
+        /// (successor links, live effects for the event, original effect row state).
+        fn census(store: &mut Store) -> Result<(i64, i64, String), Fault> {
+            let db = store.test_db();
+            Ok((
+                db.query_row(
+                    "SELECT count(*) FROM managed_delivery_liveness WHERE effect_id='e12-cap' AND republished_as IS NOT NULL",
+                    [],
+                    |row| row.get(0),
+                )?,
+                db.query_row(
+                    "SELECT count(*) FROM managed_delivery_seeds s JOIN managed_delivery_outbox o ON o.effect_id=s.effect_id WHERE s.event_key=(SELECT event_key FROM managed_delivery_seeds WHERE effect_id='e12-cap') AND o.state NOT IN ('aborted','accepted','not_delivered')",
+                    [],
+                    |row| row.get(0),
+                )?,
+                db.query_row("SELECT state FROM effects WHERE id='e12-cap'", [], |row| {
+                    row.get(0)
+                })?,
+            ))
+        }
+        let (dir, mut initial, binding, incarnation, _run) = fixture();
+        index_managed_member(initial.test_db(), &binding);
+        add_seed(&mut initial, &binding, "e12-cap", "payload", false);
+        let lost = freeze_next(&mut initial, &binding, &incarnation, "e12-cap", "next", 2);
+        initial.egress_begin_publish("e12-cap")?;
+        drop(initial);
+        let path = dir.path().join("pool.db");
+        let store = Arc::new(Mutex::new(Store::open(&path)?));
+        let owner = Owner::default();
+        let activity = Arc::new(ManagedActivity::default());
+        let lease = activity
+            .acquire(ManagedWork::Egress("e12-cap".into()))?
+            .ok_or("lease")?;
+        for now in [100, 105, 115] {
+            let state = stored(&store, |store| store.egress_state("e12-cap"))
+                .await?
+                .ok_or("state")?;
+            managed_egress_dispatch::liveness(
+                &store,
+                &lease,
+                lost.clone(),
+                owner.clone(),
+                state,
+                now,
+            )
+            .await?;
+        }
+        assert_eq!(
+            stored(&store, |store| store.egress_state("e12-cap")).await?,
+            Some(State::AbortPending)
+        );
+        // Capacity exhausted: Bridge aborts, but the successor cannot be
+        // inserted, so the abort result is not committed either.
+        stored(&store, |store| {
+            let db = store.test_db();
+            db.execute_batch("PRAGMA foreign_keys=OFF; WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<100000) INSERT INTO managed_delivery_outbox(effect_id,state) SELECT 'filler-'||i,'pending' FROM n; PRAGMA foreign_keys=ON;")?;
+            Ok(())
+        })
+        .await?;
+        managed_egress_dispatch::liveness(
+            &store,
+            &lease,
+            lost.clone(),
+            owner.clone(),
+            State::AbortPending,
+            135,
+        )
+        .await?;
+        assert_eq!(owner.aborts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            stored(&store, |store| store.egress_state("e12-cap")).await?,
+            Some(State::AbortPending)
+        );
+        assert_eq!(
+            stored(&store, census).await?,
+            (0, 1, "unknown".into()),
+            "no committed abort without its successor"
+        );
+        // Restart, then capacity recovers: the same-key abort is retried after
+        // backoff and the result commits with exactly one successor.
+        drop(lease);
+        drop(store);
+        let store = Arc::new(Mutex::new(Store::open(&path)?));
+        stored(&store, |store| {
+            store.test_db().execute(
+                "DELETE FROM managed_delivery_outbox WHERE effect_id LIKE 'filler-%'",
+                [],
+            )?;
+            Ok(())
+        })
+        .await?;
+        let lease = activity
+            .acquire(ManagedWork::Egress("e12-cap".into()))?
+            .ok_or("lease")?;
+        managed_egress_dispatch::liveness(
+            &store,
+            &lease,
+            lost.clone(),
+            owner.clone(),
+            State::AbortPending,
+            136,
+        )
+        .await?;
+        assert_eq!(owner.aborts.load(Ordering::SeqCst), 1, "backoff respected");
+        managed_egress_dispatch::liveness(
+            &store,
+            &lease,
+            lost.clone(),
+            owner.clone(),
+            State::AbortPending,
+            1000,
+        )
+        .await?;
+        assert_eq!(owner.aborts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            stored(&store, |store| store.egress_state("e12-cap")).await?,
+            Some(State::Aborted)
+        );
+        assert_eq!(stored(&store, census).await?, (1, 1, "cancelled".into()));
+        let fresh = stored(&store, |store| {
+            Ok(store.test_db().query_row(
+                "SELECT republished_as FROM managed_delivery_liveness WHERE effect_id='e12-cap'",
+                [],
+                |row| row.get::<_, String>(0),
+            )?)
+        })
+        .await?;
+        // Restart after the committed abort result: a replayed abort result and
+        // a replayed republish are idempotent and never mint a second successor.
+        drop(lease);
+        drop(store);
+        let store = Arc::new(Mutex::new(Store::open(&path)?));
+        let aborted = result(&lost, ManagedOwnerStateV1::Aborted, None);
+        assert_eq!(
+            stored(&store, move |store| store
+                .egress_result("e12-cap", None, &aborted, true))
+            .await?,
+            State::Aborted
+        );
+        let replay = fresh.clone();
+        assert_eq!(
+            stored(&store, |store| store.egress_republish("e12-cap")).await?,
+            Some(replay)
+        );
+        assert_eq!(stored(&store, census).await?, (1, 1, "cancelled".into()));
+        let seeds = stored(&store, |store| {
+            Ok(store.test_db().query_row(
+                "SELECT count(*) FROM managed_delivery_seeds WHERE event_key=(SELECT event_key FROM managed_delivery_seeds WHERE effect_id='e12-cap')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?)
+        })
+        .await?;
+        assert_eq!(seeds, 2, "the original and exactly one successor");
         Ok(())
     }
 

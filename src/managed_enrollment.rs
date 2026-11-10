@@ -565,12 +565,38 @@ pub(crate) fn load(db: &Connection, id: &str) -> Result<(Enrollment, Vec<Job>), 
     Ok((enrollment, jobs))
 }
 
-/// Enrollments that still need Run I/O: unsubmitted, uncertain or admitted-unbound.
-pub(crate) fn pending(db: &Connection) -> Result<Vec<String>, Fault> {
-    let mut stmt = db.prepare("SELECT e.id FROM managed_enrollments e WHERE e.state IN ('reserved','submit_possible') OR (e.state='admitted' AND EXISTS(SELECT 1 FROM managed_enrollment_jobs j WHERE j.enrollment=e.id AND j.state='admitted')) ORDER BY e.rowid LIMIT 64")?;
-    stmt.query_map([], |row| row.get::<_, String>(0))?
-        .map(|row| row.map_err(Fault::from))
-        .collect()
+/// One enrollment that still needs Run I/O, with its keyset position.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Pending {
+    pub rowid: i64,
+    pub id: String,
+    pub state: String,
+    pub revision: u64,
+}
+
+/// Enrollments that still need Run I/O (unsubmitted, uncertain or
+/// admitted-unbound), one keyset page from `from` (inclusive) in journal order.
+/// The caller rotates `from` so no enrollment past the first page starves.
+pub(crate) fn pending(db: &Connection, from: i64, limit: u32) -> Result<Vec<Pending>, Fault> {
+    let mut stmt = db.prepare("SELECT e.rowid,e.id,e.state,e.revision FROM managed_enrollments e WHERE e.rowid>=?1 AND (e.state IN ('reserved','submit_possible') OR (e.state='admitted' AND EXISTS(SELECT 1 FROM managed_enrollment_jobs j WHERE j.enrollment=e.id AND j.state='admitted'))) ORDER BY e.rowid LIMIT ?2")?;
+    stmt.query_map(params![from, limit], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
+    })?
+    .map(|row| {
+        let (rowid, id, state, revision) = row?;
+        Ok(Pending {
+            rowid,
+            id,
+            state,
+            revision: u64::try_from(revision).map_err(|_| Fault::Internal)?,
+        })
+    })
+    .collect()
 }
 
 /// A start or replacement that may still change the frozen roster blocks roster edits and close.
@@ -1143,7 +1169,13 @@ pub(crate) fn bootstrap_ingress(
         )
         .optional()?;
     let Some((id, index)) = owner else {
-        return Ok(None);
+        return if early_root(&tx, authority, bridge_route, target_pool)? {
+            // §4 bootstrap race: Run may have admitted this root while Pool has
+            // not yet journaled the receipt (ACK loss). Retryable not_ready.
+            Err(Fault::Unavailable)
+        } else {
+            Ok(None)
+        };
     };
     let (enrollment, jobs) = load(&tx, &id)?;
     let job = jobs
@@ -1189,6 +1221,43 @@ pub(crate) fn bootstrap_ingress(
         }
         Bound::Already => Ok(None),
     }
+}
+
+/// Whether an unknown root may still be an admitted root of a submitted
+/// enrollment whose Run receipt Pool has not journaled yet: a `submit_possible`
+/// key on the same Run and Bridge routes, in the hook's target pool. It grants
+/// nothing; with no such key a manual or foreign root stays `Forbidden`.
+fn early_root(
+    tx: &Connection,
+    authority: &crate::managed_run::CurrentAuthority,
+    bridge_route: &Route,
+    target_pool: Option<&str>,
+) -> Result<bool, Fault> {
+    let receipt = authority.receipt();
+    let known: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM members WHERE json_extract(data,'$.run_id')=?1)",
+        [&receipt.lineage_root_id],
+        |row| row.get(0),
+    )?;
+    if known {
+        return Ok(false);
+    }
+    let mut stmt = tx.prepare(
+        "SELECT route FROM managed_enrollments WHERE state='submit_possible' AND (?1 IS NULL OR pool=?1) ORDER BY rowid LIMIT 64",
+    )?;
+    let routes = stmt
+        .query_map([target_pool], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for route in routes {
+        let route: EnrollmentRoute = decoded(&route)?;
+        if &route.run.route == authority.route()
+            && &route.bridge_route == bridge_route
+            && receipt.attempt.run_store_id == route.run.route.component_store_id
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Outcome of the conditioned replacement switch.
@@ -1359,10 +1428,12 @@ pub(crate) fn switch(db: &mut Connection, id: &str, attested: &Attested) -> Resu
 }
 
 /// P3 join gate: the owner enrollment maps this exact root to a pending member
-/// whose qualified binding was installed from enrollment evidence.
+/// whose qualified binding was installed from enrollment evidence. Eligibility
+/// is the job's own `bound_pending_join` fact: an owner `retain_unassigned` that
+/// resolved unbound siblings leaves an already-bound job joinable.
 pub(crate) fn join_gate(db: &Connection, binding: &ManagedBinding) -> Result<(), Fault> {
     let allowed: bool = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM managed_enrollment_jobs j JOIN managed_enrollments e ON e.id=j.enrollment JOIN pools p ON p.id=e.pool JOIN managed_bindings b ON b.member=j.member WHERE j.member=?1 AND e.pool=?2 AND j.lineage_root_id=?3 AND j.state='bound_pending_join' AND j.bound_generation IS NOT NULL AND e.state IN ('admitted','switched') AND e.owner=p.owner AND e.receipt IS NOT NULL)",
+        "SELECT EXISTS(SELECT 1 FROM managed_enrollment_jobs j JOIN managed_enrollments e ON e.id=j.enrollment JOIN pools p ON p.id=e.pool JOIN managed_bindings b ON b.member=j.member WHERE j.member=?1 AND e.pool=?2 AND j.lineage_root_id=?3 AND j.state='bound_pending_join' AND j.bound_generation IS NOT NULL AND e.state IN ('admitted','switched','resolved') AND e.owner=p.owner AND e.receipt IS NOT NULL)",
         params![binding.member_id, binding.pool_id, binding.attempt.lineage_root_id],
         |row| row.get(0),
     )?;
@@ -1448,8 +1519,10 @@ pub(crate) fn owner_get(
     )?)))
 }
 
-/// Owner `retain_unassigned`: close a definitively admitted, unbound enrollment.
-/// No process is cancelled and no pin is released.
+/// Owner `retain_unassigned`: close a definitively admitted enrollment. Only its
+/// still-unbound (`admitted`) jobs become unassigned; jobs already bound keep
+/// their pending member, binding and join eligibility (`join_gate`). No process
+/// is cancelled and no pin is released.
 pub(crate) fn owner_resolve(
     db: &Connection,
     actor: &crate::domain::Actor,

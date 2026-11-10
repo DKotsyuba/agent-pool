@@ -91,21 +91,27 @@ pub(crate) fn begin_liveness_abort(db: &mut Connection, effect_id: &str) -> Resu
     Ok(())
 }
 
-/// Whether an abort-pending effect was fenced by E12 liveness (not scope retirement).
-pub(crate) fn liveness_aborting(db: &Connection, effect_id: &str) -> Result<bool, Fault> {
-    Ok(db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM managed_delivery_liveness WHERE effect_id=?1 AND aborting=1)",
-        [effect_id],
-        |row| row.get(0),
-    )?)
-}
-
 /// After a durable `aborted` for a liveness-fenced original, create exactly one
 /// NEW effect (new effect_id) for the same event under the normal freeze rules.
 /// The original stays aborted and is never retargeted. Returns the new ID, or
-/// `None` when the membership/scope no longer permits delivery.
+/// `None` when the membership/scope no longer permits delivery. The resident
+/// only republishes inside `record_result`; this standalone form is a replay check.
+#[cfg(test)]
 pub(crate) fn republish(db: &mut Connection, effect_id: &str) -> Result<Option<String>, Fault> {
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let fresh = republish_in(&tx, effect_id)?;
+    tx.commit()?;
+    Ok(fresh)
+}
+
+/// The successor insert itself, inside the caller's transaction. `record_result`
+/// calls it in the same transaction that records the durable `aborted`, so a
+/// crash or a capacity refusal can never leave an aborted original without its
+/// successor (the whole result rolls back and the same-key abort is retried).
+fn republish_in(tx: &Connection, effect_id: &str) -> Result<Option<String>, Fault> {
+    if tx.is_autocommit() {
+        return Err(Fault::Internal);
+    }
     let row: Option<(bool, Option<String>)> = tx
         .query_row(
             "SELECT aborting=1,republished_as FROM managed_delivery_liveness WHERE effect_id=?1",
@@ -119,10 +125,10 @@ pub(crate) fn republish(db: &mut Connection, effect_id: &str) -> Result<Option<S
     if let Some(prior) = prior {
         return Ok(Some(prior));
     }
-    if state(&tx, effect_id)? != Some(State::Aborted) {
+    if state(tx, effect_id)? != Some(State::Aborted) {
         return Err(Fault::Stale);
     }
-    let seed = seed(&tx, effect_id)?;
+    let seed = seed(tx, effect_id)?;
     let scope_state: String = tx.query_row(
         "SELECT state FROM managed_delivery_scopes WHERE producer_scope=?1",
         [&seed.producer_scope],
@@ -141,8 +147,9 @@ pub(crate) fn republish(db: &mut Connection, effect_id: &str) -> Result<Option<S
     if !deliverable {
         return Ok(None);
     }
-    require_capacity(&tx, ACTIVE_LIMIT)?;
-    let mut copy = effect(&tx, effect_id)?;
+    // The original is already `aborted` here, so it no longer counts as active.
+    require_capacity(tx, ACTIVE_LIMIT)?;
+    let mut copy = effect(tx, effect_id)?;
     let fresh = crate::domain::id();
     copy.effect_id = fresh.clone();
     copy.state = match &copy.work {
@@ -172,7 +179,6 @@ pub(crate) fn republish(db: &mut Connection, effect_id: &str) -> Result<Option<S
         "UPDATE managed_delivery_liveness SET republished_as=?2 WHERE effect_id=?1 AND republished_as IS NULL",
         params![effect_id, fresh],
     )?;
-    tx.commit()?;
     Ok(Some(fresh))
 }
 /// Check the approved active pin in the transaction that first freezes work.
@@ -1195,6 +1201,11 @@ pub(crate) fn record_result(
         "UPDATE effects SET state=?2 WHERE id=?1",
         params![effect_id, effect_state],
     )?;
+    if aborting && next == "aborted" {
+        // E12: an aborted liveness-fenced original and its ONE successor commit
+        // together; a scope-retirement abort has no liveness fence and stops here.
+        republish_in(&tx, effect_id)?;
+    }
     tx.commit()?;
     State::parse(next)
 }

@@ -662,8 +662,16 @@ receipt's `created_id` is the enrollment ID and `created_ids` the members.
 Single start is a one-job batch. Identity, keys, routes, params, fingerprint,
 receipt and replacement source are trigger-immutable; rows are never deleted.
 
-**Run I/O.** A serial resident pass handles each pending enrollment outside
-SQLite. `reserved` -> capability check (`managed_enrollment_v1` and
+**Run I/O.** A serial resident pass handles pending enrollments outside
+SQLite. It is bounded and fair: a keyset cursor over the journal rotates through
+every pending enrollment (64 per page, resuming where the previous pass
+stopped), each unsubmitted/uncertain enrollment and each admitted unbound job
+that keeps waiting (not ready, refused, uncertain) backs off exponentially
+(5 s doubling, capped at 300 s; an enrollment revision change such as an owner
+abort request makes it due again), and one pass makes at most 64 Run calls, so
+egress, scope retirement and completion always get their turn in the same tick.
+The schedule is resident memory only; a restart makes everything due again.
+`reserved` -> capability check (`managed_enrollment_v1` and
 `attempt_current_egress_v1`; absence refuses definitively) -> durable
 `submit_possible` -> submit. A typed refusal is definitive only on that first
 possible submission; later refusals are attention only. Recovery always
@@ -694,14 +702,18 @@ generation 1, sets the member address and leaves the pool revision unchanged.
 (`qualification_pending`, `execution_failed`, ...) as job attention. The first
 protected hook may win instead: rootless ingress whose root is an admitted,
 unbound start job installs generation 1 under the same CAS, so exactly one first
-binding exists; a replacement candidate is `not_ready` until switched and an
-unknown root is forbidden. Binding, delivery accepted and join are separate
+binding exists; a replacement candidate is `not_ready` until switched. An
+unknown root while a same-route start or replacement in the hook's pool is
+still `submit_possible` (Run may have admitted it before Pool journaled the
+receipt, e.g. after ACK loss) is a retryable `unavailable` (§4 `not_ready`),
+never a binding; any other unknown root is forbidden. Binding, delivery accepted and join are separate
 facts: delivery never activates a member.
 
 **Join.** `pool_join` runs through the normal P1 context, Bridge consume, Run
 admission and domain CAS. `managed_enrollment::join_gate` additionally requires
 the owner enrollment receipt mapping this root, its recorded enrollment binding,
-and the job still `bound_pending_join`; the domain CAS then checks the
+and the job still `bound_pending_join` (the job's own fact: it stays joinable
+after the owner resolved its unbound siblings); the domain CAS then checks the
 acknowledged revision and pending -> active. While pending, an enrollee may only
 read (`pool_get`) and join. The legacy Bridge-only path still refuses every
 Run-started member.
@@ -732,8 +744,9 @@ mode, state (`reserved`, `submit_possible`, `admitted`, `refused`, `aborted`,
 They never contact Run. `pool_enrollment_resolve {pool_id,enrollment_id,
 expected_enrollment_revision,request_key,disposition:"retain_unassigned"}`
 closes only an admitted enrollment (uncertain submissions conflict): unbound
-jobs become `unassigned`, still-pending start members leave the roster, a
-failed replacement keeps the old member; no process is cancelled and no pin
+jobs become `unassigned`, their still-pending start members leave the roster, a
+failed replacement keeps the old member; jobs already `bound_pending_join` keep
+their member, generation-1 binding and join eligibility; no process is cancelled and no pin
 released. Pending enrollments also fence formal completion.
 
 E11 issuer discovery failures in namespace retirement are durable
@@ -777,7 +790,10 @@ loss or `unknown` keeps retrying with `outcome_unknown` attention. Only a durabl
 `aborted` lets Pool create one NEW effect (new effect ID, same event, payload
 and scope) that is frozen again under the normal rules; the original stays
 aborted and is never retargeted, so at most one live effect exists per event.
-The link is kept in `managed_delivery_liveness` (schema v15).
+The `aborted` result and the successor (with its `managed_delivery_liveness`
+link, schema v15) commit in one transaction: a crash cannot separate them, and
+a successor refused for outbox capacity rolls the result back, keeping the
+original fenced `abort_pending` until a later same-key abort succeeds.
 Removal or replacement before freezing makes an ordinary seed not delivered.
 A final notice is the exception: it may be frozen for the exact removed
 membership's previously bound lineage, with a fresh Run receipt and a same-lineage

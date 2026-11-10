@@ -414,9 +414,7 @@ impl Store {
     pub(crate) fn egress_begin_liveness_abort(&mut self, id: &str) -> Result<(), Fault> {
         crate::managed_egress::begin_liveness_abort(&mut self.db, id)
     }
-    pub(crate) fn egress_liveness_aborting(&self, id: &str) -> Result<bool, Fault> {
-        crate::managed_egress::liveness_aborting(&self.db, id)
-    }
+    #[cfg(test)]
     pub(crate) fn egress_republish(&mut self, id: &str) -> Result<Option<String>, Fault> {
         crate::managed_egress::republish(&mut self.db, id)
     }

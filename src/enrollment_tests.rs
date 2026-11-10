@@ -59,6 +59,7 @@ struct RunState {
     aborts: usize,
     current_calls: usize,
     status_calls: usize,
+    enabled_calls: usize,
     lose_submit_ack: bool,
     refuse_submit: Option<(&'static str, &'static str)>,
     lose_current_ack: bool,
@@ -262,7 +263,11 @@ impl Client for SyntheticRun {
         self.state().switch
     }
     fn enabled(&self) -> Response<'_, ()> {
-        let enabled = self.state().capability;
+        let enabled = {
+            let mut state = self.state();
+            state.enabled_calls += 1;
+            state.capability
+        };
         Box::pin(async move {
             if enabled {
                 Ok(())
@@ -1303,7 +1308,7 @@ async fn p3_single_enrollment() {
     );
     // A completed enrollment needs no further Run I/O.
     let calls = h.run.state().current_calls;
-    assert!(h.db(|db| journal::pending(db).unwrap()).is_empty());
+    assert!(h.db(|db| journal::pending(db, 0, 64).unwrap()).is_empty());
     h.drive(&id).await;
     assert_eq!(h.run.state().current_calls, calls);
 }
@@ -1399,6 +1404,148 @@ async fn p3_batch_enrollment() {
     assert!(view.jobs[1].pin_id.is_some(), "pins are retained");
     assert!(!h.member(&members[1]).1);
     assert_eq!(h.run.state().admissions, 2);
+}
+
+/// Resolving the unbound remainder of a mixed batch keeps an already bound,
+/// not yet joined sibling joinable: eligibility is the job's own fact.
+#[tokio::test]
+async fn p3_resolve_keeps_bound_sibling_joinable() {
+    let mut h = Harness::new();
+    let (batch, members) = h.batch(2).unwrap();
+    h.drive(&batch).await;
+    h.qualify(&members[0]);
+    h.run.state().failed.insert(members[1].clone());
+    h.drive(&batch).await;
+    let view = h.view(&batch);
+    assert_eq!(view.jobs[0].state, "bound_pending_join");
+    assert_eq!(view.jobs[1].state, "admitted");
+    assert_eq!(view.jobs[1].attention.as_deref(), Some("execution_failed"));
+    let Reply::Receipt(resolved) = h.resolve(&batch, view.revision).unwrap() else {
+        panic!("resolve");
+    };
+    assert_eq!(resolved.created_ids, vec![members[1].clone()]);
+    let view = h.view(&batch);
+    assert_eq!(view.state, "resolved");
+    assert_eq!(view.jobs[0].state, "bound_pending_join");
+    assert_eq!(view.jobs[0].binding_generation, Some(1));
+    assert_eq!(view.jobs[1].state, "unassigned");
+    assert!(
+        h.member(&members[0]).1,
+        "the bound member stays on the roster"
+    );
+    assert!(!h.member(&members[1]).1);
+    // Durable across a restart; the bound sibling joins against the current revision.
+    h.restart();
+    let revision = h.revision();
+    h.join(&members[0], revision).unwrap();
+    assert_eq!(h.member(&members[0]).0.member.state, MemberState::Active);
+    let view = h.view(&batch);
+    assert_eq!(view.state, "resolved");
+    assert_eq!(view.jobs[0].state, "active");
+    assert_eq!(view.jobs[1].state, "unassigned");
+    // The resolved, unassigned sibling never gains a binding or a join.
+    h.drive(&batch).await;
+    assert!(h.managed_binding(&members[1]).is_none());
+    assert_eq!(h.run.state().admissions, 1);
+}
+
+/// More than one keyset page of pending enrollments: the rotating cursor and the
+/// per-pass Run budget let the 65th and later enrollments progress although the
+/// first 64 never qualify, every pass stays within `PASS_BUDGET`, and waiting
+/// jobs back off instead of being observed on every tick.
+#[tokio::test]
+async fn p3_reconcile_rotates_within_budget() {
+    use enrollment_dispatch::{PASS_BUDGET, Schedule};
+    let mut h = Harness::new();
+    let mut ids = Vec::new();
+    for pool in 0..4 {
+        if pool > 0 {
+            let Reply::Receipt(created) = h
+                .execute(
+                    &h.owner.clone(),
+                    &Command::Create(Create {
+                        request_key: format!("create-{pool}"),
+                        name: format!("P3-{pool}"),
+                        purpose: "Managed enrollment".into(),
+                        acceptance: None,
+                    }),
+                )
+                .unwrap()
+            else {
+                panic!("pool receipt");
+            };
+            h.pool = created.pool_id;
+        }
+        for index in 0..17 {
+            ids.push(h.start(&format!("w{pool}-{index}")));
+        }
+    }
+    assert_eq!(ids.len(), 68);
+    fn calls(h: &Harness) -> usize {
+        let state = h.run.state();
+        state.submits
+            + state.lookups
+            + state.aborts
+            + state.current_calls
+            + state.status_calls
+            + state.enabled_calls
+    }
+    async fn pass(
+        h: &Harness,
+        schedule: &mut Schedule,
+        stopped: &tokio::sync::watch::Receiver<bool>,
+        now: u64,
+    ) {
+        let before = calls(h);
+        let made = enrollment_dispatch::reconcile(&h.store, &h.run, stopped, schedule, now)
+            .await
+            .unwrap();
+        assert_eq!(calls(h) - before, made, "every Run call is metered");
+        assert!(made <= PASS_BUDGET, "pass made {made} Run calls");
+    }
+    let state_of = |h: &Harness, id: &str| h.db(|db| journal::load(db, id).unwrap().0.state);
+    let (_stop, stopped) = tokio::sync::watch::channel(false);
+    let mut schedule = Schedule::default();
+    let mut now = 0;
+    let mut passes = 0;
+    while ids[64..]
+        .iter()
+        .any(|(id, _)| state_of(&h, id) != "admitted")
+    {
+        pass(&h, &mut schedule, &stopped, now).await;
+        now += 5;
+        passes += 1;
+        assert!(
+            passes <= 4,
+            "the 65th+ enrollment progresses within a rotation"
+        );
+    }
+    assert!(ids.iter().all(|(id, _)| state_of(&h, id) == "admitted"));
+    assert_eq!(h.run.state().admissions, 68, "one Run admission per key");
+    // Nobody qualifies: every job keeps waiting and backs off exponentially,
+    // so 100 s of 5 s ticks observe each job only a handful of times.
+    let observed = h.run.state().current_calls;
+    for _ in 0..20 {
+        pass(&h, &mut schedule, &stopped, now).await;
+        now += 5;
+    }
+    let per_job = (h.run.state().current_calls - observed) / ids.len();
+    assert!(per_job <= 6, "{per_job} observations per waiting job");
+    assert!(
+        schedule.due_at(&ids[0].0, Some(0)).is_some(),
+        "a waiting job keeps its backoff"
+    );
+    // Progress clears the backoff: a qualified job binds on its next due turn.
+    h.qualify(&ids[67].1);
+    for _ in 0..80 {
+        if h.managed_binding(&ids[67].1).is_some() {
+            break;
+        }
+        pass(&h, &mut schedule, &stopped, now).await;
+        now += 5;
+    }
+    assert!(h.managed_binding(&ids[67].1).is_some());
+    assert!(schedule.due_at(&ids[67].0, Some(0)).is_none());
 }
 
 #[tokio::test]
@@ -1650,13 +1797,77 @@ async fn p3_rootless_first_hook() {
     assert_eq!(h.first_hook(foreign).err(), Some(Fault::Forbidden));
 }
 
+/// ACK loss before the first hook: the early hook is a retryable not_ready
+/// across a Pool restart, binds generation 1 once the original-key lookup
+/// journals the admission, and never causes a second Run start. Manual or
+/// foreign roots stay refused.
+#[tokio::test]
+async fn p3_early_hook_after_ack_loss() {
+    let mut h = Harness::new();
+    let (id, member) = h.start("early");
+    h.run.state().lose_submit_ack = true;
+    h.drive(&id).await;
+    assert_eq!(h.view(&id).state, "submit_possible");
+    assert_eq!(
+        h.first_hook(h.ingress_for(&member, "early-1")).err(),
+        Some(Fault::Unavailable)
+    );
+    assert!(h.managed_binding(&member).is_none());
+    assert_eq!(h.count("SELECT count(*) FROM managed_rebinds"), 0);
+    h.restart();
+    assert_eq!(
+        h.first_hook(h.ingress_for(&member, "early-2")).err(),
+        Some(Fault::Unavailable)
+    );
+    h.drive(&id).await;
+    assert_eq!(h.view(&id).state, "admitted");
+    assert_eq!(
+        h.run.state().admissions,
+        1,
+        "recovery used the original key"
+    );
+    let binding = h.first_hook(h.ingress_for(&member, "early-3")).unwrap();
+    assert_eq!(binding.binding_generation, 1);
+    assert_eq!(binding.member_id, member);
+    // With no submitted-but-unjournaled key left, an unknown root is refused.
+    let mut foreign = h.ingress_for(&member, "foreign");
+    let other = agent(8192);
+    foreign.lineage_root_id = other.clone();
+    foreign.bound_execution_id = other.clone();
+    foreign.attempt.lineage_root_id = other.clone();
+    foreign.attempt.execution_id = other.clone();
+    foreign.actor.native_id = "foreign".into();
+    foreign.actor.address = "host/codex/store/foreign".into();
+    foreign.successor_proof = SuccessorProof {
+        lineage_root_id: other.clone(),
+        bound_execution_id: other.clone(),
+        current_execution_id: other.clone(),
+        chain: vec![SuccessorLink {
+            execution_id: other,
+            parent_execution_id: None,
+            sequence: 1,
+        }],
+    };
+    assert_eq!(h.first_hook(foreign).err(), Some(Fault::Forbidden));
+}
+
 #[tokio::test]
 async fn p3_join_not_delivery() {
     let mut h = Harness::new();
     let (id, member) = h.start("join");
-    // Early: no admission and no binding, so neither read nor join can resolve.
+    // Early: Run admitted the root but its ACK was lost, so Pool has neither the
+    // admission nor a binding. The authorized first hook is a retryable
+    // not_ready (§4), not a refusal; a join cannot resolve without a binding.
+    h.run.state().lose_submit_ack = true;
+    h.drive(&id).await;
+    assert_eq!(h.view(&id).state, "submit_possible");
+    assert_eq!(
+        h.first_hook(h.ingress_for(&member, "early")).err(),
+        Some(Fault::Unavailable)
+    );
     assert_eq!(h.join(&member, h.revision()).err(), Some(Fault::Forbidden));
     h.drive(&id).await;
+    assert_eq!(h.view(&id).state, "admitted");
     h.qualify(&member);
     h.drive(&id).await;
     // Stale revision: a new owner change after binding makes the join stale.
