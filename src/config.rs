@@ -199,13 +199,10 @@ impl Config {
             }
             if transport.frontend_enabled
                 && (config.managed_run_reader.is_none()
-                    || transport.mcp_server.as_ref().is_none_or(|server| {
-                        server.is_empty()
-                            || server.len() > 128
-                            || !server
-                                .bytes()
-                                .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
-                    }))
+                    || transport
+                        .mcp_server
+                        .as_deref()
+                        .is_none_or(|server| !crate::managed_bridge::valid_managed_server(server)))
             {
                 return Err(Fault::Invalid);
             }
@@ -720,6 +717,42 @@ producer = "fixture"
         ] {
             fs::write(&path, format!("{base}\n{refused}\n{reader}"))?;
             assert!(matches!(Config::load(&path), Err(Fault::Invalid)));
+        }
+        // E16: a server whose Codex segment would be trimmed, ambiguous or overlong is refused.
+        if cfg!(target_os = "linux") {
+            let named = |server: &str| {
+                enabled.replace(
+                    "mcp_server = \"pool\"",
+                    &format!("mcp_server = \"{server}\""),
+                )
+            };
+            fs::write(&path, format!("{base}\n{}\n{reader}", named("agent-pool")))?;
+            assert!(Config::load(&path)?.managed_run_transport.is_some());
+            let overlong = "p".repeat(128 - "mcp____".len() - "pool_cancel_replacement".len() + 1);
+            for refused in [
+                "",
+                "-pool",
+                "pool-",
+                "_pool",
+                "pool_",
+                "a__b",
+                "a-_b",
+                "a--b",
+                "a.b",
+                "a b",
+                overlong.as_str(),
+            ] {
+                fs::write(&path, format!("{base}\n{}\n{reader}", named(refused)))?;
+                assert!(
+                    matches!(Config::load(&path), Err(Fault::Invalid)),
+                    "{refused}"
+                );
+            }
+            fs::write(
+                &path,
+                format!("{base}\n{}\n{reader}", named(&overlong[1..])),
+            )?;
+            assert!(Config::load(&path)?.managed_run_transport.is_some());
         }
         fs::write(
             &path,

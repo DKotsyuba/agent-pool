@@ -329,6 +329,67 @@ pub(crate) fn abort_original(
     }
     Ok(result)
 }
+/// Longest native tool name Codex presents without a hashed substitute.
+const MAX_CODEX_TOOL_NAME_BYTES: usize = 128;
+/// Codex's MCP name segment: every character outside `[A-Za-z0-9_]` becomes `_`.
+fn codex_segment(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+/// A segment Codex joins without trimming, prefix elision or ambiguity.
+fn plain_codex_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && !segment.starts_with('_')
+        && !segment.ends_with('_')
+        && !segment.contains("__")
+}
+/// A command Codex presents verbatim: a segment fixed point not trimmed by the hook join.
+fn plain_codex_command(command: &str) -> bool {
+    !command.is_empty() && !command.starts_with('_') && codex_segment(command) == command
+}
+/// The exact native tool name the attested harness presents for the configured server and
+/// command (E16), or `None` when that harness has no unambiguous managed name.
+///
+/// Claude presents the raw server. Codex presents `mcp__` + seg(server) + `__` + command and
+/// substitutes a hash for colliding or overlong names, so only plain segments and fixed-point
+/// commands map to a name. Any other harness is refused rather than guessed.
+pub(crate) fn managed_tool_name(harness: &str, server: &str, command: &str) -> Option<String> {
+    match harness {
+        "claude-code" => Some(format!("mcp__{server}__{command}")),
+        "codex" => {
+            let segment = codex_segment(server);
+            let name = format!("mcp__{segment}__{command}");
+            (plain_codex_segment(&segment)
+                && plain_codex_command(command)
+                && name.len() <= MAX_CODEX_TOOL_NAME_BYTES)
+                .then_some(name)
+        }
+        _ => None,
+    }
+}
+/// A configured server Bridge can map without ambiguity: every Pool tool has an exact managed
+/// name for both served harnesses.
+pub(crate) fn valid_managed_server(server: &str) -> bool {
+    !server.is_empty()
+        && server.len() <= 128
+        && server
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+        && !server.contains("__")
+        && crate::tools::definitions().iter().all(|tool| {
+            tool.get("name")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|name| managed_tool_name("codex", server, name))
+                .is_some()
+        })
+}
 /// Refuse any consumed association that does not exactly match the frozen invocation.
 pub(crate) fn validate_consume(
     consumed: &Consumed,
@@ -339,13 +400,19 @@ pub(crate) fn validate_consume(
 ) -> Result<(), BridgeFailure> {
     let name = command_name(command).map_err(|_| BridgeFailure::Refused)?;
     let receipt = &consumed.receipt;
-    let address_valid =
+    let address =
         bridge_sdk::bridge_protocol::NativeAddress::parse(&receipt.observation.actor.address)
-            .is_ok_and(|address| {
+            .ok()
+            .filter(|address| {
                 address.canonical() == receipt.observation.actor.address
                     && address.host == receipt.observation.incarnation.host_id
                     && address.session == receipt.observation.actor.native_id
             });
+    // The harness comes only from Bridge's attested actor address, which Run's binding also
+    // fixes; the caller's native metadata never selects the naming rule.
+    let tool_name = address
+        .as_ref()
+        .and_then(|address| managed_tool_name(address.harness.as_str(), server, &name));
     if !canonical_uuid(key.expected_store_id)
         || !valid_digest(key.security_digest)
         || consumed.store_id != key.expected_store_id
@@ -356,9 +423,9 @@ pub(crate) fn validate_consume(
         || receipt.invocation_key != key.invocation_key
         || receipt.security_digest != key.security_digest
         || receipt.issuer_epoch != expected_epoch
-        || receipt.observation.tool_name != format!("mcp__{server}__{name}")
+        || tool_name.as_deref() != Some(receipt.observation.tool_name.as_str())
         || receipt.observation.actor.role != "root"
-        || !address_valid
+        || address.is_none()
         || receipt.observation.actor.native_id.is_empty()
         || receipt.observation.actor.epoch == 0
         || receipt.observation.incarnation.pid <= 1
@@ -543,6 +610,136 @@ mod tests {
             ),
             Err(BridgeFailure::Refused)
         ));
+    }
+    /// E16: the attested address's harness selects the one exact presented name.
+    #[test]
+    fn codex_tool_name_is_normalized_and_claude_stays_raw() {
+        let command = Command::Join(Change {
+            pool_id: "pool".into(),
+            expected_revision: 1,
+            request_key: "key".into(),
+        });
+        let digest = "a".repeat(64);
+        let key = ConsumeKey {
+            abort_request_id: "abort-1",
+            expected_store_id: BRIDGE_ID,
+            producer: "pool",
+            consume_request_id: "consume",
+            invocation_key: "inv",
+            security_digest: &digest,
+            audience: "audience",
+        };
+        let consumed = |harness: &str, tool: &str| Consumed {
+            store_id: BRIDGE_ID.into(),
+            validity: Validity::Current,
+            aborted: false,
+            receipt: ConsumeReceipt {
+                producer: "pool".into(),
+                consume_request_id: "consume".into(),
+                invocation_key: "inv".into(),
+                security_digest: digest.clone(),
+                issuer_epoch: "epoch".into(),
+                consumed_at_ms: 1,
+                observation: Observation {
+                    incarnation: Incarnation {
+                        host_id: "host".into(),
+                        boot_id: "00000000-0000-4000-8000-000000000002".into(),
+                        pid_namespace_inode: 1,
+                        uid: 1,
+                        pid: 2,
+                        start_ticks: 1,
+                    },
+                    launch_id: "00000000-0000-4000-8000-000000000003".into(),
+                    actor: ManagedActor {
+                        address: format!("host/{harness}/store/session"),
+                        role: "root".into(),
+                        native_id: "session".into(),
+                        epoch: 1,
+                    },
+                    native_call_id: "call".into(),
+                    tool_name: tool.into(),
+                    observed_at_ms: 1,
+                    expires_at_ms: 2,
+                },
+            },
+        };
+        let check = |harness: &str, server: &str, tool: &str| {
+            validate_consume(&consumed(harness, tool), &key, server, &command, "epoch")
+        };
+        let normalized = "mcp__agent_pool__pool_join";
+        let raw = "mcp__agent-pool__pool_join";
+        assert!(check("codex", "agent-pool", normalized).is_ok());
+        assert!(check("claude-code", "agent-pool", raw).is_ok());
+        // Harness mismatch between the attested address and the presented name.
+        assert_eq!(
+            check("codex", "agent-pool", raw),
+            Err(BridgeFailure::Refused)
+        );
+        assert_eq!(
+            check("claude-code", "agent-pool", normalized),
+            Err(BridgeFailure::Refused)
+        );
+        // Unserved harnesses never borrow either rule.
+        for harness in ["opencode", "gemini", "codex-cli"] {
+            for tool in [normalized, raw] {
+                assert_eq!(
+                    check(harness, "agent-pool", tool),
+                    Err(BridgeFailure::Refused)
+                );
+            }
+        }
+        // Hashed substitutes, hook-join trims and near variants are not the exact name.
+        let sha1 = "0f6a3c2b9d8e7f1a2b3c4d5e6f708192a3b4c5d6";
+        for tool in [
+            format!("mcp__{sha1}"),
+            format!("mcp__agent_pool__{sha1}"),
+            format!("mcp__agent_pool_{sha1}__pool_join"),
+            format!("mcp__agent_pool__pool_join_{sha1}"),
+            "mcp__agent_pool_pool_join".into(),
+            "mcp_agent_pool__pool_join".into(),
+            "agent_pool__pool_join".into(),
+            "mcp__agent_pool__pool_join ".into(),
+            " mcp__agent_pool__pool_join".into(),
+            "mcp__agent_pool__Pool_join".into(),
+            "mcp__agent_pool__pool_vote".into(),
+            "mcp__agent_pool___pool_join".into(),
+        ] {
+            assert_eq!(
+                check("codex", "agent-pool", &tool),
+                Err(BridgeFailure::Refused),
+                "{tool}"
+            );
+        }
+        // Servers whose Codex segment is trimmed or ambiguous have no Codex name at all,
+        // including the trimmed form Codex would actually present.
+        for server in [
+            "-agent-pool",
+            "agent-pool-",
+            "agent--pool",
+            "agent_-pool",
+            "",
+            "_",
+        ] {
+            assert!(managed_tool_name("codex", server, "pool_join").is_none());
+            assert!(!valid_managed_server(server));
+            assert_eq!(
+                check("codex", server, normalized),
+                Err(BridgeFailure::Refused)
+            );
+        }
+        // Commands must be fixed points that the hook join does not trim.
+        assert!(managed_tool_name("codex", "pool", "pool-join").is_none());
+        assert!(managed_tool_name("codex", "pool", "_pool_join").is_none());
+        assert!(managed_tool_name("codex", "pool", "").is_none());
+        // Names over 128 bytes get a hashed substitute, so they are refused.
+        let long = "c".repeat(128 - "mcp__pool__".len());
+        assert_eq!(
+            managed_tool_name("codex", "pool", &long).map(|name| name.len()),
+            Some(128)
+        );
+        assert!(managed_tool_name("codex", "pool", &format!("{long}c")).is_none());
+        assert!(valid_managed_server("pool") && valid_managed_server("agent-pool"));
+        assert!(!valid_managed_server("a__b") && !valid_managed_server("a.b"));
     }
     #[test]
     fn relaunch_required_is_typed_only_with_no_automatic_recovery() {

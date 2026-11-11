@@ -555,10 +555,17 @@ restarts the resident itself.
 The explicit opt-in is safe only because Run issues a current receipt after the
 exact launch has a durable managed-role qualification. A missing or unqualified
 role returns `attempt_not_ready` or `role_unqualified`; Pool refuses the call
-before participant reads, domain-key reservation or effects. Both Codex and Claude
-use Bridge B1's configured `mcp__{server}__{command_name}` hook convention;
-Bridge verifies the exact mapping and Pool checks the same association. Installed
-provider hook behavior remains subject to separate dobi qualification.
+before participant reads, domain-key reservation or effects. The consumed
+observation's `tool_name` must be the exact name the attested harness presents
+(errata E16), with the harness taken only from Bridge's attested actor address:
+Claude uses the raw `mcp__{server}__{command_name}`; Codex uses
+`mcp__{seg(server)}__{command_name}`, where seg maps every character outside
+`[A-Za-z0-9_]` to `_`; any other harness is refused. Pool refuses an
+`mcp_server` whose segment is empty, starts or ends with `_` or contains `__`,
+or that makes any Codex tool name longer than 128 bytes, because Codex would
+trim it or substitute a hash. Bridge verifies the same mapping and Pool checks
+the same association. Installed provider hook behavior remains subject to
+separate dobi qualification.
 
 For a managed call the frontend prepares the original B1 context. The resident
 persists the pinned routes and original key, then asks Run for rootless ingress

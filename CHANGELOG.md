@@ -39,6 +39,16 @@ managed enrollment and conditioned replacement, paired with Agent Bridge v0.7.0.
 
 ### Fixed
 
+- Managed Codex calls are no longer refused as `unauthorized` (errata E16).
+  codex-cli 0.167.0 presents MCP tools as `mcp__{seg(server)}__{tool}`, where
+  seg maps every character outside `[A-Za-z0-9_]` to `_`. Pool now checks the
+  consumed `tool_name` against the exact name the attested harness presents,
+  using the same rule as Bridge 0.7.1. The harness comes only from Bridge's
+  attested actor address. Claude keeps the raw `mcp__{server}__{tool}`, Codex
+  must match the normalized name exactly, and any other harness is refused.
+  `managed_run_transport.mcp_server` is refused when its Codex segment is
+  empty, starts or ends with `_`, or contains `__`, or when any Codex tool name
+  would exceed 128 bytes.
 - `agent-pool repin` accepts a moved Bridge `server_executable` and Run
   `executable` (for example a versioned Bridge 0.7.1 install path) with their
   new SHA-256, instead of failing with `Conflict`. Before it commits, it proves
