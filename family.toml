@@ -6,7 +6,7 @@ standard_version = "1.0.0-rc.2"
 response_profile = "rust-minijinja-v1"
 devkit_version = "0.2.0"
 baseline = "rust-macos-2026-09-candidate1"
-qualification = "not_verified"
+qualification = "verified"
 
 [profiles]
 process = "resident"
@@ -17,11 +17,11 @@ host_adapter = false
 [compatibility]
 supported_protocol_revisions = ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28"]
 candidate_targets = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
-qualified_targets = []
-qualified_hosts = []
+qualified_targets = ["x86_64-unknown-linux-gnu"]
+qualified_hosts = ["dobi"]
 
 [release]
-enabled = false
+enabled = true
 workflow = "release.yml"
 delivery_profile = "single-binary-v1"
 trust_profile = "github-authenticated"

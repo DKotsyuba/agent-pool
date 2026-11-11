@@ -4,9 +4,32 @@
 
 ## 0.1.0
 
-First release, 2026-11-10. Attempt-bound managed ingress and egress with
+First release, 2026-11-11. Attempt-bound managed ingress and egress with
 operator re-pin, E11 namespace retirement, formal Pool completion, and P3
-managed enrollment and conditioned replacement, paired with Agent Bridge v0.7.0.
+managed enrollment and conditioned replacement, qualified on Linux x86-64 with
+Agent Bridge 0.7.1 and Agent Run 0.31.0 RC.
+
+### Qualification
+
+`x86_64-unknown-linux-gnu` is release-qualified on the host `dobi`; this release
+ships that target only. `aarch64-apple-darwin` remains a candidate target and is
+not qualified or published.
+
+Host evidence: dobi, 2026-11-11, run 6c. Managed members were Claude Code 2.1.311
+with `claude-haiku-5-5` and codex-cli 0.167.0 with `gpt-6-luna`, both through
+Agent Bridge 0.7.1 and Agent Run 0.31.0 RC. Scenarios Q1–Q5 passed:
+
+- Q1 create
+- Q2 enroll and join
+- Q3 egress
+- Q4 vote and completion
+- Q5 freeze
+
+### Known limitations
+
+- Managed attempt binding requires that Run, Pool, the Bridge worker and the
+  agents all run under a single UID. On dobi that is the dedicated `agent-mcp`
+  account. Multi-UID deployments are not supported.
 
 ### Added
 
@@ -118,7 +141,7 @@ managed enrollment and conditioned replacement, paired with Agent Bridge v0.7.0.
 - Exact paged purposes up to 8192 bytes and proposal snapshots up to 65536 bytes.
 - Opt-in owner history windows with backward paging and exact 64-bit cursors.
 - Linux x86-64 candidate support in the installer and native CI, alongside
-  the existing Apple Silicon macOS candidate. Neither target is release-qualified.
+  the existing Apple Silicon macOS candidate. Only Linux x86-64 is release-qualified (see Qualification).
 - Build and verify an archived Linux x86-64 candidate in CI and retain it as a
   seven-day workflow artifact, without publishing it as a release.
 - Retain an independently verified macOS arm64 CI candidate on main and manual

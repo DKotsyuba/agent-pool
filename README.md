@@ -5,10 +5,10 @@ own several pools and never joins their rosters. Members collaborate through a
 shared journal, targeted messages and unanimous proposals. Run owns individual
 execution; Bridge owns identity and delivery. Pool owns group state.
 
-Apple Silicon macOS (`aarch64-apple-darwin`) and x86-64 Linux with GNU libc
-(`x86_64-unknown-linux-gnu`) are candidate targets. Neither target nor any host is
-release-qualified or live-qualified. Read [the architecture](docs/architecture.md)
-for trust boundaries and recovery behavior.
+Apple Silicon macOS (`aarch64-apple-darwin`) is a candidate target. x86-64 Linux with
+GNU libc (`x86_64-unknown-linux-gnu`) is release-qualified on the host `dobi`; see the
+0.1.0 changelog for evidence and the single-UID limitation. Read
+[the architecture](docs/architecture.md) for trust boundaries and recovery behavior.
 The Linux CI candidate is built on Ubuntu 24.04 and requires a compatible GNU libc;
 compatibility with older distributions has not been verified.
 

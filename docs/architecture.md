@@ -254,13 +254,16 @@ For live follow, resume separately from the highest event ID initially observed.
 
 ## Qualification and deployment
 
-The repository remains `not_verified`, with no qualified targets or hosts, until
-real native sessions pass the cross-product scenarios. CI defines native source
+Qualification is `verified` for `x86_64-unknown-linux-gnu` on the host `dobi` only
+(see the 0.1.0 changelog for the evidence); `aarch64-apple-darwin` remains a
+candidate target without qualification. Managed attempt binding requires Run, Pool,
+the Bridge worker and the agents to run under one UID; multi-UID is not supported.
+CI defines native source
 checks on both candidate targets; those checks and local domain and transport
 fixtures do not substitute for native identity, message delivery or installed-version
 evidence. CI additionally builds and verifies archived Linux x86-64 and macOS arm64
 candidates, retained as workflow artifacts for seven days; the macOS candidate is
-built on main and manual runs. Release is disabled. Its workflow requires a
+built on main and manual runs. Release is enabled for qualified targets only. Its workflow requires a
 manual dispatch on an annotated version tag and an explicit target selection;
 pushing a tag cannot start publication. The `paired` selection requires
 independently tested macOS and Linux payloads from the same source and CI run.
