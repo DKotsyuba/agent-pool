@@ -1670,6 +1670,7 @@ fn validate_lookup(result: Lookup, intent_id: &str, digest: &str) -> Result<Look
 )]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use crate::managed_state::ManagedActor;
     #[cfg(target_os = "linux")]
     use std::os::unix::fs::{MetadataExt, PermissionsExt};

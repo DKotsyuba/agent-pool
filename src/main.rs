@@ -1,6 +1,6 @@
 //! Rust MCP application; protocol, presentation and deployment have separate boundaries.
 /// Serializes fixtures that repeatedly hash the large debug test executable.
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 static TEST_EXEC_HASH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 mod completion;
