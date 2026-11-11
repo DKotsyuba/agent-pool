@@ -37,6 +37,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
+autotests = false
 
 [dependencies]
 chrono.workspace = true
@@ -76,6 +77,26 @@ unimplemented = "deny"
 
 [lints]
 workspace = true
+
+# All integration tests build into one binary; see tests/it/main.rs.
+[[test]]
+name = "it"
+path = "tests/it/main.rs"
+
+# Backtraces keep file/line; dependencies carry no debug info. This keeps test
+# binaries small and links fast. Use `--profile debugging` for full debug info.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.debugging]
+inherits = "dev"
+debug = true
+
+[profile.debugging.package."*"]
+debug = true
 
 [profile.release]
 lto = "thin"

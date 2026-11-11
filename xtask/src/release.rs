@@ -442,7 +442,8 @@ fn prepare(project: &Project, version: &str, apply: bool) -> Result<()> {
     );
     Ok(())
 }
-/// Selects exactly one Cargo-built protocol test executable from machine-readable output.
+/// Selects exactly one Cargo-built integration-test executable (`it`, which hosts the
+/// protocol suite) from machine-readable output.
 fn protocol_executable(output: &[u8], source: &Path) -> Result<PathBuf> {
     let mut result = None;
     for line in output
@@ -452,7 +453,7 @@ fn protocol_executable(output: &[u8], source: &Path) -> Result<PathBuf> {
         let value: Value = serde_json::from_slice(line)?;
         let target = &value["target"];
         if value["reason"] != "compiler-artifact"
-            || target["name"] != "protocol"
+            || target["name"] != "it"
             || target["src_path"].as_str().map(Path::new) != Some(source)
             || !target["kind"]
                 .as_array()
@@ -604,13 +605,13 @@ fn publish(
             "-p",
             &project.name,
             "--test",
-            "protocol",
+            "it",
             "--no-run",
             "--message-format=json",
         ],
         600,
     )?;
-    let protocol = protocol_executable(&test_output, &project.root.join("tests/protocol.rs"))?;
+    let protocol = protocol_executable(&test_output, &project.root.join("tests/it/main.rs"))?;
     let protocol_digest = family_delivery::digest(&protocol)?;
     if !helper(&project.root, "cargo")
         .args(["deny", "--locked", "check"])
@@ -647,6 +648,7 @@ fn publish(
     }
     let protocol_str = protocol.to_str().ok_or("non-UTF8 protocol test path")?;
     if !helper(&project.root, protocol_str)
+        .arg("protocol::")
         .env("MCP_TEST_BINARY", &binary)
         .status()?
         .success()
@@ -1187,10 +1189,10 @@ mod tests {
     /// Only one exact Cargo protocol-test artifact can be selected for native acceptance.
     #[test]
     fn selects_exact_protocol_test_artifact() {
-        let source = Path::new("/fixture/tests/protocol.rs");
+        let source = Path::new("/fixture/tests/it/main.rs");
         let artifact = json!({
             "reason":"compiler-artifact",
-            "target":{"name":"protocol","src_path":"/fixture/tests/protocol.rs","kind":["test"]},
+            "target":{"name":"it","src_path":"/fixture/tests/it/main.rs","kind":["test"]},
             "profile":{"test":true},"executable":"/fixture/target/protocol-test"
         });
         let bytes = serde_json::to_vec(&artifact).unwrap();

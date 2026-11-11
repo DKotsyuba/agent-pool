@@ -7855,7 +7855,11 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
         let uid = fs::metadata(&path)?.uid();
         let original = std::env::current_exe()?;
-        let other_path = directory.path().join("other-pool");
+        // Same bytes and inode under another path. The link lives beside the
+        // original so it stays on one filesystem even when TMPDIR is tmpfs.
+        let link_directory =
+            tempfile::tempdir_in(original.parent().ok_or("executable has no directory")?)?;
+        let other_path = link_directory.path().join("other-pool");
         fs::hard_link(&original, &other_path)?;
         for (executable, reject) in [(&original, false), (&other_path, true)] {
             let mut child = tokio::process::Command::new(executable)

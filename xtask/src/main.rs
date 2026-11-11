@@ -179,6 +179,69 @@ pub(crate) fn text(root: &Path, program: &str, args: &[&str]) -> Result<String> 
         .trim()
         .to_owned())
 }
+/// Private directory for test temporaries on tmpfs (`/dev/shm`), so
+/// filesystem-heavy tests avoid slow disk sync. Without tmpfs (for example on
+/// macOS) tests keep the inherited `TMPDIR`. The directory is removed on drop.
+struct TestScratch(Option<PathBuf>);
+
+impl TestScratch {
+    /// Creates a fresh `0700` directory, or none when tmpfs is unavailable.
+    fn create() -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            let dir = Path::new("/dev/shm").join(format!("xtask-{}", std::process::id()));
+            if fs::DirBuilder::new().mode(0o700).create(&dir).is_ok() {
+                return Self(Some(dir));
+            }
+        }
+        Self(None)
+    }
+
+    /// Runs `cargo <args>` with `TMPDIR`, `TMP` and `TEMP` set to the directory.
+    fn cargo(&self, root: &Path, args: &[&str]) -> Result<()> {
+        eprintln!("xtask: cargo {}", args.join(" "));
+        let mut command = helper(root, "cargo");
+        command.args(args);
+        if let Some(dir) = &self.0 {
+            for name in ["TMPDIR", "TMP", "TEMP"] {
+                command.env(name, dir);
+            }
+        }
+        if !command.status()?.success() {
+            return Err("cargo failed".into());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for TestScratch {
+    fn drop(&mut self) {
+        if let Some(dir) = &self.0 {
+            owner_writable(dir);
+            // Best effort: a leftover only costs tmpfs space until reboot.
+            drop(fs::remove_dir_all(dir));
+        }
+    }
+}
+
+/// Restores owner access on directories so read-only trees left by tests
+/// do not block removal.
+fn owner_writable(dir: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        drop(fs::set_permissions(dir, fs::Permissions::from_mode(0o700)));
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    owner_writable(&entry.path());
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn run(root: &Path, program: &str, args: &[&str]) -> Result<()> {
     eprintln!("xtask: {program} {}", args.join(" "));
     if !helper(root, program).args(args).status()?.success() {
@@ -391,11 +454,34 @@ impl Project {
                 "-D",
                 "warnings",
             ],
-            vec!["test", "--frozen", "--workspace"],
-            vec!["test", "--frozen", "--workspace", "--all-features"],
         ] {
             if self.has_features || args.contains(&"--all-features") {
                 run(&self.root, "cargo", &args)?;
+            }
+        }
+        // nextest runs each test in its own process; doctests need cargo's runner.
+        let scratch = TestScratch::create();
+        for args in [
+            vec![
+                "nextest",
+                "run",
+                "--frozen",
+                "--workspace",
+                "--no-fail-fast",
+            ],
+            vec![
+                "nextest",
+                "run",
+                "--frozen",
+                "--workspace",
+                "--all-features",
+                "--no-fail-fast",
+            ],
+            vec!["test", "--frozen", "--workspace", "--doc"],
+            vec!["test", "--frozen", "--workspace", "--all-features", "--doc"],
+        ] {
+            if self.has_features || args.contains(&"--all-features") {
+                scratch.cargo(&self.root, &args)?;
             }
         }
         if !helper(&self.root, "cargo")
@@ -650,7 +736,8 @@ fn main_result() -> Result<()> {
                     "-p",
                     &project.name,
                     "--test",
-                    "protocol",
+                    "it",
+                    "protocol::",
                 ],
             ),
             _ => Err("unknown test suite".into()),

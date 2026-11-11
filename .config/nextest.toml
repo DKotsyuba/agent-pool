@@ -1,0 +1,27 @@
+# nextest settings for `cargo xtask check`. Doctests run separately via `cargo test --doc`.
+[profile.default]
+# Report every failing test in one run instead of stopping at the first one.
+fail-fast = false
+# Mark tests slower than 60 s; terminate a test after 10 periods (10 minutes).
+slow-timeout = { period = "60s", terminate-after = 10 }
+
+# nextest runs every test in its own process, so the in-process
+# `TEST_EXEC_HASH_LOCK` no longer serializes these tests. Every test that takes
+# that lock must be listed here to keep them one at a time.
+[test-groups]
+exec-hash = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = """
+test(=managed_run::tests::namespace_retirement_wire_replays_keys_and_rejects_mismatched_receipt)
+| test(=managed_run::tests::egress_actor_recovery_wire_is_opted_in_and_correlated)
+| test(=managed_run::tests::pinned_run_wire_rejects_mismatch_before_authority)
+| test(=managed_run::tests::rootless_ingress_egress_and_admission_recovery_use_pinned_wire)
+| test(=managed_run::tests::p3_enrollment_wire_exact_keys_and_typed_errors)
+| test(=managed_egress::tests::sdk_decoded_attempt_mismatch_known_unsent_is_not_delivered)
+| test(=runtime::tests::repin_cli_authenticates_both_candidates_before_commit)
+| test(=runtime::tests::managed_run_reader_is_build_and_namespace_fenced)
+| test(=runtime::tests::managed_session_peer_requires_same_loaded_build)
+| test(=runtime::tests::consensus_superseded_rebinds_before_rejecting_old_vote)
+"""
+test-group = "exec-hash"

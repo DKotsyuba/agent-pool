@@ -59,6 +59,11 @@ jobs:
           cache-bin: false
           save-if: false
       - run: cargo fetch --locked
+      - name: Install cargo-nextest 0.9.149 from the checksum-verified release archive
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/nextest.tar.gz" https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.149/cargo-nextest-0.9.149-universal-apple-darwin.tar.gz
+          echo "47b9941765a9ff94e304a3fe5444ac1c7593da655525b8b69f8f2b31a9217507  $RUNNER_TEMP/nextest.tar.gz" | shasum -a 256 -c -
+          tar -xzf "$RUNNER_TEMP/nextest.tar.gz" -C "$HOME/.cargo/bin"
       - run: cargo xtask check
   # Build independently of the source gate; publication requires both to pass.
   build:
@@ -115,6 +120,11 @@ jobs:
           cache-bin: false
           save-if: false
       - run: cargo fetch --locked
+      - name: Install cargo-nextest 0.9.149 from the checksum-verified release archive
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/nextest.tar.gz" https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.149/cargo-nextest-0.9.149-x86_64-unknown-linux-gnu.tar.gz
+          echo "32d1d8c0567b7a80bee2bad8bb09125c846da96bc009b2de11ec08557290c770  $RUNNER_TEMP/nextest.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/nextest.tar.gz" -C "$HOME/.cargo/bin"
       - run: cargo xtask check
   build-linux:
     needs: validate
@@ -147,8 +157,8 @@ jobs:
           clean=(env -u GH_TOKEN -u GITHUB_TOKEN -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN -u ACTIONS_RUNTIME_TOKEN -u ACTIONS_ID_TOKEN_REQUEST_TOKEN -u GITHUB_OUTPUT -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_STATE -u GITHUB_STEP_SUMMARY)
           rustc -vV | grep -Fx 'host: x86_64-unknown-linux-gnu'
           "${clean[@]}" cargo xtask package --out "$RUNNER_TEMP/linux-payload"
-          "${clean[@]}" cargo test --frozen --package agent-pool --test protocol --no-run --message-format=json > "$RUNNER_TEMP/protocol-artifacts.json"
-          protocol=$(jq -ser --arg source "$GITHUB_WORKSPACE/tests/protocol.rs" '[.[] | select(.reason == "compiler-artifact" and .target.name == "protocol" and .target.src_path == $source and .profile.test == true and (.target.kind | index("test")) != null and .executable != null)] | if length == 1 then .[0].executable else error("ambiguous protocol test") end' "$RUNNER_TEMP/protocol-artifacts.json")
+          "${clean[@]}" cargo test --frozen --package agent-pool --test it --no-run --message-format=json > "$RUNNER_TEMP/protocol-artifacts.json"
+          protocol=$(jq -ser --arg source "$GITHUB_WORKSPACE/tests/it/main.rs" '[.[] | select(.reason == "compiler-artifact" and .target.name == "it" and .target.src_path == $source and .profile.test == true and (.target.kind | index("test")) != null and .executable != null)] | if length == 1 then .[0].executable else error("ambiguous protocol test") end' "$RUNNER_TEMP/protocol-artifacts.json")
           [[ "$protocol" == /* && "$protocol" != *$'\n'* && -x "$protocol" ]]
           "${clean[@]}" cargo xtask package verify "$RUNNER_TEMP/linux-payload"
           dirty=$(git status --porcelain)
@@ -188,7 +198,7 @@ jobs:
           head=$(git rev-parse HEAD)
           test "$head" = "$GITHUB_SHA"
           test "$(sha256sum "$PROTOCOL_TEST" | awk '{print $1}')" = "$EXPECTED_PROTOCOL_SHA256"
-          MCP_TEST_BINARY="$binary" "${clean[@]}" "$PROTOCOL_TEST"
+          MCP_TEST_BINARY="$binary" "${clean[@]}" "$PROTOCOL_TEST" protocol::
           "${clean[@]}" cargo xtask package verify "$RUNNER_TEMP/linux-payload"
           test "$(sha256sum "$binary" | awk '{print $1}')" = "$EXPECTED_BINARY_SHA256"
           test "$(sha256sum "$manifest" | awk '{print $1}')" = "$EXPECTED_MANIFEST_SHA256"
