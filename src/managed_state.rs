@@ -277,8 +277,10 @@ pub(crate) fn persist_pool_route(
     Ok(())
 }
 
-/// Atomically replace only build and credential hashes on already-pinned routes.
-/// The caller must authenticate both candidate services before entering this transaction.
+/// Atomically replace only the executable path, build and credential hashes on already-pinned
+/// routes; routes, stores, worker UID, sockets, producer and credential file stay exact.
+/// The caller must prove both candidate executables and authenticate both candidate services
+/// before entering this transaction with `apply`.
 pub(crate) fn repin_routes(
     db: &mut Connection,
     bridge: &crate::managed_bridge::BridgePin,
@@ -286,6 +288,28 @@ pub(crate) fn repin_routes(
     pool_route: &Route,
     apply: bool,
 ) -> Result<(i64, i64), Fault> {
+    let hash_valid = |value: &str| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    let path_valid = |path: &std::path::Path| {
+        path.is_absolute()
+            && !path
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+    };
+    // A new executable path is accepted only in its structurally canonical form;
+    // the caller has already proved the file itself.
+    if !path_valid(&bridge.server_executable)
+        || !path_valid(&run.executable)
+        || !hash_valid(&bridge.server_sha256)
+        || !hash_valid(&bridge.credential_sha256)
+        || !hash_valid(&run.executable_sha256)
+    {
+        return Err(Fault::Invalid);
+    }
     let bridge_route = encoded(&bridge.route)?;
     let run_route = encoded(&run.route)?;
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -322,10 +346,16 @@ pub(crate) fn repin_routes(
     }
     let mut prior_bridge: crate::managed_bridge::BridgePin = decoded(&old_bridge)?;
     let mut prior_run: RunEndpointPin = decoded(&old_run)?;
+    // An upgrade may install the build at a new versioned path. Every other field,
+    // including both sockets, is route identity and must stay exact.
+    prior_bridge
+        .server_executable
+        .clone_from(&bridge.server_executable);
     prior_bridge.server_sha256.clone_from(&bridge.server_sha256);
     prior_bridge
         .credential_sha256
         .clone_from(&bridge.credential_sha256);
+    prior_run.executable.clone_from(&run.executable);
     prior_run
         .executable_sha256
         .clone_from(&run.executable_sha256);
@@ -3938,6 +3968,292 @@ pub(crate) mod tests {
         assert_eq!(
             repin_routes(db, &upgraded, &conflicting_route, &pool_route, true).err(),
             Some(Fault::Conflict)
+        );
+    }
+
+    /// Latest generation and pin recorded for one route kind.
+    fn latest_pin(db: &Connection, kind: &str, route: &Route) -> (i64, String) {
+        db.query_row(
+            "SELECT generation,pin FROM managed_route_pin_history WHERE kind=?1 AND route=?2 ORDER BY generation DESC LIMIT 1",
+            params![kind, encoded(route).unwrap()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    /// A versioned Bridge or Run upgrade moves the executable: repin records a new
+    /// generation for new work while the old intent stays on its frozen pins.
+    #[test]
+    fn repin_accepts_upgraded_executable_paths_and_keeps_old_intent_frozen() {
+        let (_dir, mut store, binding, incarnation, run) = fixture();
+        let db = store.test_db();
+        let pool_route = Route {
+            component_store_id: binding.pool_store_id.clone(),
+            route_id: "pool-route".into(),
+            worker_uid: binding.run_route.worker_uid,
+        };
+        let old_bridge = fake_bridge_pin(&binding);
+        let old_run = fake_run_endpoint(&binding);
+        persist_pool_route(db, &old_run, &pool_route).unwrap();
+        let digest = prepare(
+            db,
+            &run,
+            &binding,
+            &incarnation,
+            "old-context",
+            "old-intent",
+            "old-inv",
+            1,
+        );
+        assert!(matches!(
+            reserve(
+                db,
+                &run,
+                &binding,
+                &incarnation,
+                "old-context",
+                "old-inv",
+                "old-intent",
+                &command(1),
+                &digest
+            ),
+            Ok(IntentReservation::Created)
+        ));
+        let mut new_bridge = old_bridge.clone();
+        new_bridge.server_executable =
+            "/opt/agent-bridge/releases/0.7.1+b2666a5d02f8/bin/bridge-native-daemon".into();
+        new_bridge.server_sha256 = "d".repeat(64);
+        let mut new_run = old_run.clone();
+        new_run.executable = "/opt/agent-run/releases/0.2.0/bin/agent-run".into();
+        new_run.executable_sha256 = "c".repeat(64);
+        assert_eq!(
+            persist_bridge_route(db, &new_bridge).err(),
+            Some(Fault::Conflict)
+        );
+        assert_eq!(persist_run_route(db, &new_run).err(), Some(Fault::Conflict));
+
+        // Dry run validates the candidate without writing a generation.
+        assert_eq!(
+            repin_routes(db, &new_bridge, &new_run, &pool_route, false).unwrap(),
+            (1, 1)
+        );
+        assert_eq!(
+            latest_pin(db, "bridge", &binding.bridge_route),
+            (1, encoded(&old_bridge).unwrap())
+        );
+        assert_eq!(
+            latest_pin(db, "run", &binding.run_route),
+            (1, encoded(&old_run).unwrap())
+        );
+        assert!(require_run_route(db, &old_run).is_ok());
+
+        assert_eq!(
+            repin_routes(db, &new_bridge, &new_run, &pool_route, true).unwrap(),
+            (2, 2)
+        );
+        assert_eq!(
+            repin_routes(db, &new_bridge, &new_run, &pool_route, true).unwrap(),
+            (2, 2)
+        );
+        assert_eq!(
+            latest_pin(db, "bridge", &binding.bridge_route),
+            (2, encoded(&new_bridge).unwrap())
+        );
+        assert_eq!(
+            latest_pin(db, "run", &binding.run_route),
+            (2, encoded(&new_run).unwrap())
+        );
+        persist_bridge_route(db, &new_bridge).unwrap();
+        assert!(require_run_route(db, &new_run).is_ok());
+        assert_eq!(
+            persist_bridge_route(db, &old_bridge).err(),
+            Some(Fault::Conflict)
+        );
+        assert_eq!(require_run_route(db, &old_run).err(), Some(Fault::Conflict));
+
+        // The existing intent keeps the old executable paths and cannot adopt the new ones.
+        let original = recovery_intent(db, "old-intent", &digest).unwrap();
+        assert!(original.run_pin.endpoint() == old_run);
+        assert!(original.bridge_pin == old_bridge);
+        let mut upgraded_config = fake_config(&binding);
+        upgraded_config.bridge_server_executable = new_bridge.server_executable.clone();
+        upgraded_config.bridge_server_sha256 = new_bridge.server_sha256.clone();
+        let transport = upgraded_config.managed_run_transport.as_mut().unwrap();
+        transport.executable = new_run.executable.clone();
+        transport.sha256 = new_run.executable_sha256.clone();
+        assert!(crate::managed_run::RunPeer::from_recovery(&upgraded_config, &original).is_err());
+        assert!(matches!(
+            stage_recovery(db, "old-intent", &digest).unwrap(),
+            RecoveryAction::LocallyFenced
+        ));
+        let RecoveryAction::BridgeAbort { pin, key, .. } =
+            stage_recovery(db, "old-intent", &digest).unwrap()
+        else {
+            panic!("original abort");
+        };
+        assert!(pin == old_bridge);
+        let abort = crate::managed_bridge::Abort {
+            store_id: binding.bridge_route.component_store_id.clone(),
+            aborted: true,
+            receipt: Some(
+                fake_consumed(
+                    &binding,
+                    &incarnation,
+                    "old-intent",
+                    "old-inv",
+                    &digest,
+                    &command(1),
+                )
+                .receipt,
+            ),
+        };
+        record_bridge_abort(db, "old-intent", &digest, &key.borrowed(), &abort, &pin).unwrap();
+
+        // New invocations pin the new executable paths.
+        let mut next_command = command(1);
+        if let Command::Join(change) = &mut next_command {
+            change.request_key = "new-key".into();
+        }
+        let next_digest = prepare_with_pin(
+            db,
+            &run,
+            &binding,
+            &incarnation,
+            "new-context",
+            "new-intent",
+            "new-inv",
+            &next_command,
+            "namespace",
+            "epoch",
+            &new_bridge,
+        );
+        assert!(matches!(
+            reserve(
+                db,
+                &run,
+                &binding,
+                &incarnation,
+                "new-context",
+                "new-inv",
+                "new-intent",
+                &next_command,
+                &next_digest
+            ),
+            Ok(IntentReservation::Created)
+        ));
+        let new_intent = recovery_intent(db, "new-intent", &next_digest).unwrap();
+        assert!(new_intent.run_pin.endpoint() == new_run);
+        assert!(new_intent.bridge_pin == new_bridge);
+        assert!(crate::managed_run::RunPeer::from_recovery(&upgraded_config, &new_intent).is_ok());
+
+        // Each side may move on its own and gets its own generation.
+        let mut moved_bridge = new_bridge.clone();
+        moved_bridge.server_executable =
+            "/opt/agent-bridge/releases/0.7.2+c0ffee/bin/bridge-native-daemon".into();
+        moved_bridge.server_sha256 = "e".repeat(64);
+        assert_eq!(
+            repin_routes(db, &moved_bridge, &new_run, &pool_route, true).unwrap(),
+            (3, 2)
+        );
+        let mut moved_run = new_run.clone();
+        moved_run.executable = "/opt/agent-run/releases/0.2.1/bin/agent-run".into();
+        assert_eq!(
+            repin_routes(db, &moved_bridge, &moved_run, &pool_route, true).unwrap(),
+            (3, 3)
+        );
+        assert_eq!(
+            latest_pin(db, "run", &binding.run_route),
+            (3, encoded(&moved_run).unwrap())
+        );
+        let original_new = recovery_intent(db, "new-intent", &next_digest).unwrap();
+        assert!(original_new.bridge_pin == new_bridge);
+        assert!(original_new.run_pin.endpoint() == new_run);
+    }
+
+    /// A moved executable never carries a socket, credential, producer or route change with it.
+    #[test]
+    fn repin_with_moved_executable_still_refuses_endpoint_changes() {
+        let (_dir, mut store, binding, _incarnation, _run) = fixture();
+        let db = store.test_db();
+        let pool_route = Route {
+            component_store_id: binding.pool_store_id.clone(),
+            route_id: "pool-route".into(),
+            worker_uid: binding.run_route.worker_uid,
+        };
+        let bridge = fake_bridge_pin(&binding);
+        let run = fake_run_endpoint(&binding);
+        persist_pool_route(db, &run, &pool_route).unwrap();
+        let mut moved_bridge = bridge.clone();
+        moved_bridge.server_executable = "/opt/agent-bridge/releases/0.7.1/bin/bridge".into();
+        moved_bridge.server_sha256 = "d".repeat(64);
+        let mut moved_run = run.clone();
+        moved_run.executable = "/opt/agent-run/releases/0.2.0/bin/agent-run".into();
+        moved_run.executable_sha256 = "c".repeat(64);
+        let unchanged = |db: &Connection| {
+            assert_eq!(
+                latest_pin(db, "bridge", &binding.bridge_route),
+                (1, encoded(&bridge).unwrap())
+            );
+            assert_eq!(
+                latest_pin(db, "run", &binding.run_route),
+                (1, encoded(&run).unwrap())
+            );
+        };
+        let mut changed = moved_run.clone();
+        changed.socket = "/fixture/other/attempt.sock".into();
+        assert_eq!(
+            repin_routes(db, &moved_bridge, &changed, &pool_route, true).err(),
+            Some(Fault::Conflict)
+        );
+        let bridge_changes: [fn(&mut crate::managed_bridge::BridgePin); 5] = [
+            |pin| pin.core_socket = "/fixture/other-core.sock".into(),
+            |pin| pin.registration_socket = "/fixture/other-adapter.sock".into(),
+            |pin| pin.credential_file = "/fixture/other-token".into(),
+            |pin| pin.producer = "other".into(),
+            |pin| pin.route.worker_uid += 1,
+        ];
+        for change in bridge_changes {
+            let mut candidate = moved_bridge.clone();
+            change(&mut candidate);
+            for apply in [false, true] {
+                assert_eq!(
+                    repin_routes(db, &candidate, &moved_run, &pool_route, apply).err(),
+                    Some(Fault::Conflict)
+                );
+            }
+        }
+        unchanged(db);
+        for (bridge_path, run_path) in [
+            ("relative/bridge", "/opt/agent-run/bin/agent-run"),
+            (
+                "/opt/agent-bridge/../bridge",
+                "/opt/agent-run/bin/agent-run",
+            ),
+            ("/opt/agent-bridge/bin/bridge", "agent-run"),
+            (
+                "/opt/agent-bridge/bin/bridge",
+                "/opt/agent-run/../agent-run",
+            ),
+        ] {
+            let mut candidate_bridge = moved_bridge.clone();
+            candidate_bridge.server_executable = bridge_path.into();
+            let mut candidate_run = moved_run.clone();
+            candidate_run.executable = run_path.into();
+            assert_eq!(
+                repin_routes(db, &candidate_bridge, &candidate_run, &pool_route, true).err(),
+                Some(Fault::Invalid)
+            );
+        }
+        let mut uppercase = moved_run.clone();
+        uppercase.executable_sha256 = "C".repeat(64);
+        assert_eq!(
+            repin_routes(db, &moved_bridge, &uppercase, &pool_route, true).err(),
+            Some(Fault::Invalid)
+        );
+        unchanged(db);
+        assert_eq!(
+            repin_routes(db, &moved_bridge, &moved_run, &pool_route, true).unwrap(),
+            (2, 2)
         );
     }
 

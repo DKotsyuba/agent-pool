@@ -39,6 +39,21 @@ managed enrollment and conditioned replacement, paired with Agent Bridge v0.7.0.
 
 ### Fixed
 
+- `agent-pool repin` accepts a moved Bridge `server_executable` and Run
+  `executable` (for example a versioned Bridge 0.7.1 install path) with their
+  new SHA-256, instead of failing with `Conflict`. Before it commits, it proves
+  each candidate file: absolute canonical path, regular file owned by the
+  resident UID or root, not group/other-writable, digest equal to the pin. Each
+  live peer is then proved through the pinned capability exchange. The path
+  change records a new route pin generation. Existing intents, effects and
+  enrollment keys keep their frozen pins, and only new work uses the new pin.
+  Route IDs, stores, worker UID, sockets, producer and credential file must
+  still match exactly; a mismatch is a `Conflict` that leaves every pin unchanged.
+- A stored route pin that no longer matches the configured Bridge or Run
+  executable no longer stops the resident (`resident: Conflict`). Only the
+  affected managed delivery is refused, with `route_unavailable` attention. The
+  resident logs once that `agent-pool repin` is required and keeps serving
+  everything else.
 - E11 namespace retirement records durable owner attention
   (`namespace_retirement_attention_<code>`) with capped backoff when Bridge
   issuer discovery fails, instead of silently skipping retirement; `repin`

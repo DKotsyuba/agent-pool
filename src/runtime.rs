@@ -1558,10 +1558,20 @@ mod managed_egress_dispatch {
         let bridge = bridge_pin.clone();
         let endpoint = run.endpoint();
         let pool_route = run.pool_route();
-        stored_managed(store, lease, move |store| {
+        match stored_managed(store, lease, move |store| {
             store.managed_pin_routes(&bridge, &endpoint, &pool_route)
         })
-        .await?;
+        .await
+        {
+            Ok(()) => {}
+            // A stale pin refuses this managed delivery only; the resident keeps serving.
+            Err(Fault::Conflict) => {
+                stale_route_pin();
+                note(store, lease, &id, "route_unavailable").await?;
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        }
         let run_pin = match run.current_pin().await {
             Ok(pin) => pin,
             Err(error) => {
@@ -2219,12 +2229,14 @@ async fn recover_egress_scope(
     let pin_for_store = pin.clone();
     let endpoint = run.endpoint_pin();
     let pool_route = run.pool_route.clone();
-    if stored_managed(store, &lease, move |store| {
+    if let Err(error) = stored_managed(store, &lease, move |store| {
         store.managed_pin_routes(&pin_for_store, &endpoint, &pool_route)
     })
     .await
-    .is_err()
     {
+        if error == Fault::Conflict {
+            stale_route_pin();
+        }
         return Ok(());
     }
     let scope_id = scope.clone();
@@ -2423,7 +2435,12 @@ async fn managed_session_core<S: managed_dispatch::SessionClient>(
     stored_managed(store, &lease, move |store| {
         store.managed_pin_routes(&persisted_pin, &endpoint, &pool_route)
     })
-    .await?;
+    .await
+    .inspect_err(|error| {
+        if *error == Fault::Conflict {
+            stale_route_pin();
+        }
+    })?;
     crate::managed_session::send(stream, &ServerFrame::Ready).await?;
     let epoch = match crate::managed_session::receive::<ClientFrame>(stream).await? {
         ClientFrame::Epoch { issuer_epoch }
@@ -3252,8 +3269,22 @@ async fn listener(config: &Config) -> Result<(UnixListener, SocketGuard), Fault>
     Ok((listener, guard))
 }
 
+/// The configured Bridge or Run pin no longer matches the stored route pin, typically after
+/// an upgrade moved an executable. Managed work on that route is refused, everything else
+/// continues, and the operator action is named once per resident process.
+fn stale_route_pin() {
+    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "resident: managed work refused (Conflict): the configured Bridge or Run executable pin differs from the stored route pin; stop the resident, run `agent-pool repin --config <config>`, then restart it; other work continues"
+        );
+    }
+}
+
 /// Verify both configured services and atomically re-pin an existing, exclusively held store.
-/// Candidate peers are checked through the same pinned capability exchanges used by admission.
+/// Only executable paths, build digests and the credential digest may change. Each candidate
+/// executable is proved on disk, then its live peer through the same pinned capability
+/// exchanges used by admission, before one transaction records the new generations.
 pub async fn repin(config_path: &Path) -> Result<(i64, i64), Fault> {
     let config = Config::load(config_path)?;
     integrations::own_uid(config.expected_uid)?;
@@ -3275,7 +3306,41 @@ pub async fn repin(config_path: &Path) -> Result<(i64, i64), Fault> {
     .await
     .map_err(|_| Fault::Unavailable)??;
     let run_pin = peer.endpoint_pin();
-    store.managed_repin_routes(&bridge_pin, &run_pin, &peer.pool_route, false)?;
+    store
+        .managed_repin_routes(&bridge_pin, &run_pin, &peer.pool_route, false)
+        .inspect_err(|error| {
+            if *error == Fault::Conflict {
+                eprintln!(
+                    "repin: a configured route, socket, producer or credential file differs from the pinned one; only executable paths and digests can be re-pinned; no pin was changed"
+                );
+            }
+        })?;
+    let uid = config.expected_uid;
+    let candidates = [
+        (
+            "Bridge server",
+            bridge_pin.server_executable.clone(),
+            bridge_pin.server_sha256.clone(),
+        ),
+        (
+            "Run",
+            run_pin.executable.clone(),
+            run_pin.executable_sha256.clone(),
+        ),
+    ];
+    tokio::task::spawn_blocking(move || {
+        for (name, path, sha256) in candidates {
+            crate::config::trusted_executable(&path, &sha256, uid).map_err(|reason| {
+                eprintln!(
+                    "repin: the configured {name} executable is not trusted ({reason}); no pin was changed"
+                );
+                Fault::Unauthorized
+            })?;
+        }
+        Ok::<(), Fault>(())
+    })
+    .await
+    .map_err(|_| Fault::Unavailable)??;
     let expected = bridge_pin.route.component_store_id.clone();
     tokio::task::spawn_blocking(move || crate::managed_bridge::discover(&bridge, &expected))
         .await
@@ -4155,7 +4220,7 @@ async fn recover_namespace_retirement(config: &Config, store: &SharedStore) -> R
         };
         let candidate = pin.clone();
         let pinned_peer = peer.clone();
-        if stored(store, move |store| {
+        if let Err(error) = stored(store, move |store| {
             store.managed_pin_routes(
                 &candidate,
                 &pinned_peer.endpoint_pin(),
@@ -4163,8 +4228,10 @@ async fn recover_namespace_retirement(config: &Config, store: &SharedStore) -> R
             )
         })
         .await
-        .is_err()
         {
+            if error == Fault::Conflict {
+                stale_route_pin();
+            }
             return failed("route_changed").await;
         }
         let expected = pin.route.component_store_id.clone();
@@ -4352,7 +4419,7 @@ mod tests {
         let directory =
             tempfile::tempdir_in(std::env::var_os("TMPDIR").ok_or("task TMPDIR required")?)?;
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))?;
-        let root = directory.path();
+        let root = &fs::canonicalize(directory.path())?;
         let uid = fs::metadata(root)?.uid();
         let bridge_socket = root.join("bridge.sock");
         let run_socket = root.join("attempt.sock");
@@ -4375,7 +4442,7 @@ mod tests {
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o500))?;
         let sha = format!("{:x}", Sha256::digest(fs::read(&executable)?));
         let config_path = root.join("config.toml");
-        let config_text = |run_sha: &str| {
+        let config_text = |run_socket: &Path, run_executable: &Path, run_sha: &str| {
             format!(
                 "socket_path = {:?}\ndatabase_path = {:?}\nexpected_uid = {}\nbridge_registration_socket = {:?}\nbridge_core_socket = {:?}\nbridge_credential_file = {:?}\nbridge_producer_id = 'pool'\nbridge_audience = 'pool'\nbridge_server_executable = {:?}\nbridge_server_sha256 = '{}'\n[managed_run_transport]\nsocket = {:?}\nexecutable = {:?}\nsha256 = '{}'\nrun_store_id = 'store_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\nrun_route_id = 'run-route'\npool_route_id = 'pool-route'\nbridge_store_id = '00000000-0000-4000-8000-000000000003'\nbridge_route_id = 'bridge-route'\nproducer = 'pool'\n",
                 root.join("pool.sock"),
@@ -4387,21 +4454,27 @@ mod tests {
                 executable,
                 sha,
                 run_socket,
-                executable,
+                run_executable,
                 run_sha,
             )
         };
-        fs::write(&config_path, config_text(&"3".repeat(64)))?;
+        fs::write(&config_path, config_text(&run_socket, &executable, &sha))?;
         let config = Config::load(&config_path)?;
         let mut initial = Store::open(&config.database_path)?;
         let pool_store = initial.managed_store_id()?;
         let peer = crate::managed_run::RunPeer::from_config(&config, &pool_store)
             .map_err(|_| "peer config")?;
-        let (_, mut old_bridge) =
+        let (_, upgraded_bridge) =
             crate::managed_bridge::SdkBridge::capture(&config, peer.bridge_route.clone())?;
+        let upgraded_run = peer.endpoint_pin();
+        // The pre-upgrade pins name older versioned install paths and builds.
+        let mut old_bridge = upgraded_bridge.clone();
+        old_bridge.server_executable =
+            "/opt/agent-bridge/releases/0.7.0+0123456789ab/bin/bridge-native-daemon".into();
         old_bridge.server_sha256 = "0".repeat(64);
         old_bridge.credential_sha256 = "1".repeat(64);
-        let mut old_run = peer.endpoint_pin();
+        let mut old_run = upgraded_run.clone();
+        old_run.executable = "/opt/agent-run/releases/0.1.0/bin/agent-run".into();
         old_run.executable_sha256 = "2".repeat(64);
         initial.managed_pin_routes(&old_bridge, &old_run, &peer.pool_route)?;
         drop(initial);
@@ -4433,14 +4506,57 @@ mod tests {
             }
             Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
         });
+        let unchanged = || -> Result<(), Box<dyn std::error::Error>> {
+            let mut store = Store::open(&config.database_path)?;
+            assert_eq!(
+                store.managed_repin_routes(&old_bridge, &old_run, &peer.pool_route, false)?,
+                (1, 1)
+            );
+            assert_eq!(
+                store.managed_repin_routes(
+                    &upgraded_bridge,
+                    &upgraded_run,
+                    &peer.pool_route,
+                    false
+                )?,
+                (1, 1)
+            );
+            Ok(())
+        };
+        // A moved socket is a route change: refused before any proof or I/O.
+        fs::write(
+            &config_path,
+            config_text(&root.join("moved").join("attempt.sock"), &executable, &sha),
+        )?;
+        assert_eq!(repin(&config_path).await.err(), Some(Fault::Conflict));
+        unchanged()?;
+        // Untrusted candidates are refused before any peer I/O.
+        fs::write(
+            &config_path,
+            config_text(&run_socket, &executable, &"3".repeat(64)),
+        )?;
+        assert_eq!(repin(&config_path).await.err(), Some(Fault::Unauthorized));
+        let writable = root.join("run-writable");
+        fs::write(&writable, "fixture-run-build")?;
+        fs::set_permissions(&writable, fs::Permissions::from_mode(0o720))?;
+        let writable_sha = format!("{:x}", Sha256::digest(fs::read(&writable)?));
+        fs::write(
+            &config_path,
+            config_text(&run_socket, &writable, &writable_sha),
+        )?;
+        assert_eq!(repin(&config_path).await.err(), Some(Fault::Unauthorized));
+        unchanged()?;
+        // A trusted file that is not the live Run peer fails the live peer proof.
+        let other = root.join("run-other");
+        fs::write(&other, "fixture-run-build")?;
+        fs::set_permissions(&other, fs::Permissions::from_mode(0o500))?;
+        fs::write(
+            &config_path,
+            config_text(&run_socket, &other, &writable_sha),
+        )?;
         assert_eq!(repin(&config_path).await.err(), Some(Fault::Unavailable));
-        let mut unchanged = Store::open(&config.database_path)?;
-        assert_eq!(
-            unchanged.managed_repin_routes(&old_bridge, &old_run, &peer.pool_route, false)?,
-            (1, 1)
-        );
-        drop(unchanged);
-        fs::write(&config_path, config_text(&sha))?;
+        unchanged()?;
+        fs::write(&config_path, config_text(&run_socket, &executable, &sha))?;
         assert_eq!(
             repin(&config_path)
                 .await
@@ -4453,6 +4569,18 @@ mod tests {
                 .map_err(|error| format!("replayed candidate: {error}"))?,
             (2, 2)
         );
+        let mut repinned = Store::open(&config.database_path)?;
+        assert_eq!(
+            repinned.managed_repin_routes(
+                &upgraded_bridge,
+                &upgraded_run,
+                &peer.pool_route,
+                false
+            )?,
+            (2, 2)
+        );
+        repinned.managed_pin_routes(&upgraded_bridge, &upgraded_run, &peer.pool_route)?;
+        drop(repinned);
         bridge_task.await?.map_err(|_| "Bridge fixture")?;
         run_task.await?.map_err(|_| "Run fixture")?;
         Ok(())
@@ -9470,6 +9598,150 @@ mod tests {
         assert_eq!(generation, 2u64.to_be_bytes());
         assert_eq!(context, "invalidated");
         assert_eq!(revision, 1);
+        Ok(())
+    }
+
+    /// After an upgrade moved the Bridge and Run executables, the stale stored pin refuses
+    /// the managed delivery with route attention while the resident worker keeps running;
+    /// after `repin` the same delivery proceeds on the new pin.
+    #[tokio::test]
+    async fn stale_route_pin_refuses_managed_delivery_without_stopping_resident()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::managed_egress::tests::add_seed;
+        use crate::managed_state::tests::{fake_config, fixture_with_uid, index_managed_member};
+        let uid = fs::metadata(std::env::var_os("TMPDIR").ok_or("task TMPDIR required")?)?.uid();
+        let (dir, mut initial, binding, _incarnation, _run) = fixture_with_uid(uid);
+        index_managed_member(initial.test_db(), &binding);
+        add_seed(&mut initial, &binding, "stale-effect", "payload", false);
+        initial.test_db().execute(
+            "UPDATE effects SET state='awaiting_binding' WHERE id='stale-effect'",
+            [],
+        )?;
+        let root = fs::canonicalize(dir.path())?;
+        let mut config = fake_config(&binding);
+        config.socket_path = root.join("pool.sock");
+        config.database_path = root.join("pool.db");
+        config.bridge_registration_socket = root.join("adapter.sock");
+        config.bridge_core_socket = root.join("core.sock");
+        config.bridge_credential_file = root.join("token");
+        config.bridge_server_executable =
+            "/opt/agent-bridge/releases/0.7.1+b2666a5d02f8/bin/bridge-native-daemon".into();
+        config.bridge_server_sha256 = "d".repeat(64);
+        let _adapter = std::os::unix::net::UnixListener::bind(&config.bridge_registration_socket)?;
+        let _core = std::os::unix::net::UnixListener::bind(&config.bridge_core_socket)?;
+        for socket in [
+            &config.bridge_registration_socket,
+            &config.bridge_core_socket,
+        ] {
+            fs::set_permissions(socket, fs::Permissions::from_mode(0o600))?;
+        }
+        fs::write(&config.bridge_credential_file, "fixture-credential")?;
+        fs::set_permissions(
+            &config.bridge_credential_file,
+            fs::Permissions::from_mode(0o600),
+        )?;
+        let transport = config.managed_run_transport.as_mut().ok_or("transport")?;
+        transport.egress_enabled = true;
+        transport.producer_scope_prefix = Some(format!("pool/{}/", binding.pool_store_id));
+        transport.socket = root.join("run").join("attempt.sock");
+        transport.executable = "/opt/agent-run/releases/0.2.0/bin/agent-run".into();
+        transport.sha256 = "c".repeat(64);
+
+        // The store still holds the pre-upgrade pins: same routes and sockets, old executables.
+        let (_, upgraded_bridge) =
+            crate::managed_bridge::SdkBridge::capture(&config, binding.bridge_route.clone())
+                .map_err(|error| format!("capture: {error}"))?;
+        let peer = crate::managed_run::RunPeer::from_config(&config, &binding.pool_store_id)
+            .map_err(|_| "peer config")?;
+        let upgraded_run = peer.endpoint_pin();
+        let mut old_bridge = upgraded_bridge.clone();
+        old_bridge.server_executable =
+            "/opt/agent-bridge/releases/0.7.0+0123456789ab/bin/bridge-native-daemon".into();
+        old_bridge.server_sha256 = "a".repeat(64);
+        let mut old_run = upgraded_run.clone();
+        old_run.executable = "/opt/agent-run/releases/0.1.0/bin/agent-run".into();
+        old_run.executable_sha256 = "a".repeat(64);
+        let old_bridge_json = serde_json::to_string(&old_bridge)?;
+        let old_run_json = serde_json::to_string(&old_run)?;
+        let db = initial.test_db();
+        db.execute(
+            "UPDATE managed_bridge_routes SET pin=?1",
+            [&old_bridge_json],
+        )?;
+        db.execute("UPDATE managed_run_routes SET pin=?1", [&old_run_json])?;
+        db.execute(
+            "UPDATE managed_route_pin_history SET pin=?1 WHERE kind='bridge'",
+            [&old_bridge_json],
+        )?;
+        db.execute(
+            "UPDATE managed_route_pin_history SET pin=?1 WHERE kind='run'",
+            [&old_run_json],
+        )?;
+        let store = Arc::new(Mutex::new(initial));
+        let attention = |store: SharedStore| async move {
+            stored(&store, |store| {
+                Ok(store.test_db().query_row::<Option<String>, _, _>(
+                    "SELECT attention FROM managed_delivery_outbox WHERE effect_id='stale-effect'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+        };
+        let wait_for = |expected: &'static str| {
+            let store = Arc::clone(&store);
+            let config = config.clone();
+            async move {
+                let (stop, stopped) = watch::channel(false);
+                let mut worker = tokio::spawn(fixture_work(config, Arc::clone(&store), stopped));
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+                while attention(Arc::clone(&store)).await?.as_deref() != Some(expected) {
+                    assert!(!worker.is_finished(), "resident worker stopped early");
+                    assert!(tokio::time::Instant::now() < deadline, "no {expected}");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                assert!(!worker.is_finished(), "resident worker must keep running");
+                stop.send(true)?;
+                tokio::time::timeout(Duration::from_secs(20), &mut worker)
+                    .await??
+                    .map_err(|error| format!("resident worker: {error}"))?;
+                Ok::<(), Box<dyn std::error::Error>>(())
+            }
+        };
+        wait_for("route_unavailable").await?;
+        let (bridge_pin, run_pin, generations) = stored(&store, |store| {
+            let db = store.test_db();
+            Ok((
+                db.query_row::<String, _, _>("SELECT pin FROM managed_bridge_routes", [], |r| {
+                    r.get(0)
+                })?,
+                db.query_row::<String, _, _>("SELECT pin FROM managed_run_routes", [], |r| {
+                    r.get(0)
+                })?,
+                db.query_row::<i64, _, _>(
+                    "SELECT MAX(generation) FROM managed_route_pin_history",
+                    [],
+                    |r| r.get(0),
+                )?,
+            ))
+        })
+        .await?;
+        assert_eq!(
+            (bridge_pin, run_pin, generations),
+            (old_bridge_json, old_run_json, 1)
+        );
+
+        // The documented upgrade flow: repin, then the delivery uses the new pin and
+        // reaches Run (absent here) instead of the stale-pin refusal.
+        let pool_route = peer.pool_route.clone();
+        assert_eq!(
+            stored(&store, move |store| {
+                store.managed_repin_routes(&upgraded_bridge, &upgraded_run, &pool_route, true)
+            })
+            .await?,
+            (2, 2)
+        );
+        wait_for("binding_unavailable").await?;
         Ok(())
     }
 

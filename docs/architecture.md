@@ -583,19 +583,28 @@ managed long polls are not implemented.
 
 ### Operator re-pin after an upgrade or credential rotation
 
-The resident never accepts a different executable hash or Bridge credential hash
-implicitly. To approve an upgrade, stop the Pool resident and wait for it to exit,
-then install and start the intended Run and Bridge services at their existing
-configured paths. Update the private Pool config with the new executable SHA-256
-values, including `managed_run_reader.sha256` when that reader uses the upgraded
-Run build, and provision the rotated Bridge credential at its existing private path.
+The resident never implicitly accepts a different executable path, executable hash
+or Bridge credential hash. To approve an upgrade, stop the Pool resident and wait
+for it to exit, then install and start the intended Run and Bridge services.
+An upgrade may install a build at a new versioned path, for example
+`/opt/agent-bridge/releases/0.7.1+b2666a5d02f8/bin/bridge-native-daemon`.
+Update the private Pool config with the new `bridge_server_executable` and
+`managed_run_transport.executable` paths and their SHA-256 values, including
+`managed_run_reader` when that reader uses the upgraded Run build. Provision a
+rotated Bridge credential at its existing private path.
 Run `agent-pool repin --config /absolute/path/to/pool.toml`, then start the Pool
 resident separately. This command does not stop or start any service. It requires
-the existing private Pool store and its exclusive writer lease, authenticates both
-candidate service peers and checks their configured stores through the same pinned
-capability exchanges used by managed operation. It refuses changed Run, Bridge or
-known Pool store/route identities, endpoints, producer or credential path. A failed
-check leaves both active pins unchanged. If multiple stored route identities share
+the existing private Pool store and its exclusive writer lease. It checks every
+fixed route field first. Then it proves each candidate executable on disk: the
+absolute path is already canonical, and it names a regular file owned by the Pool
+UID or root that group and other cannot write, whose digest equals the configured
+SHA-256. Only then does it authenticate both candidate service peers and their
+configured stores, through the same pinned capability exchanges and live
+loaded-executable proofs used by managed operation. Only executable paths,
+executable digests and the credential digest may change. It refuses changed Run,
+Bridge or known Pool store/route identities, worker UID, sockets, producer or
+credential path with `Conflict`, and refuses an untrusted executable with
+`Unauthorized`. A failed check leaves both active pins unchanged. If multiple stored route identities share
 either configured endpoint, re-pin refuses the ambiguous store. A repeated command with the same identities
 is a no-op and reports the same per-route generation. Each actual pin change
 increments its generation; previous pins remain in the store.
@@ -611,6 +620,13 @@ and credential can still be authenticated; otherwise the original work remains
 unresolved or unknown under its existing recovery rules. Preserve old binaries and
 credentials if they may be needed to reconcile such work. Re-pin does not itself
 settle or discard unresolved work.
+
+A resident started with a configuration that no longer matches the stored route
+pin does not exit. It refuses only the managed work that would use that route: a
+pending managed delivery gets `route_unavailable` attention, a managed frontend
+call gets `Conflict`, and namespace retirement waits. It logs once that
+`agent-pool repin` is required. Legacy work, owner observation and unmanaged
+pools keep running. Stop the resident, run `repin`, then start it again.
 
 Consensus captures voter identities in a SQLite read snapshot, checks all voters
 against Run without holding that transaction, then applies generation and roster

@@ -10,6 +10,8 @@ bridge_credential_file = "/absolute/private/agent-pool/producer.token"
 bridge_producer_id = "agent-pool"
 bridge_audience = "agent-pool-backend"
 # Required same-connection server build pin for every managed B1 exchange.
+# After an upgrade changes this path or hash, stop the resident and run
+# `agent-pool repin --config <this file>` before starting it again.
 bridge_server_executable = "/absolute/path/to/bridge"
 bridge_server_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 # Optional separate opt-in read grant; both fields must be present together.

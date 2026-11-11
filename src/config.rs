@@ -330,6 +330,68 @@ pub fn private_socket(path: &Path, uid: u32) -> Result<(), Fault> {
     Ok(())
 }
 
+/// Largest executable whose digest an operator re-pin computes.
+const MAX_EXECUTABLE: u64 = 512 * 1024 * 1024;
+
+/// Proves a candidate pinned executable before an operator re-pin adopts it: the
+/// absolute path is already canonical, names a regular file owned by `uid` or root
+/// that group and other cannot write, and the opened file's digest equals `sha256`.
+/// The live peer proof stays with each authenticated exchange. Returns a fixed
+/// nonsecret reason for the operator.
+pub(crate) fn trusted_executable(path: &Path, sha256: &str, uid: u32) -> Result<(), &'static str> {
+    use sha2::{Digest, Sha256};
+    if !path.is_absolute() || fs::canonicalize(path).ok().as_deref() != Some(path) {
+        return Err("not_canonical");
+    }
+    let named = fs::symlink_metadata(path).map_err(|_| "unreadable")?;
+    if !named.is_file() || named.len() > MAX_EXECUTABLE {
+        return Err("not_regular_file");
+    }
+    if named.uid() != uid && named.uid() != 0 {
+        return Err("untrusted_owner");
+    }
+    if named.permissions().mode() & 0o022 != 0 {
+        return Err("writable_by_others");
+    }
+    let mut file = fs::File::open(path).map_err(|_| "unreadable")?;
+    let opened = file.metadata().map_err(|_| "unreadable")?;
+    let identity = |meta: &fs::Metadata| {
+        (
+            meta.dev(),
+            meta.ino(),
+            meta.uid(),
+            meta.mode(),
+            meta.len(),
+            meta.mtime(),
+            meta.mtime_nsec(),
+            meta.ctime(),
+            meta.ctime_nsec(),
+        )
+    };
+    if identity(&opened) != identity(&named) {
+        return Err("changed_during_check");
+    }
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0u8; 65_536];
+    loop {
+        let read = file.read(&mut buffer).map_err(|_| "unreadable")?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    let after = fs::symlink_metadata(path).map_err(|_| "unreadable")?;
+    if identity(&file.metadata().map_err(|_| "unreadable")?) != identity(&opened)
+        || identity(&after) != identity(&opened)
+    {
+        return Err("changed_during_check");
+    }
+    if format!("{:x}", digest.finalize()) != sha256 {
+        return Err("digest_mismatch");
+    }
+    Ok(())
+}
+
 /// Verifies the full identity UID map before trusting cross-user Linux peer credentials.
 #[cfg(target_os = "linux")]
 pub(crate) fn identity_uid_map() -> Result<(), Fault> {
@@ -460,6 +522,64 @@ mod tests {
             private_parent(&path, uid),
             Err(Fault::Unavailable)
         ));
+        Ok(())
+    }
+
+    /// A re-pinned executable must be canonical, trusted-owned, not writable by others and exact.
+    #[test]
+    fn trusted_executable_rejects_alias_owner_mode_and_digest()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use sha2::{Digest, Sha256};
+        let directory =
+            tempfile::tempdir_in(std::env::var_os("TMPDIR").ok_or("task TMPDIR required")?)?;
+        let root = fs::canonicalize(directory.path())?;
+        let path = root.join("bridge-native-daemon");
+        fs::write(&path, "fixture-build-0.7.1")?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+        let uid = fs::metadata(&path)?.uid();
+        let sha = format!("{:x}", Sha256::digest(fs::read(&path)?));
+        trusted_executable(&path, &sha, uid)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o500))?;
+        trusted_executable(&path, &sha, uid)?;
+        if uid != 0 {
+            assert_eq!(
+                trusted_executable(&path, &sha, uid.wrapping_add(1)),
+                Err("untrusted_owner")
+            );
+        }
+        for mode in [0o775, 0o757, 0o722] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode))?;
+            assert_eq!(
+                trusted_executable(&path, &sha, uid),
+                Err("writable_by_others")
+            );
+        }
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+        assert_eq!(
+            trusted_executable(&path, &"0".repeat(64), uid),
+            Err("digest_mismatch")
+        );
+        let alias = root.join("current");
+        std::os::unix::fs::symlink(&path, &alias)?;
+        assert_eq!(trusted_executable(&alias, &sha, uid), Err("not_canonical"));
+        let nested = root.join("releases");
+        fs::create_dir(&nested)?;
+        assert_eq!(
+            trusted_executable(&nested.join("..").join("bridge-native-daemon"), &sha, uid),
+            Err("not_canonical")
+        );
+        assert_eq!(
+            trusted_executable(Path::new("bridge-native-daemon"), &sha, uid),
+            Err("not_canonical")
+        );
+        assert_eq!(
+            trusted_executable(&root.join("absent"), &sha, uid),
+            Err("not_canonical")
+        );
+        assert_eq!(
+            trusted_executable(&root, &sha, uid),
+            Err("not_regular_file")
+        );
         Ok(())
     }
 
