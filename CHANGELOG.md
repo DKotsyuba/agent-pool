@@ -32,6 +32,11 @@ managed enrollment and conditioned replacement, paired with Agent Bridge v0.7.0.
 - Reuse Cargo dependency builds and versioned cargo-deny tooling in CI and release jobs.
 - Run Clippy/tests once for featureless workspaces; retain both default and all-features configurations when workspace features exist.
 
+### Security
+
+- Update `rmcp` to 3.9.0 (RUSTSEC-2026-0457, RUSTSEC-2026-0461, RUSTSEC-2026-0462) and
+  `rusqlite` to 0.41.1, which brings bundled `libsqlite3-sys` 0.39.1 (RUSTSEC-2026-0459).
+
 ### Fixed
 
 - E11 namespace retirement records durable owner attention

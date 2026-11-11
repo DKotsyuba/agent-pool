@@ -400,6 +400,9 @@ async fn main() -> ExitCode {
                     Ok(_) => ExitCode::SUCCESS,
                     Err(_) => ExitCode::FAILURE,
                 },
+                // rmcp 3.9 answers `server/discover` as a bootstrap probe and keeps waiting for
+                // a lifecycle, so stdin EOF after it is a clean client disconnect.
+                Err(rmcp::service::ServerInitializeError::ConnectionClosed(_)) => ExitCode::SUCCESS,
                 Err(_) => {
                     eprintln!("MCP transport failed");
                     ExitCode::FAILURE
