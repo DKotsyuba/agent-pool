@@ -63,7 +63,9 @@ jobs:
         run: |
           curl -fsSL -o "$RUNNER_TEMP/nextest.tar.gz" https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.149/cargo-nextest-0.9.149-universal-apple-darwin.tar.gz
           echo "47b9941765a9ff94e304a3fe5444ac1c7593da655525b8b69f8f2b31a9217507  $RUNNER_TEMP/nextest.tar.gz" | shasum -a 256 -c -
-          tar -xzf "$RUNNER_TEMP/nextest.tar.gz" -C "$HOME/.cargo/bin"
+          mkdir -p "$RUNNER_TEMP/nextest-bin"
+          tar -xzf "$RUNNER_TEMP/nextest.tar.gz" -C "$RUNNER_TEMP/nextest-bin"
+          echo "$RUNNER_TEMP/nextest-bin" >> "$GITHUB_PATH"
       - run: cargo xtask check
   # Build independently of the source gate; publication requires both to pass.
   build:
@@ -124,7 +126,9 @@ jobs:
         run: |
           curl -fsSL -o "$RUNNER_TEMP/nextest.tar.gz" https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.149/cargo-nextest-0.9.149-x86_64-unknown-linux-gnu.tar.gz
           echo "32d1d8c0567b7a80bee2bad8bb09125c846da96bc009b2de11ec08557290c770  $RUNNER_TEMP/nextest.tar.gz" | sha256sum -c -
-          tar -xzf "$RUNNER_TEMP/nextest.tar.gz" -C "$HOME/.cargo/bin"
+          mkdir -p "$RUNNER_TEMP/nextest-bin"
+          tar -xzf "$RUNNER_TEMP/nextest.tar.gz" -C "$RUNNER_TEMP/nextest-bin"
+          echo "$RUNNER_TEMP/nextest-bin" >> "$GITHUB_PATH"
       - run: cargo xtask check
   build-linux:
     needs: validate

@@ -4,6 +4,9 @@
 
 ### Changed
 
+- Gate test scratch directories are named with the PID namespace and a random suffix, and stale cleanup only removes directories of exited processes from the same namespace.
+- The integration-test check ignores commented-out module lines and requires `autotests = false`. Every `exec-hash` nextest group entry must name a test that takes `TEST_EXEC_HASH_LOCK`.
+- CI installs cargo-nextest into a runner-owned directory added to `PATH` (macOS runners lack `~/.cargo/bin`).
 - `cargo xtask check` follows the Rust gate standard: tests run under cargo-nextest (required; CI installs 0.9.149 from a checksum-verified archive) with every failure reported, doctests via `cargo test --doc`, and test temporaries in a fresh tmpfs directory (`XTASK_TEST_TMPFS=0` opts out). Integration tests build into one `it` binary: every `tests/*.rs` must be a module of `tests/it/main.rs`. Release acceptance runs `--test it <suite>::` filters and refuses a filter that selects no tests. The dev profile keeps line-table debug info only (`--profile debugging` for full). Tests serialized by the in-process `TEST_EXEC_HASH_LOCK` run in a one-thread nextest group; the gate rejects a lock user missing from it.
 
 ## 0.1.0

@@ -183,7 +183,7 @@ pub(crate) fn text(root: &Path, program: &str, args: &[&str]) -> Result<String> 
 /// filesystem-heavy tests avoid slow disk sync. Tests keep the inherited `TMPDIR`
 /// when tmpfs is absent, cannot execute files, has less than 1 GiB free, or
 /// `XTASK_TEST_TMPFS=0` is set. The directory is removed on drop; directories
-/// left by interrupted runs are removed on the next start.
+/// left by exited runs of the same PID namespace are removed on the next start.
 struct TestScratch(Option<PathBuf>);
 
 impl TestScratch {
@@ -197,11 +197,13 @@ impl TestScratch {
             use std::os::unix::fs::DirBuilderExt;
             let base = Path::new("/dev/shm");
             if base.is_dir() {
-                remove_stale_scratch(base);
-                let nanos = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |elapsed| elapsed.subsec_nanos());
-                let dir = base.join(format!("xtask-{}-{nanos:09}", std::process::id()));
+                let namespace = pid_namespace();
+                remove_stale_scratch(base, &namespace);
+                let dir = base.join(format!(
+                    "xtask-{}-{namespace}-{}",
+                    std::process::id(),
+                    random_suffix()
+                ));
                 if fs::DirBuilder::new().mode(0o700).create(&dir).is_ok() {
                     if scratch_usable(&dir) {
                         return Self(Some(dir));
@@ -272,9 +274,41 @@ fn scratch_usable(dir: &Path) -> bool {
     executes && free_kib.is_some_and(|kib| kib >= 1024 * 1024)
 }
 
-/// Removes this user's scratch directories whose creating process has exited.
+/// The inode of this process's PID namespace (`/proc/self/ns/pid`), or `0`
+/// when unavailable, so stale cleanup never judges another namespace's PIDs.
 #[cfg(unix)]
-fn remove_stale_scratch(base: &Path) {
+fn pid_namespace() -> String {
+    fs::read_link("/proc/self/ns/pid")
+        .ok()
+        .and_then(|link| {
+            link.to_str()?
+                .strip_prefix("pid:[")?
+                .strip_suffix(']')
+                .map(str::to_owned)
+        })
+        .filter(|inode| !inode.is_empty() && inode.bytes().all(|byte| byte.is_ascii_digit()))
+        .unwrap_or_else(|| "0".to_owned())
+}
+
+/// Sixteen hex digits from `/dev/urandom`, falling back to the clock.
+#[cfg(unix)]
+fn random_suffix() -> String {
+    use std::io::Read as _;
+    let mut bytes = [0_u8; 8];
+    let random = fs::File::open("/dev/urandom").and_then(|mut file| file.read_exact(&mut bytes));
+    if random.is_err() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        bytes = (nanos as u64).to_le_bytes();
+    }
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Removes this user's scratch directories from the same PID namespace whose
+/// creating process has exited.
+#[cfg(unix)]
+fn remove_stale_scratch(base: &Path, namespace: &str) {
     use std::os::unix::fs::MetadataExt;
     let Ok(me) = fs::metadata("/proc/self") else {
         return;
@@ -284,13 +318,20 @@ fn remove_stale_scratch(base: &Path) {
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
-        let Some(pid) = name
+        let mut parts = name
             .to_str()
             .and_then(|name| name.strip_prefix("xtask-"))
-            .and_then(|rest| rest.split('-').next())
-        else {
+            .unwrap_or_default()
+            .split('-');
+        let (Some(pid), Some(owner_namespace)) = (parts.next(), parts.next()) else {
             continue;
         };
+        if pid.is_empty()
+            || !pid.bytes().all(|byte| byte.is_ascii_digit())
+            || owner_namespace != namespace
+        {
+            continue;
+        }
         let owned = entry
             .metadata()
             .is_ok_and(|meta| meta.is_dir() && meta.uid() == me.uid());
@@ -319,10 +360,18 @@ fn owner_writable(dir: &Path) {
 }
 
 /// Every test taking the in-process `TEST_EXEC_HASH_LOCK` must be in the nextest
-/// `exec-hash` group: nextest runs each test in its own process, so the lock alone
-/// no longer serializes them.
+/// `exec-hash` group, and every group entry must name such a test: nextest runs
+/// each test in its own process, so the lock alone no longer serializes them.
 fn exec_hash_tests_grouped(root: &Path) -> Result<()> {
     let config = fs::read_to_string(root.join(".config/nextest.toml"))?;
+    let end = config
+        .find("test-group = \"exec-hash\"")
+        .ok_or("no nextest override assigns the exec-hash group")?;
+    let start = config[..end]
+        .rfind("[[profile.default.overrides]]")
+        .ok_or("the exec-hash group is assigned outside a nextest override")?;
+    let filter = &config[start..end];
+    let mut users = std::collections::BTreeSet::new();
     let mut stack = vec![root.join("src")];
     while let Some(dir) = stack.pop() {
         for entry in fs::read_dir(&dir)? {
@@ -340,7 +389,8 @@ fn exec_hash_tests_grouped(root: &Path) -> Result<()> {
                     .rfind("fn ")
                     .and_then(|start| source[start + 3..].split(['(', '<']).next())
                     .ok_or("TEST_EXEC_HASH_LOCK used outside a function")?;
-                if !config.contains(&format!("::{name})")) {
+                users.insert(name.to_owned());
+                if !filter.contains(&format!("::{name})")) {
                     return Err(format!(
                         "{name} takes TEST_EXEC_HASH_LOCK but is not in the exec-hash nextest group"
                     )
@@ -349,13 +399,41 @@ fn exec_hash_tests_grouped(root: &Path) -> Result<()> {
             }
         }
     }
+    for listed in filter.split("test(=").skip(1) {
+        let name = listed
+            .split(')')
+            .next()
+            .and_then(|path| path.rsplit("::").next())
+            .unwrap_or_default();
+        if !users.contains(name) {
+            return Err(format!(
+                "exec-hash nextest group lists {name}, which does not take TEST_EXEC_HASH_LOCK"
+            )
+            .into());
+        }
+    }
     Ok(())
 }
 
 /// With `autotests = false` a `tests/*.rs` file that is not a module of
-/// `tests/it/main.rs` would silently never build; reject that.
+/// `tests/it/main.rs` would silently never build; reject that, a commented-out
+/// module line, and a manifest that lets Cargo build each file separately again.
 fn integration_tests_included(root: &Path) -> Result<()> {
+    let manifest = fs::read_to_string(root.join("Cargo.toml"))?;
+    if !manifest
+        .lines()
+        .any(|line| line.trim() == "autotests = false")
+    {
+        return Err(
+            "Cargo.toml must set `autotests = false` for the single `it` test binary".into(),
+        );
+    }
     let index = fs::read_to_string(root.join("tests/it/main.rs"))?;
+    let modules: Vec<&str> = index
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("#[path = \"../"))
+        .collect();
     for entry in fs::read_dir(root.join("tests"))? {
         let path = entry?.path();
         if path.extension().is_some_and(|extension| extension == "rs") {
@@ -363,7 +441,7 @@ fn integration_tests_included(root: &Path) -> Result<()> {
                 .file_name()
                 .and_then(|name| name.to_str())
                 .ok_or("non-UTF8 integration-test file name")?;
-            if !index.contains(&format!("\"../{name}\"")) {
+            if !modules.contains(&format!("#[path = \"../{name}\"]").as_str()) {
                 return Err(format!("tests/{name} is not a module of tests/it/main.rs").into());
             }
         }
