@@ -652,18 +652,31 @@ fn start_ticks(pid: u32) -> Result<u64, RunError> {
         .parse()
         .map_err(|_| RunError::Unknown)
 }
-/// Prove the peer is the configured currently loaded Linux executable before sending any bytes.
+/// Exact identity of the opened loaded executable, including changes during hashing.
 #[cfg(target_os = "linux")]
-pub(crate) fn verify_peer(pid: u32, peer: &RunPeer) -> Result<(), RunError> {
-    if pid <= 1 || !peer.executable.is_absolute() || !hash_text(&peer.sha256) {
-        return Err(RunError::Invalid);
-    }
-    let before = start_ticks(pid)?;
+fn loaded_identity(metadata: &fs::Metadata) -> (u64, u64, u32, u32, u64, i64, i64, i64, i64) {
+    (
+        metadata.dev(),
+        metadata.ino(),
+        metadata.uid(),
+        metadata.mode(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    )
+}
+/// Process facts that must stay equal around the executable proof: effective
+/// UID owner of `/proc/PID`, start ticks and the shared PID namespace.
+#[cfg(target_os = "linux")]
+fn process_fence(pid: u32, uid: u32) -> Result<(u64, u64), RunError> {
     let process_path = format!("/proc/{pid}");
+    let ticks = start_ticks(pid)?;
     if fs::metadata(&process_path)
         .map_err(|_| RunError::Unknown)?
         .uid()
-        != peer.expected_uid
+        != uid
     {
         return Err(RunError::Unknown);
     }
@@ -678,24 +691,50 @@ pub(crate) fn verify_peer(pid: u32, peer: &RunPeer) -> Result<(), RunError> {
     {
         return Err(RunError::Unknown);
     }
-    let exe = PathBuf::from(format!("/proc/{pid}/exe"));
+    Ok((ticks, namespace))
+}
+/// Prove the peer is the configured currently loaded Linux executable before
+/// sending any bytes (errata E13/E14). The peer must share this PID namespace,
+/// run with the expected effective UID, carry no dynamic-loader variable in its
+/// initial environment and have no tracer, before and after hashing. The pinned
+/// path must be canonical and not name a generic interpreter, and no global
+/// loader preload may exist. The descriptor opened through `/proc/PID/exe` must
+/// be the configured path's inode, currently owned by the UID or root without
+/// group/other write, on a filesystem whose `mnt_id` resolves to a
+/// write-excluding type; the digest of that same descriptor must equal the pin
+/// while its full identity and the process incarnation stay unchanged. Any
+/// unreadable or changed fact fails closed. PID reuse before the peer
+/// credential is read stays outside the guarantee, as on Run.
+#[cfg(target_os = "linux")]
+pub(crate) fn verify_peer(pid: u32, peer: &RunPeer) -> Result<(), RunError> {
+    use crate::peer_proof::{
+        clean_process, forbidden_interpreter, loader_preload_safe, write_excluded,
+    };
+    if pid <= 1 || !peer.executable.is_absolute() || !hash_text(&peer.sha256) {
+        return Err(RunError::Invalid);
+    }
     let configured = fs::canonicalize(&peer.executable).map_err(|_| RunError::Unknown)?;
-    if configured != peer.executable {
-        return Err(RunError::Unknown);
-    }
-    let actual = fs::canonicalize(&exe).map_err(|_| RunError::Unknown)?;
-    if actual != configured {
-        return Err(RunError::Unknown);
-    }
-    let metadata = fs::metadata(&exe).map_err(|_| RunError::Unknown)?;
-    let expected = fs::metadata(&configured).map_err(|_| RunError::Unknown)?;
-    if !metadata.is_file()
-        || metadata.len() > 512 * 1024 * 1024
-        || (metadata.dev(), metadata.ino()) != (expected.dev(), expected.ino())
+    if configured != peer.executable || forbidden_interpreter(&configured) || !loader_preload_safe()
     {
         return Err(RunError::Unknown);
     }
+    let fence = process_fence(pid, peer.expected_uid)?;
+    if !clean_process(pid) {
+        return Err(RunError::Unknown);
+    }
+    let exe = PathBuf::from(format!("/proc/{pid}/exe"));
+    if fs::read_link(&exe).map_err(|_| RunError::Unknown)? != configured {
+        return Err(RunError::Unknown);
+    }
     let mut file = File::open(&exe).map_err(|_| RunError::Unknown)?;
+    let opened = file.metadata().map_err(|_| RunError::Unknown)?;
+    let expected = fs::metadata(&configured).map_err(|_| RunError::Unknown)?;
+    if (opened.dev(), opened.ino()) != (expected.dev(), expected.ino())
+        || crate::config::trusted_executable_metadata(&opened, peer.expected_uid).is_err()
+        || !write_excluded(&file)
+    {
+        return Err(RunError::Unknown);
+    }
     let mut digest = Sha256::new();
     let mut buffer = [0u8; 65536];
     loop {
@@ -705,36 +744,16 @@ pub(crate) fn verify_peer(pid: u32, peer: &RunPeer) -> Result<(), RunError> {
         }
         digest.update(&buffer[..n]);
     }
-    let after = fs::metadata(&exe).map_err(|_| RunError::Unknown)?;
-    if (
-        metadata.dev(),
-        metadata.ino(),
-        metadata.len(),
-        metadata.mtime(),
-        metadata.mtime_nsec(),
-        metadata.ctime(),
-        metadata.ctime_nsec(),
-    ) != (
-        after.dev(),
-        after.ino(),
-        after.len(),
-        after.mtime(),
-        after.mtime_nsec(),
-        after.ctime(),
-        after.ctime_nsec(),
-    ) || before != start_ticks(pid)?
-        || fs::metadata(&process_path)
-            .map_err(|_| RunError::Unknown)?
-            .uid()
-            != peer.expected_uid
-        || fs::metadata(format!("{process_path}/ns/pid"))
-            .map_err(|_| RunError::Unknown)?
-            .ino()
-            != namespace
-        || fs::metadata("/proc/self/ns/pid")
-            .map_err(|_| RunError::Unknown)?
-            .ino()
-            != namespace
+    let after = file.metadata().map_err(|_| RunError::Unknown)?;
+    let loaded = fs::metadata(&exe).map_err(|_| RunError::Unknown)?;
+    let named = fs::metadata(&configured).map_err(|_| RunError::Unknown)?;
+    if loaded_identity(&after) != loaded_identity(&opened)
+        || (loaded.dev(), loaded.ino()) != (opened.dev(), opened.ino())
+        || (named.dev(), named.ino()) != (opened.dev(), opened.ino())
+        || fs::read_link(&exe).map_err(|_| RunError::Unknown)? != configured
+        || process_fence(pid, peer.expected_uid)? != fence
+        || !clean_process(pid)
+        || !loader_preload_safe()
         || format!("{:x}", digest.finalize()) != peer.sha256
     {
         return Err(RunError::Unknown);
@@ -1707,13 +1726,19 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn namespace_retirement_wire_replays_keys_and_rejects_mismatched_receipt() {
+        if crate::peer_proof::rerun_without_loader_environment(
+            "managed_run::tests::namespace_retirement_wire_replays_keys_and_rejects_mismatched_receipt",
+        ) {
+            return;
+        }
         let _guard = crate::TEST_EXEC_HASH_LOCK.lock().await;
         let dir = tempfile::tempdir_in(std::env::var_os("TMPDIR").unwrap()).unwrap();
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let socket = dir.path().join("attempt.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
-        let executable = std::env::current_exe().unwrap();
+        let trusted = crate::peer_proof::TrustedTestExecutable::current().unwrap();
+        let executable = trusted.path().to_path_buf();
         let sha = format!("{:x}", Sha256::digest(fs::read(&executable).unwrap()));
         let peer = local_peer(
             socket,
@@ -1887,6 +1912,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn egress_actor_recovery_wire_is_opted_in_and_correlated() {
+        if crate::peer_proof::rerun_without_loader_environment(
+            "managed_run::tests::egress_actor_recovery_wire_is_opted_in_and_correlated",
+        ) {
+            return;
+        }
         let _hash_guard = crate::TEST_EXEC_HASH_LOCK.lock().await;
         let root = std::env::var_os("TMPDIR").unwrap();
         let dir = tempfile::tempdir_in(root).unwrap();
@@ -1894,7 +1924,8 @@ mod tests {
         let socket = dir.path().join("attempt.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
-        let executable = std::env::current_exe().unwrap();
+        let trusted = crate::peer_proof::TrustedTestExecutable::current().unwrap();
+        let executable = trusted.path().to_path_buf();
         let sha256 = format!("{:x}", Sha256::digest(fs::read(&executable).unwrap()));
         let uid = fs::metadata(dir.path()).unwrap().uid();
         let peer = local_peer(socket, uid, executable, sha256);
@@ -2091,6 +2122,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn pinned_run_wire_rejects_mismatch_before_authority() {
+        if crate::peer_proof::rerun_without_loader_environment(
+            "managed_run::tests::pinned_run_wire_rejects_mismatch_before_authority",
+        ) {
+            return;
+        }
         let _hash_guard = crate::TEST_EXEC_HASH_LOCK.lock().await;
         let root = std::env::var_os("TMPDIR").unwrap();
         let dir = tempfile::tempdir_in(root).unwrap();
@@ -2098,7 +2134,8 @@ mod tests {
         let socket = dir.path().join("attempt.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
-        let executable = std::env::current_exe().unwrap();
+        let trusted = crate::peer_proof::TrustedTestExecutable::current().unwrap();
+        let executable = trusted.path().to_path_buf();
         let sha256 = format!("{:x}", Sha256::digest(fs::read(&executable).unwrap()));
         let uid = fs::metadata(dir.path()).unwrap().uid();
         let peer = local_peer(socket, uid, executable, sha256);
@@ -2181,9 +2218,182 @@ mod tests {
         server.await.unwrap();
     }
 
+    /// The live peer proof refuses a pinned build whose loaded code is not the
+    /// pinned build in effect: loader variables, a tracer, a group/other-writable
+    /// or foreign-owned file, a configured path swapped to another inode, an
+    /// interpreter name or another digest. Each case runs a real child process
+    /// from a private copy of the test executable; the clean child is accepted.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verify_peer_refuses_untrusted_loaded_builds() {
+        use std::io::Read as _;
+        if let Some(ready) = std::env::var_os("POOL_PEER_PROOF_READY") {
+            let staged = PathBuf::from(&ready).with_extension("staged");
+            fs::write(&staged, std::process::id().to_string()).unwrap();
+            fs::rename(&staged, &ready).unwrap();
+            let mut sink = Vec::new();
+            let _ = std::io::stdin().read_to_end(&mut sink);
+            return;
+        }
+        let _hash_guard = crate::TEST_EXEC_HASH_LOCK.blocking_lock();
+        let directory = tempfile::tempdir_in(std::env::var_os("TMPDIR").unwrap()).unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let root = fs::canonicalize(directory.path()).unwrap();
+        let uid = fs::metadata(&root).unwrap().uid();
+        let executable = root.join("run-peer");
+        fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let sha256 = format!("{:x}", Sha256::digest(fs::read(&executable).unwrap()));
+        struct Child(std::process::Child, u32);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let spawn = |program: &std::path::Path, prefix: &[&str], env: &[(&str, &str)]| {
+            let ready = root.join(format!("ready-{}", crate::domain::id()));
+            let mut command = std::process::Command::new(program);
+            command
+                .args(prefix)
+                .args([
+                    "--exact",
+                    "managed_run::tests::verify_peer_refuses_untrusted_loaded_builds",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env("POOL_PEER_PROOF_READY", &ready)
+                .envs(env.iter().copied())
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            let mut child = Child(command.spawn().unwrap(), 0);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while !ready.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "peer fixture start: {program:?} {prefix:?} {env:?}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            child.1 = fs::read_to_string(&ready).unwrap().parse().unwrap();
+            child
+        };
+        let peer = |path: &std::path::Path, sha256: &str| {
+            local_peer(
+                root.join("attempt.sock"),
+                uid,
+                path.to_path_buf(),
+                sha256.into(),
+            )
+        };
+
+        let clean = spawn(&executable, &[], &[]);
+        assert_eq!(verify_peer(clean.1, &peer(&executable, &sha256)), Ok(()));
+        // Wrong build: the loaded bytes do not have the pinned digest.
+        let other = format!("{:x}", Sha256::digest(b"another build"));
+        assert_eq!(
+            verify_peer(clean.1, &peer(&executable, &other)),
+            Err(RunError::Unknown)
+        );
+        // The kernel denies writes to the running file; the proof depends on it.
+        let denied = fs::OpenOptions::new().write(true).open(&executable);
+        assert_eq!(
+            denied.err().and_then(|error| error.raw_os_error()),
+            Some(26)
+        );
+        // Current mode: a group- or other-writable loaded file is refused.
+        for mode in [0o775, 0o757] {
+            fs::set_permissions(&executable, fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(
+                verify_peer(clean.1, &peer(&executable, &sha256)),
+                Err(RunError::Unknown),
+                "mode {mode:o}"
+            );
+        }
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(verify_peer(clean.1, &peer(&executable, &sha256)), Ok(()));
+        // Current owner: a loaded file owned by neither the UID nor root is refused.
+        let loaded = fs::metadata(format!("/proc/{}/exe", clean.1)).unwrap();
+        assert_eq!(
+            crate::config::trusted_executable_metadata(&loaded, uid.wrapping_add(1)),
+            Err("untrusted_owner")
+        );
+        assert_eq!(
+            crate::config::trusted_executable_metadata(&loaded, uid),
+            Ok(())
+        );
+
+        // Loader variables in the peer's initial environment.
+        for variable in [
+            ("LD_PRELOAD", "/nonexistent/synthetic-preload.so"),
+            ("LD_LIBRARY_PATH", "/nonexistent"),
+            ("LD_AUDIT", "/nonexistent/synthetic-audit.so"),
+        ] {
+            let loaded = spawn(&executable, &[], &[variable]);
+            assert_eq!(
+                verify_peer(loaded.1, &peer(&executable, &sha256)),
+                Err(RunError::Unknown),
+                "{}",
+                variable.0
+            );
+        }
+
+        // A traced peer. strace is optional host tooling; the TracerPid parser
+        // is covered by peer_proof unit tests either way.
+        let strace = std::path::Path::new("/usr/bin/strace");
+        if strace.is_file() {
+            let program = executable.to_str().unwrap();
+            let traced = spawn(strace, &["-qq", "-o", "/dev/null", "--", program], &[]);
+            let status = fs::read_to_string(format!("/proc/{}/status", traced.1)).unwrap();
+            assert!(!status.contains("TracerPid:\t0\n"), "fixture is traced");
+            assert_eq!(
+                fs::read_link(format!("/proc/{}/exe", traced.1)).unwrap(),
+                executable
+            );
+            assert_eq!(
+                verify_peer(traced.1, &peer(&executable, &sha256)),
+                Err(RunError::Unknown)
+            );
+        } else {
+            eprintln!("traced-peer case not run: /usr/bin/strace is absent");
+        }
+
+        // An interpreter name identifies no program, even with the right digest.
+        let interpreter = root.join("python3");
+        fs::copy(&executable, &interpreter).unwrap();
+        fs::set_permissions(&interpreter, fs::Permissions::from_mode(0o755)).unwrap();
+        let named = spawn(&interpreter, &[], &[]);
+        assert_eq!(
+            verify_peer(named.1, &peer(&interpreter, &sha256)),
+            Err(RunError::Unknown)
+        );
+
+        // The configured path swapped to a byte-identical file with another inode.
+        let replacement = root.join("run-peer.new");
+        fs::copy(&executable, &replacement).unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::rename(&replacement, &executable).unwrap();
+        assert_eq!(
+            verify_peer(clean.1, &peer(&executable, &sha256)),
+            Err(RunError::Unknown)
+        );
+        let fresh = spawn(&executable, &[], &[]);
+        assert_eq!(verify_peer(fresh.1, &peer(&executable, &sha256)), Ok(()));
+        assert_eq!(
+            verify_peer(clean.1, &peer(&executable, &sha256)),
+            Err(RunError::Unknown)
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn rootless_ingress_egress_and_admission_recovery_use_pinned_wire() {
+        if crate::peer_proof::rerun_without_loader_environment(
+            "managed_run::tests::rootless_ingress_egress_and_admission_recovery_use_pinned_wire",
+        ) {
+            return;
+        }
         use crate::managed_state::SuccessorLink;
         let _hash_guard = crate::TEST_EXEC_HASH_LOCK.lock().await;
         let root = std::env::var_os("TMPDIR").unwrap();
@@ -2192,7 +2402,8 @@ mod tests {
         let socket = dir.path().join("attempt.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
-        let executable = std::env::current_exe().unwrap();
+        let trusted = crate::peer_proof::TrustedTestExecutable::current().unwrap();
+        let executable = trusted.path().to_path_buf();
         let sha256 = format!("{:x}", Sha256::digest(fs::read(&executable).unwrap()));
         let uid = fs::metadata(dir.path()).unwrap().uid();
         let peer = local_peer(socket, uid, executable, sha256);
@@ -2426,6 +2637,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn p3_enrollment_wire_exact_keys_and_typed_errors() {
+        if crate::peer_proof::rerun_without_loader_environment(
+            "managed_run::tests::p3_enrollment_wire_exact_keys_and_typed_errors",
+        ) {
+            return;
+        }
         use crate::managed_enrollment::{Failure, Key};
         use crate::managed_state::SuccessorLink;
         let _hash_guard = crate::TEST_EXEC_HASH_LOCK.lock().await;
@@ -2435,7 +2651,8 @@ mod tests {
         let socket = dir.path().join("attempt.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
-        let executable = std::env::current_exe().unwrap();
+        let trusted = crate::peer_proof::TrustedTestExecutable::current().unwrap();
+        let executable = trusted.path().to_path_buf();
         let sha256 = format!("{:x}", Sha256::digest(fs::read(&executable).unwrap()));
         let uid = fs::metadata(dir.path()).unwrap().uid();
         let peer = local_peer(socket, uid, executable, sha256);

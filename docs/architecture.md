@@ -537,6 +537,42 @@ executable before accessing the Store. A namespace seal fences later local work;
 it reports `draining` until tracked abort and settlement recovery is durable.
 The exact proposed wire is in the shared `contracts/pool-p1-wire.md`.
 
+Pool verifies every pinned Pool or Run peer on Linux before it sends or
+accepts any bytes, following errata E13/E14 of the attempt-binding
+contract. That covers the Run attempt endpoint, the Run reader on the Pool
+socket, and the frontend and resident checking each other. Pool takes the PID
+from the connected socket's kernel credentials. The peer must have the
+expected effective UID, share Pool's PID namespace and have unchanged start
+ticks. Its initial environment must have no `LD_*` variable, and
+`/proc/PID/status` must show no tracer. The pinned path must be canonical and
+must not name a generic interpreter (`python3`, `bash`, `node` and similar).
+`/etc/ld.so.preload` must be absent or blank. Pool opens `/proc/PID/exe` and
+checks that descriptor for all of the following:
+
+- its inode equals the inode at the configured path;
+- it is currently a regular file of at most 512 MiB, owned by the Pool UID or
+  root, that group and other cannot write;
+- its `mnt_id` from fdinfo resolves to exactly one mountinfo record of type
+  ext2/3/4, xfs, btrfs or tmpfs, where the kernel denies writes to a running
+  executable;
+- its own SHA-256 equals the pin.
+
+After hashing, Pool requires the following to be unchanged: the descriptor's
+full identity (dev, ino, owner, mode, size, mtime, ctime), the link target, the
+configured path's inode, the process facts, the environment and tracer checks,
+and the preload list. Any unreadable, ambiguous or changed fact fails closed.
+Pool refuses overlay, network and FUSE filesystems. Non-Linux platforms have
+no such evidence and refuse these routes. Wall-clock time is never used.
+Accepted residuals, the same as Run's own peer proof:
+
+- the PID can be reused before the socket credential is read;
+- a tracer can attach after the proof;
+- a peer can rewrite its own environment memory after exec, which requires
+  foreign code that the other checks exclude.
+
+The Bridge managed-server proof belongs to the Bridge SDK (see
+`bridge_server_executable` above). The legacy Run socket checks only the peer UID.
+
 Schema v7 adds separate managed binding generations, binding epochs, original
 contexts and rebind records; v8 adds managed intents, domain-key reservations and
 ballot provenance; v9 adds an open-ballot invalidation overlay, retained binding
@@ -606,7 +642,8 @@ Run `agent-pool repin --config /absolute/path/to/pool.toml`, then start the Pool
 resident separately. This command does not stop or start any service. It requires
 the existing private Pool store and its exclusive writer lease. It checks every
 fixed route field first. Then it proves each candidate executable on disk: the
-absolute path is already canonical, and it names a regular file owned by the Pool
+absolute path is already canonical and does not name a generic interpreter, and
+it names a regular file owned by the Pool
 UID or root that group and other cannot write, whose digest equals the configured
 SHA-256. Only then does it authenticate both candidate service peers and their
 configured stores, through the same pinned capability exchanges and live

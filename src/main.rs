@@ -38,6 +38,7 @@ mod managed_session;
 )]
 mod managed_state;
 mod observer;
+mod peer_proof;
 mod response;
 #[allow(
     dead_code,

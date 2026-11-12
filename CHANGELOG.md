@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Security
+
+- The live proof for pinned Pool and Run peers now meets errata E13/E14, matching Run's own peer proof. It applies to the Run attempt endpoint, the Run reader and the managed frontend/resident session. The peer may not have any `LD_*` variable in its initial environment or a tracer, and `/etc/ld.so.preload` must be absent or blank. The pinned path may not name a generic interpreter. Pool opens `/proc/PID/exe` and checks the same descriptor three ways: the file must currently be owned by the Pool UID or root without group/other write; its fdinfo `mnt_id` must resolve to a filesystem that denies writes to a running executable (ext2/3/4, xfs, btrfs, tmpfs); and its own digest must equal the pin. After hashing, its identity and the configured path's inode must be unchanged. Previously Pool accepted a genuine pinned build started with a loader override or under a tracer, a writable loaded file, or a file on any filesystem. Operator re-pin also refuses an interpreter path.
+- Tests that use the test executable as a trusted peer re-run themselves without `LD_*` variables (nextest exports `LD_LIBRARY_PATH`), and drop group/other write from the executable while they run.
+
 ### Changed
 
 - Stale test scratch cleanup accepts only canonical decimal PIDs and is skipped when the PID namespace is unknown.

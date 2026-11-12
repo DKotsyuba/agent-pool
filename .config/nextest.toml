@@ -17,6 +17,7 @@ filter = """
 test(=managed_run::tests::namespace_retirement_wire_replays_keys_and_rejects_mismatched_receipt)
 | test(=managed_run::tests::egress_actor_recovery_wire_is_opted_in_and_correlated)
 | test(=managed_run::tests::pinned_run_wire_rejects_mismatch_before_authority)
+| test(=managed_run::tests::verify_peer_refuses_untrusted_loaded_builds)
 | test(=managed_run::tests::rootless_ingress_egress_and_admission_recovery_use_pinned_wire)
 | test(=managed_run::tests::p3_enrollment_wire_exact_keys_and_typed_errors)
 | test(=managed_egress::tests::sdk_decoded_attempt_mismatch_known_unsent_is_not_delivered)

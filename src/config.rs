@@ -330,26 +330,41 @@ pub fn private_socket(path: &Path, uid: u32) -> Result<(), Fault> {
 /// Largest executable whose digest an operator re-pin computes.
 const MAX_EXECUTABLE: u64 = 512 * 1024 * 1024;
 
+/// Current ownership and mode of a pinned executable: a regular file of at most
+/// `MAX_EXECUTABLE` bytes, owned by `uid` or root, that group and other cannot
+/// write. Shared by the operator re-pin and the live peer proof. Returns a fixed
+/// nonsecret reason.
+pub(crate) fn trusted_executable_metadata(
+    metadata: &fs::Metadata,
+    uid: u32,
+) -> Result<(), &'static str> {
+    if !metadata.is_file() || metadata.len() > MAX_EXECUTABLE {
+        return Err("not_regular_file");
+    }
+    if metadata.uid() != uid && metadata.uid() != 0 {
+        return Err("untrusted_owner");
+    }
+    if metadata.permissions().mode() & 0o022 != 0 {
+        return Err("writable_by_others");
+    }
+    Ok(())
+}
+
 /// Proves a candidate pinned executable before an operator re-pin adopts it: the
-/// absolute path is already canonical, names a regular file owned by `uid` or root
-/// that group and other cannot write, and the opened file's digest equals `sha256`.
-/// The live peer proof stays with each authenticated exchange. Returns a fixed
-/// nonsecret reason for the operator.
+/// absolute path is already canonical, does not name a generic interpreter, names
+/// a regular file owned by `uid` or root that group and other cannot write, and
+/// the opened file's digest equals `sha256`. The live peer proof stays with each
+/// authenticated exchange. Returns a fixed nonsecret reason for the operator.
 pub(crate) fn trusted_executable(path: &Path, sha256: &str, uid: u32) -> Result<(), &'static str> {
     use sha2::{Digest, Sha256};
     if !path.is_absolute() || fs::canonicalize(path).ok().as_deref() != Some(path) {
         return Err("not_canonical");
     }
+    if crate::peer_proof::forbidden_interpreter(path) {
+        return Err("interpreter");
+    }
     let named = fs::symlink_metadata(path).map_err(|_| "unreadable")?;
-    if !named.is_file() || named.len() > MAX_EXECUTABLE {
-        return Err("not_regular_file");
-    }
-    if named.uid() != uid && named.uid() != 0 {
-        return Err("untrusted_owner");
-    }
-    if named.permissions().mode() & 0o022 != 0 {
-        return Err("writable_by_others");
-    }
+    trusted_executable_metadata(&named, uid)?;
     let mut file = fs::File::open(path).map_err(|_| "unreadable")?;
     let opened = file.metadata().map_err(|_| "unreadable")?;
     let identity = |meta: &fs::Metadata| {
@@ -522,7 +537,7 @@ mod tests {
         Ok(())
     }
 
-    /// A re-pinned executable must be canonical, trusted-owned, not writable by others and exact.
+    /// A re-pinned executable must be canonical, not an interpreter, trusted-owned, not writable by others and exact.
     #[test]
     fn trusted_executable_rejects_alias_owner_mode_and_digest()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -576,6 +591,13 @@ mod tests {
         assert_eq!(
             trusted_executable(&root, &sha, uid),
             Err("not_regular_file")
+        );
+        let interpreter = root.join("python3");
+        fs::copy(&path, &interpreter)?;
+        fs::set_permissions(&interpreter, fs::Permissions::from_mode(0o755))?;
+        assert_eq!(
+            trusted_executable(&interpreter, &sha, uid),
+            Err("interpreter")
         );
         Ok(())
     }

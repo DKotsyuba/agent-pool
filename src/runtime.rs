@@ -4412,6 +4412,11 @@ mod tests {
     #[tokio::test]
     async fn repin_cli_authenticates_both_candidates_before_commit()
     -> Result<(), Box<dyn std::error::Error>> {
+        if crate::peer_proof::rerun_without_loader_environment(
+            "runtime::tests::repin_cli_authenticates_both_candidates_before_commit",
+        ) {
+            return Ok(());
+        }
         use sha2::{Digest, Sha256};
         use tokio::io::AsyncReadExt;
 
@@ -7764,13 +7769,19 @@ mod tests {
     #[tokio::test]
     async fn managed_run_reader_is_build_and_namespace_fenced()
     -> Result<(), Box<dyn std::error::Error>> {
+        if crate::peer_proof::rerun_without_loader_environment(
+            "runtime::tests::managed_run_reader_is_build_and_namespace_fenced",
+        ) {
+            return Ok(());
+        }
         use sha2::Digest;
         let _hash_guard = crate::TEST_EXEC_HASH_LOCK.lock().await;
         let directory =
             tempfile::tempdir_in(std::env::var_os("TMPDIR").ok_or("task TMPDIR required")?)?;
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))?;
         let path = directory.path();
-        let executable = std::env::current_exe()?;
+        let trusted = crate::peer_proof::TrustedTestExecutable::current()?;
+        let executable = trusted.path().to_path_buf();
         let sha256 = format!("{:x}", sha2::Sha256::digest(fs::read(&executable)?));
         let uid = fs::metadata(path)?.uid();
         let mut config = Config {
@@ -7828,6 +7839,11 @@ mod tests {
     #[tokio::test]
     async fn managed_session_peer_requires_same_loaded_build()
     -> Result<(), Box<dyn std::error::Error>> {
+        if crate::peer_proof::rerun_without_loader_environment(
+            "runtime::tests::managed_session_peer_requires_same_loaded_build",
+        ) {
+            return Ok(());
+        }
         use tokio::io::AsyncReadExt;
 
         if let Some(socket) = std::env::var_os("POOL_MANAGED_PEER_FIXTURE") {
@@ -7854,7 +7870,8 @@ mod tests {
         let listener = UnixListener::bind(&path)?;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
         let uid = fs::metadata(&path)?.uid();
-        let original = std::env::current_exe()?;
+        let trusted = crate::peer_proof::TrustedTestExecutable::current()?;
+        let original = trusted.path().to_path_buf();
         // Same bytes and inode under another path. The link lives beside the
         // original so it stays on one filesystem even when TMPDIR is tmpfs.
         let link_directory =
@@ -9426,6 +9443,11 @@ mod tests {
     #[tokio::test]
     async fn consensus_superseded_rebinds_before_rejecting_old_vote()
     -> Result<(), Box<dyn std::error::Error>> {
+        if crate::peer_proof::rerun_without_loader_environment(
+            "runtime::tests::consensus_superseded_rebinds_before_rejecting_old_vote",
+        ) {
+            return Ok(());
+        }
         use crate::managed_state::tests::{
             consumed_admission, fake_config, fixture_with_uid, index_managed_member,
             prepare_command, reserve,
@@ -9438,7 +9460,8 @@ mod tests {
         let socket = directory.path().join("attempt.sock");
         let listener = UnixListener::bind(&socket)?;
         fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
-        let executable = std::env::current_exe()?;
+        let trusted = crate::peer_proof::TrustedTestExecutable::current()?;
+        let executable = trusted.path().to_path_buf();
         let sha256 = format!("{:x}", sha2::Sha256::digest(fs::read(&executable)?));
         let endpoint = crate::managed_state::RunEndpointPin {
             route: binding.run_route.clone(),
