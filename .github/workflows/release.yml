@@ -53,7 +53,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - run: test "$(uname -m)" = arm64
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: product-check-v2-macos-26-${{ runner.arch }}
           cache-bin: false
@@ -81,7 +81,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - run: test "$(uname -m)" = arm64
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: product-package-v1-macos-26-${{ runner.arch }}
           cache-bin: false
@@ -94,7 +94,7 @@ jobs:
           cargo xtask package verify "$bundle"
           mkdir "$RUNNER_TEMP/upload"
           cp "$bundle/"* "$RUNNER_TEMP/upload/"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: payload
           path: ${{ runner.temp }}/upload/
@@ -114,7 +114,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - run: test "$(uname -s):$(uname -m)" = Linux:x86_64
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: product-check-v1-ubuntu-24.04-${{ runner.arch }}
           cache-bin: false
@@ -143,7 +143,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - run: test "$(uname -s):$(uname -m)" = Linux:x86_64
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: product-package-v1-ubuntu-24.04-${{ runner.arch }}
           cache-bin: false
@@ -208,7 +208,7 @@ jobs:
           test -z "$dirty"
           head=$(git rev-parse HEAD)
           test "$head" = "$GITHUB_SHA"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: payload-linux
           path: ${{ runner.temp }}/linux-payload/
@@ -232,7 +232,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - run: test "$(uname -m)" = arm64
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: product-check-v2-macos-26-${{ runner.arch }}
           cache-bin: false
@@ -243,11 +243,11 @@ jobs:
         with:
           path: ~/.cargo/bin/cargo-deny
           key: cargo-deny-${{ runner.os }}-${{ runner.arch }}-macos-26-0.20.2-${{ hashFiles('rust-toolchain.toml') }}
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: payload
           path: ${{ runner.temp }}/payload
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: payload-linux
           path: ${{ runner.temp }}/payload-linux
@@ -297,7 +297,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - run: test "$(uname -s):$(uname -m)" = Linux:x86_64
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: product-check-v1-ubuntu-24.04-${{ runner.arch }}
           cache-bin: false
@@ -307,7 +307,7 @@ jobs:
         with:
           path: ~/.cargo/bin/cargo-deny
           key: cargo-deny-${{ runner.os }}-${{ runner.arch }}-ubuntu-24.04-0.20.2-${{ hashFiles('rust-toolchain.toml') }}
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: payload-linux
           path: ${{ runner.temp }}/payload-linux
