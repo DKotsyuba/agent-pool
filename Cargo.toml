@@ -20,8 +20,8 @@ serde_json = { version = "=1.0.154", features = ["float_roundtrip", "raw_value"]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "net", "sync", "signal", "time", "process"] }
 rusqlite = { version = "=0.41.1", features = ["bundled"] }
 uuid = { version = "=1.26.1", features = ["v4"] }
-# Agent Bridge v0.7.0 (tag v0.7.0); pinned by rev for immutability.
-bridge-sdk = { git = "https://github.com/DKotsyuba/agent-bridge.git", rev = "c12376fe8a89fd18dd4bb21e0c55aec1308e1e5f" }
+# Agent Bridge v0.7.2 (tag v0.7.2); pinned by rev for immutability.
+bridge-sdk = { git = "https://github.com/DKotsyuba/agent-bridge.git", rev = "2743c00cb4a0e9d3f6633d850b550d264dbfb6f1" }
 sha2 = "0.10"
 fs2 = "0.4"
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std", "zeroize"] }
