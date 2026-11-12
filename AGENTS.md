@@ -5,7 +5,7 @@ docs/architecture.md is the behavior truth source.
 
 ## Single workflow
 
-`cargo xtask check` is the full non-mutating gate.
+`cargo xtask check` is the full non-mutating gate. It requires cargo-nextest; set `XTASK_TEST_TMPFS=0` to keep test temporaries off tmpfs. Add each new `tests/*.rs` as a module of `tests/it/main.rs`.
 Use `cargo xtask add-tool NAME --effect read --response entity|page|ack` to add a typed skeleton.
 Definitions live in src/tools/mod.rs; JSON is an exported snapshot. `contract update` is explicit.
 Generated stubs remain unimplemented and release-blocking until their behavior and tests are reviewed.

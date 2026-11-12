@@ -647,6 +647,17 @@ fn publish(
         return Err("acceptance inputs changed before protocol test".into());
     }
     let protocol_str = protocol.to_str().ok_or("non-UTF8 protocol test path")?;
+    // A renamed module must not turn acceptance into a run of zero tests.
+    let listed = helper(&project.root, protocol_str)
+        .args(["--list", "protocol::"])
+        .output()?;
+    if !listed.status.success()
+        || !String::from_utf8_lossy(&listed.stdout)
+            .lines()
+            .any(|line| line.ends_with(": test"))
+    {
+        return Err("acceptance filter `protocol::` selects no tests".into());
+    }
     if !helper(&project.root, protocol_str)
         .arg("protocol::")
         .env("MCP_TEST_BINARY", &binary)

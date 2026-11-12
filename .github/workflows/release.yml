@@ -198,6 +198,7 @@ jobs:
           head=$(git rev-parse HEAD)
           test "$head" = "$GITHUB_SHA"
           test "$(sha256sum "$PROTOCOL_TEST" | awk '{print $1}')" = "$EXPECTED_PROTOCOL_SHA256"
+          test "$("${clean[@]}" "$PROTOCOL_TEST" --list protocol:: | grep -c ': test$')" -gt 0
           MCP_TEST_BINARY="$binary" "${clean[@]}" "$PROTOCOL_TEST" protocol::
           "${clean[@]}" cargo xtask package verify "$RUNNER_TEMP/linux-payload"
           test "$(sha256sum "$binary" | awk '{print $1}')" = "$EXPECTED_BINARY_SHA256"

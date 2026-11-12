@@ -180,19 +180,34 @@ pub(crate) fn text(root: &Path, program: &str, args: &[&str]) -> Result<String> 
         .to_owned())
 }
 /// Private directory for test temporaries on tmpfs (`/dev/shm`), so
-/// filesystem-heavy tests avoid slow disk sync. Without tmpfs (for example on
-/// macOS) tests keep the inherited `TMPDIR`. The directory is removed on drop.
+/// filesystem-heavy tests avoid slow disk sync. Tests keep the inherited `TMPDIR`
+/// when tmpfs is absent, cannot execute files, has less than 1 GiB free, or
+/// `XTASK_TEST_TMPFS=0` is set. The directory is removed on drop; directories
+/// left by interrupted runs are removed on the next start.
 struct TestScratch(Option<PathBuf>);
 
 impl TestScratch {
-    /// Creates a fresh `0700` directory, or none when tmpfs is unavailable.
+    /// Creates a fresh `0700` directory, or none when tmpfs is unsuitable.
     fn create() -> Self {
+        if std::env::var_os("XTASK_TEST_TMPFS").is_some_and(|value| value == "0") {
+            return Self(None);
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
-            let dir = Path::new("/dev/shm").join(format!("xtask-{}", std::process::id()));
-            if fs::DirBuilder::new().mode(0o700).create(&dir).is_ok() {
-                return Self(Some(dir));
+            let base = Path::new("/dev/shm");
+            if base.is_dir() {
+                remove_stale_scratch(base);
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |elapsed| elapsed.subsec_nanos());
+                let dir = base.join(format!("xtask-{}-{nanos:09}", std::process::id()));
+                if fs::DirBuilder::new().mode(0o700).create(&dir).is_ok() {
+                    if scratch_usable(&dir) {
+                        return Self(Some(dir));
+                    }
+                    drop(fs::remove_dir_all(&dir));
+                }
             }
         }
         Self(None)
@@ -219,8 +234,69 @@ impl Drop for TestScratch {
     fn drop(&mut self) {
         if let Some(dir) = &self.0 {
             owner_writable(dir);
-            // Best effort: a leftover only costs tmpfs space until reboot.
+            // Best effort: a leftover is removed by the next run's stale cleanup.
             drop(fs::remove_dir_all(dir));
+        }
+    }
+}
+
+/// True when a script in `dir` can execute and at least 1 GiB is free there.
+#[cfg(unix)]
+fn scratch_usable(dir: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let probe = dir.join("probe");
+    let executes = fs::write(&probe, "#!/bin/sh\nexit 0\n").is_ok()
+        && fs::set_permissions(&probe, fs::Permissions::from_mode(0o700)).is_ok()
+        && Command::new(&probe)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+    drop(fs::remove_file(&probe));
+    // POSIX `df -Pk`: the second line's fourth column is the free space in KiB.
+    let free_kib = Command::new("df")
+        .arg("-Pk")
+        .arg(dir)
+        .output()
+        .ok()
+        .and_then(|output| {
+            String::from_utf8(output.stdout)
+                .ok()?
+                .lines()
+                .nth(1)?
+                .split_whitespace()
+                .nth(3)?
+                .parse::<u64>()
+                .ok()
+        });
+    executes && free_kib.is_some_and(|kib| kib >= 1024 * 1024)
+}
+
+/// Removes this user's scratch directories whose creating process has exited.
+#[cfg(unix)]
+fn remove_stale_scratch(base: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(me) = fs::metadata("/proc/self") else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(base) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("xtask-"))
+            .and_then(|rest| rest.split('-').next())
+        else {
+            continue;
+        };
+        let owned = entry
+            .metadata()
+            .is_ok_and(|meta| meta.is_dir() && meta.uid() == me.uid());
+        if owned && !Path::new("/proc").join(pid).exists() {
+            owner_writable(&entry.path());
+            drop(fs::remove_dir_all(entry.path()));
         }
     }
 }
@@ -240,6 +316,59 @@ fn owner_writable(dir: &Path) {
             }
         }
     }
+}
+
+/// Every test taking the in-process `TEST_EXEC_HASH_LOCK` must be in the nextest
+/// `exec-hash` group: nextest runs each test in its own process, so the lock alone
+/// no longer serializes them.
+fn exec_hash_tests_grouped(root: &Path) -> Result<()> {
+    let config = fs::read_to_string(root.join(".config/nextest.toml"))?;
+    let mut stack = vec![root.join("src")];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().is_none_or(|extension| extension != "rs") {
+                continue;
+            }
+            let source = fs::read_to_string(&path)?;
+            for (at, _) in source.match_indices("TEST_EXEC_HASH_LOCK.") {
+                let name = source[..at]
+                    .rfind("fn ")
+                    .and_then(|start| source[start + 3..].split(['(', '<']).next())
+                    .ok_or("TEST_EXEC_HASH_LOCK used outside a function")?;
+                if !config.contains(&format!("::{name})")) {
+                    return Err(format!(
+                        "{name} takes TEST_EXEC_HASH_LOCK but is not in the exec-hash nextest group"
+                    )
+                    .into());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// With `autotests = false` a `tests/*.rs` file that is not a module of
+/// `tests/it/main.rs` would silently never build; reject that.
+fn integration_tests_included(root: &Path) -> Result<()> {
+    let index = fs::read_to_string(root.join("tests/it/main.rs"))?;
+    for entry in fs::read_dir(root.join("tests"))? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|extension| extension == "rs") {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or("non-UTF8 integration-test file name")?;
+            if !index.contains(&format!("\"../{name}\"")) {
+                return Err(format!("tests/{name} is not a module of tests/it/main.rs").into());
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn run(root: &Path, program: &str, args: &[&str]) -> Result<()> {
@@ -425,6 +554,8 @@ impl Project {
                 }
             }
         }
+        integration_tests_included(&self.root)?;
+        exec_hash_tests_grouped(&self.root)?;
         println!("standard: structural checks passed (not a semantic or security certificate)");
         Ok(())
     }
@@ -477,8 +608,15 @@ impl Project {
                 "--all-features",
                 "--no-fail-fast",
             ],
-            vec!["test", "--frozen", "--workspace", "--doc"],
-            vec!["test", "--frozen", "--workspace", "--all-features", "--doc"],
+            vec!["test", "--frozen", "--workspace", "--doc", "--no-fail-fast"],
+            vec![
+                "test",
+                "--frozen",
+                "--workspace",
+                "--all-features",
+                "--doc",
+                "--no-fail-fast",
+            ],
         ] {
             if self.has_features || args.contains(&"--all-features") {
                 scratch.cargo(&self.root, &args)?;

@@ -75,7 +75,7 @@ project-specific temporary/build directories before checks.
 
 ```sh
 cargo check -p agent-pool --all-targets --offline --locked
-cargo test -p agent-pool --offline --locked
+cargo nextest run -p agent-pool --offline --locked
 cargo xtask contract update
 cargo xtask check
 ```

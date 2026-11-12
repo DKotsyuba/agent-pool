@@ -59,6 +59,8 @@ fn managed(path: &Path) -> bool {
             "rust-toolchain.toml",
             "install.sh",
             "tests/protocol.rs",
+            "tests/it/main.rs",
+            ".config/nextest.toml",
         ]
         .iter()
         .any(|s| path == Path::new(s))
@@ -115,7 +117,7 @@ pub fn execute(project: &Project, command: Template) -> Result<()> {
     println!(
         "{}",
         serde_json::to_string_pretty(
-            &serde_json::json!({"dry_run":true,"writes":0,"plan":plan,"manual_review":["Cargo.toml dependency changes", "family.toml profiles and versions", "product source and state migrations"]})
+            &serde_json::json!({"dry_run":true,"writes":0,"plan":plan,"manual_review":["Cargo.toml dependency changes", "Cargo.toml test target: `autotests = false` and `[[test]] name = \"it\"` (tests/it/main.rs) are required by xtask `--test it`", "family.toml profiles and versions", "product source and state migrations"]})
         )?
     );
     Ok(())

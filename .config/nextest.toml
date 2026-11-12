@@ -7,7 +7,8 @@ slow-timeout = { period = "60s", terminate-after = 10 }
 
 # nextest runs every test in its own process, so the in-process
 # `TEST_EXEC_HASH_LOCK` no longer serializes these tests. Every test that takes
-# that lock must be listed here to keep them one at a time.
+# that lock must be listed here to keep them one at a time; `cargo xtask check`
+# rejects a lock user missing from this list.
 [test-groups]
 exec-hash = { max-threads = 1 }
 
@@ -23,5 +24,6 @@ test(=managed_run::tests::namespace_retirement_wire_replays_keys_and_rejects_mis
 | test(=runtime::tests::managed_run_reader_is_build_and_namespace_fenced)
 | test(=runtime::tests::managed_session_peer_requires_same_loaded_build)
 | test(=runtime::tests::consensus_superseded_rebinds_before_rejecting_old_vote)
+| test(=managed_bridge::tests::typed_sdk_adapter_exchanges_with_isolated_b1_peer)
 """
 test-group = "exec-hash"
