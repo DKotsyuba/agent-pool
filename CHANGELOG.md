@@ -4,6 +4,7 @@
 
 ### Changed
 
+- Stale test scratch cleanup accepts only canonical decimal PIDs and is skipped when the PID namespace is unknown.
 - Gate test scratch directories are named with the PID namespace and a random suffix, and stale cleanup only removes directories of exited processes from the same namespace.
 - The integration-test check ignores commented-out module lines and requires `autotests = false`. Every `exec-hash` nextest group entry must name a test that takes `TEST_EXEC_HASH_LOCK`.
 - CI installs cargo-nextest into a runner-owned directory added to `PATH` (macOS runners lack `~/.cargo/bin`).
