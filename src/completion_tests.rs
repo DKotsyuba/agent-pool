@@ -2586,6 +2586,7 @@ async fn p3_hold_lost_ack_release_over_operator_socket() {
         run_socket: Some(socket.clone()),
         run_peer_uid: None,
         managed_run_reader: None,
+        observer_socket: None,
         managed_run_transport: None,
     };
     // Settlement stays off without the managed consensus transport.
@@ -2666,6 +2667,7 @@ fn worker_config(fixture: &Fixture, sockets: &tempfile::TempDir) -> crate::confi
         run_socket: Some(sockets.path().join("run.sock")),
         run_peer_uid: None,
         managed_run_reader: None,
+        observer_socket: None,
         managed_run_transport: None,
     }
 }

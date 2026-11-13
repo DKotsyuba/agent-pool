@@ -677,49 +677,100 @@ pub async fn frontend(request: Request, path: &Path) -> Result<Envelope, Fault> 
     })
     .await
     .map_err(|_| Fault::Internal)??;
-    let expected_kind = request.kind();
-    let expected_completion = match &request.operation {
-        Operation::CompletionGet(args) => Some(args.clone()),
-        _ => None,
-    };
-    let expected_proof = match &request.operation {
-        Operation::Get(args) if args.section == "run_proof" => Some((
-            args.pool_id.clone(),
-            args.member_id.clone().ok_or(Fault::Invalid)?,
-            args.expected_revision,
-        )),
-        _ => None,
-    };
+    let expected = Expected::of(&request)?;
     let bytes = serde_json::to_vec(&Ingress {
         observer_credential: credential,
         observe: request,
     })
     .map_err(|_| Fault::Invalid)?;
-    if bytes.len() >= MAX_FRAME {
+    tokio::time::timeout(EXCHANGE_TIMEOUT * 3, async {
+        let stream = integrations::connect(&config.socket_path, config.expected_uid).await?;
+        exchange(stream, bytes, &expected).await
+    })
+    .await
+    .map_err(|_| Fault::Unavailable)?
+}
+
+/// Reads through the resident's group-accessible observer socket; no config or credential.
+/// The socket path must pass the cross-user endpoint policy for `server_uid`, the connected
+/// peer must be `server_uid`, and the path identities must be unchanged after connecting.
+pub async fn socket_frontend(
+    request: Request,
+    path: &Path,
+    server_uid: u32,
+) -> Result<Envelope, Fault> {
+    request.validate()?;
+    if !path.is_absolute() || server_uid == u32::MAX {
         return Err(Fault::Invalid);
     }
-    tokio::time::timeout(EXCHANGE_TIMEOUT * 3, async {
-        let mut stream = integrations::connect(&config.socket_path, config.expected_uid).await?;
-        stream
-            .write_all(&bytes)
-            .await
-            .map_err(|_| Fault::Unavailable)?;
-        stream
-            .write_all(b"\n")
-            .await
-            .map_err(|_| Fault::Unavailable)?;
-        let envelope: Envelope =
-            serde_json::from_slice(&integrations::read_frame(&mut stream).await?)
+    let expected = Expected::of(&request)?;
+    let bytes = serde_json::to_vec(&request).map_err(|_| Fault::Invalid)?;
+    #[cfg(target_os = "linux")]
+    {
+        tokio::time::timeout(EXCHANGE_TIMEOUT * 3, async {
+            crate::config::identity_uid_map()?;
+            let before = crate::config::shared_run_socket(path, server_uid)?;
+            let stream = tokio::net::UnixStream::connect(path)
+                .await
                 .map_err(|_| Fault::Unavailable)?;
+            if stream.peer_cred().map_err(|_| Fault::Unavailable)?.uid() != server_uid
+                || crate::config::shared_run_socket(path, server_uid)? != before
+            {
+                return Err(Fault::Unavailable);
+            }
+            exchange(stream, bytes, &expected).await
+        })
+        .await
+        .map_err(|_| Fault::Unavailable)?
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (bytes, expected);
+        Err(Fault::Unavailable)
+    }
+}
+
+/// Request-derived correlation that every accepted reply must satisfy.
+pub(crate) struct Expected {
+    /// Success/error family of the request.
+    kind: &'static str,
+    /// Exact completion selector, when a completion page was requested.
+    completion: Option<crate::completion::GetRequest>,
+    /// Exact pool, member and optional revision, when a Run proof was requested.
+    proof: Option<(String, String, Option<u64>)>,
+}
+impl Expected {
+    /// Captures the correlation before the request is moved into its wire frame.
+    pub(crate) fn of(request: &Request) -> Result<Self, Fault> {
+        Ok(Self {
+            kind: request.kind(),
+            completion: match &request.operation {
+                Operation::CompletionGet(args) => Some(args.clone()),
+                _ => None,
+            },
+            proof: match &request.operation {
+                Operation::Get(args) if args.section == "run_proof" => Some((
+                    args.pool_id.clone(),
+                    args.member_id.clone().ok_or(Fault::Invalid)?,
+                    args.expected_revision,
+                )),
+                _ => None,
+            },
+        })
+    }
+    /// Accepts one exclusive branch of the requested family, or a server-side `error`
+    /// refusal issued before the request was decoded; contradictory data is unavailable.
+    fn check(&self, envelope: &Envelope) -> Result<(), Fault> {
+        let refused = envelope.kind == "error" && envelope.data.is_none();
         if envelope.schema_version != 1
-            || envelope.kind != expected_kind
+            || (envelope.kind != self.kind && !refused)
             || envelope.data.is_some() == envelope.error.is_some()
         {
             return Err(Fault::Unavailable);
         }
         if envelope.data.as_ref().is_some_and(|data| {
             !matches!(
-                (expected_kind, data),
+                (self.kind, data),
                 ("identity", Data::Identity(_))
                     | ("pool_page", Data::Pools(_))
                     | ("inventory_snapshot", Data::Inventory(_))
@@ -736,14 +787,15 @@ pub async fn frontend(request: Request, path: &Path) -> Result<Envelope, Fault> 
             return Err(Fault::Unavailable);
         }
         if let Some(Data::Completion(page)) = &envelope.data
-            && !expected_completion
+            && !self
+                .completion
                 .as_ref()
                 .is_some_and(|request| page.valid(request))
         {
             return Err(Fault::Unavailable);
         }
         if let Some(Data::RunProof(proof)) = &envelope.data {
-            let Some((pool_id, member_id, revision)) = &expected_proof else {
+            let Some((pool_id, member_id, revision)) = &self.proof else {
                 return Err(Fault::Unavailable);
             };
             if !proof.valid()
@@ -754,10 +806,30 @@ pub async fn frontend(request: Request, path: &Path) -> Result<Envelope, Fault> 
                 return Err(Fault::Unavailable);
             }
         }
-        Ok(envelope)
-    })
-    .await
-    .map_err(|_| Fault::Unavailable)?
+        Ok(())
+    }
+}
+
+/// Writes one bounded request line to an already authenticated stream and checks the reply.
+pub(crate) async fn exchange(
+    mut stream: tokio::net::UnixStream,
+    mut bytes: Vec<u8>,
+    expected: &Expected,
+) -> Result<Envelope, Fault> {
+    if bytes.len() >= MAX_FRAME {
+        return Err(Fault::Invalid);
+    }
+    bytes.push(b'\n');
+    // A server that refuses at admission closes without reading, so the write may fail;
+    // its refusal line is still readable and is the only reply accepted in that case.
+    let written = stream.write_all(&bytes).await.is_ok();
+    let envelope: Envelope = serde_json::from_slice(&integrations::read_frame(&mut stream).await?)
+        .map_err(|_| Fault::Unavailable)?;
+    if !written && (envelope.kind != "error" || envelope.data.is_some()) {
+        return Err(Fault::Unavailable);
+    }
+    expected.check(&envelope)?;
+    Ok(envelope)
 }
 /// Reads exactly one bounded UTF-8 JSON line through EOF; rejects trailing lines or bytes.
 /// EOF is required to prove there was no second line; source acquisition has no execution deadline.
@@ -776,12 +848,28 @@ async fn input() -> Result<Request, Fault> {
     }
     serde_json::from_slice(&bytes).map_err(|_| Fault::Invalid)
 }
+/// Where the CLI reads from: the owner grant in a config, or the group observer socket.
+pub enum Source<'a> {
+    /// Same-user config carrying `owner_observer_credential_file`.
+    Config(&'a Path),
+    /// Group-accessible observer socket served by `server_uid`.
+    Socket {
+        /// Absolute observer socket path.
+        path: &'a Path,
+        /// Required kernel UID of the serving resident.
+        server_uid: u32,
+    },
+}
+
 /// Fixed structured CLI branch; emits exactly one JSON line and no human prose.
-pub async fn cli(path: Option<&Path>) -> ExitCode {
+pub async fn cli(source: Option<Source<'_>>) -> ExitCode {
     let request = input().await;
     let kind = request.as_ref().map_or("error", Request::kind);
-    let result = match (request, path) {
-        (Ok(request), Some(path)) => frontend(request, path).await,
+    let result = match (request, source) {
+        (Ok(request), Some(Source::Config(path))) => frontend(request, path).await,
+        (Ok(request), Some(Source::Socket { path, server_uid })) => {
+            socket_frontend(request, path, server_uid).await
+        }
         (Err(error), _) => Err(error),
         (_, None) => Err(Fault::Unavailable),
     };

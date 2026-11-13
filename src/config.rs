@@ -49,6 +49,52 @@ pub struct Config {
     pub managed_run_reader: Option<ManagedRunReader>,
     /// Optional separately provisioned private Run attempt transport; absence disables it.
     pub managed_run_transport: Option<ManagedRunTransport>,
+    /// Optional group-accessible read-only observer endpoint; absence binds nothing.
+    pub observer_socket: Option<ObserverSocket>,
+}
+/// Linux-only read-only observer endpoint whose peers are authorized by kernel UID alone.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObserverSocket {
+    /// Absolute socket path in an existing directory owned by `expected_uid` or root that
+    /// group and other cannot write and other cannot access.
+    pub path: PathBuf,
+    /// Numeric group given to the socket; the resident must be a member of it.
+    pub gid: u32,
+    /// Socket mode, 0o660 (default) or 0o600.
+    #[serde(default = "observer_socket_mode")]
+    pub mode: u32,
+    /// Peer UIDs allowed to read; every other connection is refused before its request is read.
+    pub allowed_uids: Vec<u32>,
+}
+/// Group read/write without other access.
+fn observer_socket_mode() -> u32 {
+    0o660
+}
+/// Upper bound on configured observer peers.
+const MAX_OBSERVER_UIDS: usize = 32;
+impl ObserverSocket {
+    /// Rejects unsafe paths, modes, sentinel IDs and empty or oversized allowlists.
+    fn validate(&self, socket_path: &Path) -> Result<(), Fault> {
+        if !cfg!(target_os = "linux")
+            || !self.path.is_absolute()
+            || self
+                .path
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+            || self.path.file_name().is_none()
+            || self.path == socket_path
+            || self.path.as_os_str().len() > 100
+            || !matches!(self.mode, 0o600 | 0o660)
+            || self.gid == u32::MAX
+            || self.allowed_uids.is_empty()
+            || self.allowed_uids.len() > MAX_OBSERVER_UIDS
+            || self.allowed_uids.contains(&u32::MAX)
+        {
+            return Err(Fault::Invalid);
+        }
+        Ok(())
+    }
 }
 /// Exact same-UID Run reader build and Bridge namespace grant for private P1 reads.
 #[derive(Clone, Deserialize)]
@@ -260,6 +306,9 @@ impl Config {
         {
             return Err(Fault::Invalid);
         }
+        if let Some(observer) = &config.observer_socket {
+            observer.validate(&config.socket_path)?;
+        }
         Ok(config)
     }
 
@@ -461,6 +510,16 @@ fn run_directory_attributes(owner: u32, mode: u32, peer_uid: u32, immediate: boo
     (owner == 0 || owner == peer_uid) && mode & 0o022 == 0 && (!immediate || mode & 0o007 == 0)
 }
 
+/// Identity of the observer socket's immediate directory after the Run-directory policy:
+/// a nonsymlink directory owned by `uid` or root, without group/other write or other access.
+#[cfg(target_os = "linux")]
+pub(crate) fn observer_directory(socket: &Path, uid: u32) -> Result<(u64, u64), Fault> {
+    let parent = socket.parent().ok_or(Fault::Invalid)?;
+    let metadata = fs::symlink_metadata(parent).map_err(|_| Fault::Unavailable)?;
+    run_directory(&metadata, uid, true)?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
 /// Rejects links, foreign owners, special bits and world-accessible Run sockets.
 #[cfg(target_os = "linux")]
 fn run_endpoint(metadata: &fs::Metadata, peer_uid: u32) -> Result<(), Fault> {
@@ -599,6 +658,74 @@ mod tests {
             trusted_executable(&interpreter, &sha, uid),
             Err("interpreter")
         );
+        Ok(())
+    }
+
+    /// The observer socket section is optional, Linux-only and strictly bounded.
+    #[test]
+    fn observer_socket_configuration_is_validated() -> Result<(), Box<dyn std::error::Error>> {
+        let directory =
+            tempfile::tempdir_in(std::env::var_os("TMPDIR").ok_or("task TMPDIR required")?)?;
+        let path = directory.path().join("config.toml");
+        let base = r#"
+socket_path = "/pool.sock"
+database_path = "/pool.sqlite"
+expected_uid = 1003
+bridge_registration_socket = "/adapter.sock"
+bridge_core_socket = "/core.sock"
+bridge_credential_file = "/token"
+bridge_producer_id = "fixture"
+bridge_audience = "fixture"
+bridge_server_executable = "/fixture/bridge"
+bridge_server_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+"#;
+        fs::write(&path, base)?;
+        assert!(Config::load(&path)?.observer_socket.is_none());
+        let section = "[observer_socket]\npath = \"/run/agent-pool/observer.sock\"\ngid = 986\nallowed_uids = [1000]\n";
+        fs::write(&path, format!("{base}{section}"))?;
+        if cfg!(target_os = "linux") {
+            let observer = Config::load(&path)?
+                .observer_socket
+                .ok_or("observer section")?;
+            assert_eq!(observer.mode, 0o660);
+            assert_eq!(observer.gid, 986);
+            assert_eq!(observer.allowed_uids, [1000]);
+            fs::write(&path, format!("{base}{section}mode = 0o600\n"))?;
+            assert_eq!(
+                Config::load(&path)?.observer_socket.ok_or("mode")?.mode,
+                0o600
+            );
+        } else {
+            assert!(matches!(Config::load(&path), Err(Fault::Invalid)));
+        }
+        for invalid in [
+            section.replace("/run/agent-pool/observer.sock", "relative.sock"),
+            section.replace("/run/agent-pool/observer.sock", "/run/../observer.sock"),
+            section.replace("/run/agent-pool/observer.sock", "/pool.sock"),
+            section.replace(
+                "/run/agent-pool/observer.sock",
+                &format!("/{}", "a".repeat(100)),
+            ),
+            section.replace("[1000]", "[]"),
+            section.replace("[1000]", "[4294967295]"),
+            section.replace(
+                "[1000]",
+                &format!("{:?}", vec![1000; MAX_OBSERVER_UIDS + 1]),
+            ),
+            section.replace("986", "4294967295"),
+            section.replace("gid = 986\n", ""),
+            section.replace("allowed_uids = [1000]\n", ""),
+            format!("{section}mode = 0o666\n"),
+            format!("{section}mode = 0o640\n"),
+            format!("{section}mode = 0o4660\n"),
+            format!("{section}credential_file = \"/token\"\n"),
+        ] {
+            fs::write(&path, format!("{base}{invalid}"))?;
+            assert!(
+                matches!(Config::load(&path), Err(Fault::Invalid)),
+                "accepted {invalid}"
+            );
+        }
         Ok(())
     }
 

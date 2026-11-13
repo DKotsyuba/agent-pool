@@ -552,6 +552,12 @@ pub async fn observe(config: Config, address: String) -> Result<String, Fault> {
 /// Reads exactly one bounded newline frame; EOF, extra same-read frames and oversize fail closed.
 /// Cancellation discards the connection, so partial I/O is never restarted on the same stream.
 pub async fn read_frame(stream: &mut UnixStream) -> Result<Vec<u8>, Fault> {
+    read_frame_limited(stream, MAX_FRAME).await
+}
+
+/// `read_frame` with a smaller per-endpoint ceiling; never exceeds `MAX_FRAME`.
+pub async fn read_frame_limited(stream: &mut UnixStream, limit: usize) -> Result<Vec<u8>, Fault> {
+    let limit = limit.min(MAX_FRAME);
     let mut frame = Vec::new();
     let mut buffer = [0_u8; 8192];
     loop {
@@ -563,13 +569,13 @@ pub async fn read_frame(stream: &mut UnixStream) -> Result<Vec<u8>, Fault> {
             return Err(Fault::Unavailable);
         }
         if let Some(end) = buffer[..count].iter().position(|byte| *byte == b'\n') {
-            if frame.len() + end > MAX_FRAME || end + 1 != count {
+            if frame.len() + end > limit || end + 1 != count {
                 return Err(Fault::Invalid);
             }
             frame.extend_from_slice(&buffer[..end]);
             return Ok(frame);
         }
-        if frame.len() + count > MAX_FRAME {
+        if frame.len() + count > limit {
             return Err(Fault::Invalid);
         }
         frame.extend_from_slice(&buffer[..count]);
@@ -1722,6 +1728,7 @@ mod tests {
             run_socket: Some(path.join("run.sock")),
             run_peer_uid: None,
             managed_run_reader: None,
+            observer_socket: None,
             managed_run_transport: None,
         }
     }

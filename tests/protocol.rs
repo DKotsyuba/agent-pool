@@ -871,6 +871,88 @@ async fn observer_cli_errors_are_one_structured_line() {
     }
 }
 
+/// `observe --socket` needs `--server-uid`, excludes `--config`, and refuses an endpoint that
+/// fails the cross-user path policy with one structured line, before connecting.
+#[tokio::test]
+async fn observer_cli_socket_mode_is_explicit_and_fail_closed() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let directory =
+        tempfile::tempdir_in(std::env::var_os("TMPDIR").expect("task TMPDIR required")).unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o750)).unwrap();
+    let socket = directory.path().join("observer.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o660)).unwrap();
+    let uid = std::fs::metadata(&socket).unwrap().uid();
+    let input = b"{\"schema_version\":1,\"operation\":\"identity\",\"params\":{}}\n";
+    let run = |args: Vec<std::ffi::OsString>| async move {
+        let mut child = tokio::process::Command::new(binary())
+            .arg("observe")
+            .args(args)
+            .env_clear()
+            .kill_on_drop(true)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(input).await.unwrap();
+        drop(stdin);
+        tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+            .await
+            .expect("observer CLI fixture deadline")
+            .unwrap()
+    };
+    for args in [
+        vec!["--socket".into(), socket.clone().into_os_string()],
+        vec!["--server-uid".into(), uid.to_string().into()],
+        vec![
+            "--socket".into(),
+            socket.clone().into_os_string(),
+            "--server-uid".into(),
+            uid.to_string().into(),
+            "--config".into(),
+            directory.path().join("config.toml").into_os_string(),
+        ],
+    ] {
+        let output = run(args).await;
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+    }
+    // Test directories sit below non-root ancestors owned by another user, or the
+    // claimed server UID differs from the socket owner: both fail before connecting.
+    let other = if uid == 0 { 1 } else { uid - 1 };
+    let trusted = directory.path().ancestors().skip(1).all(|ancestor| {
+        std::fs::metadata(ancestor).is_ok_and(|meta| meta.uid() == 0 || meta.uid() == uid)
+    });
+    for server_uid in [uid, other] {
+        if trusted && server_uid == uid {
+            continue;
+        }
+        let output = run(vec![
+            "--socket".into(),
+            socket.clone().into_os_string(),
+            "--server-uid".into(),
+            server_uid.to_string().into(),
+        ])
+        .await;
+        assert!(!output.status.success());
+        assert!(output.stderr.is_empty());
+        assert_eq!(
+            output.stdout.iter().filter(|byte| **byte == b'\n').count(),
+            1
+        );
+        let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(envelope["kind"], "identity");
+        assert_eq!(envelope["error"]["code"], "unavailable");
+    }
+    let accepted = tokio::time::timeout(Duration::from_millis(50), listener.accept()).await;
+    assert!(
+        accepted.is_err(),
+        "CLI must not connect to an untrusted endpoint"
+    );
+}
+
 /// The CLI loads only its protected observer token and forwards to the existing socket, without opening a DB.
 #[tokio::test]
 async fn observer_cli_uses_separate_credential_and_resident() {

@@ -38,6 +38,7 @@ mod managed_session;
 )]
 mod managed_state;
 mod observer;
+mod observer_socket;
 mod peer_proof;
 mod response;
 #[allow(
@@ -73,8 +74,14 @@ enum Commands {
     /// Read owner projections from an existing resident using one structured stdin request.
     Observe {
         /// Explicit absolute config containing the separately provisioned observer credential.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "socket")]
         config: Option<PathBuf>,
+        /// Absolute group-accessible observer socket; needs no config or credential.
+        #[arg(long, requires = "server_uid")]
+        socket: Option<PathBuf>,
+        /// Required UID of the resident serving `--socket`.
+        #[arg(long, requires = "socket")]
+        server_uid: Option<u32>,
     },
     /// Run the stdio frontend; missing configuration still permits catalog and product identity.
     Mcp {
@@ -296,7 +303,20 @@ fn qualification() -> &'static str {
 #[tokio::main]
 async fn main() -> ExitCode {
     match Cli::parse().command {
-        Commands::Observe { config } => observer::cli(config.as_deref()).await,
+        Commands::Observe {
+            config,
+            socket,
+            server_uid,
+        } => {
+            let source = match (&config, &socket, server_uid) {
+                (Some(path), None, None) => Some(observer::Source::Config(path)),
+                (None, Some(path), Some(server_uid)) => {
+                    Some(observer::Source::Socket { path, server_uid })
+                }
+                _ => None,
+            };
+            observer::cli(source).await
+        }
         Commands::SelfInstall {
             bundle,
             home,

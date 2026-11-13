@@ -28,7 +28,7 @@ const MAX_WAITERS: usize = 8;
 /// Serial observer/outbox cycle cadence; missed ticks are skipped, never replayed in bursts.
 const OBSERVATION_INTERVAL: Duration = Duration::from_secs(5);
 /// One SQLite writer shared only through finite blocking store operations.
-type SharedStore = Arc<Mutex<Store>>;
+pub(crate) type SharedStore = Arc<Mutex<Store>>;
 
 /// A live frontend and recovery must never drive the same durable work at once.
 #[derive(Clone, Hash, PartialEq, Eq)]
@@ -88,13 +88,13 @@ struct Request {
 }
 
 /// Removes only the socket inode created by this resident after every owned task has ended.
-struct SocketGuard {
+pub(crate) struct SocketGuard {
     /// Bound socket path, never an unrelated discovered endpoint.
-    path: PathBuf,
+    pub(crate) path: PathBuf,
     /// Original filesystem device for replacement-safe cleanup.
-    device: u64,
+    pub(crate) device: u64,
     /// Original inode for replacement-safe cleanup.
-    inode: u64,
+    pub(crate) inode: u64,
 }
 impl Drop for SocketGuard {
     /// Best-effort endpoint cleanup; replacement files are preserved and data is never deleted.
@@ -110,7 +110,7 @@ impl Drop for SocketGuard {
 
 /// Offloads one bounded store transaction; no mutex guard survives a provider await.
 /// Poison or worker panic fails closed rather than continuing potentially damaged state.
-async fn stored<T, F>(store: &SharedStore, operation: F) -> Result<T, Fault>
+pub(crate) async fn stored<T, F>(store: &SharedStore, operation: F) -> Result<T, Fault>
 where
     T: Send + 'static,
     F: FnOnce(&mut Store) -> Result<T, Fault> + Send + 'static,
@@ -3402,6 +3402,14 @@ pub async fn serve(config_path: &Path) -> Result<(), Fault> {
     }
     let store = Arc::new(Mutex::new(opened));
     let (listener, _guard) = listener(&config).await?;
+    let (observer_listener, _observer_guard, observer_uids) = match &config.observer_socket {
+        Some(settings) => {
+            let (listener, guard) = crate::observer_socket::listener(&config, settings).await?;
+            (Some(listener), Some(guard), settings.allowed_uids.clone())
+        }
+        None => (None, None, Vec::new()),
+    };
+    let observer_permits = Arc::new(Semaphore::new(crate::observer_socket::MAX_CONNECTIONS));
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|_| Fault::Unavailable)?;
     let (stop, stopped) = watch::channel(false);
@@ -3441,9 +3449,21 @@ pub async fn serve(config_path: &Path) -> Result<(), Fault> {
                 let stopped = stopped.clone();
                 connections.spawn(async move { let _permit = permit; connection(stream, config, store, activity, waits, stopped).await });
             }
+            accepted = async {
+                match &observer_listener {
+                    Some(listener) => listener.accept().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let (stream, _) = match accepted { Ok(value) => value, Err(_) => break Err(Fault::Unavailable) };
+                let Some((stream, permit)) = crate::observer_socket::admit(stream, &observer_uids, &observer_permits) else { continue; };
+                let store = Arc::clone(&store);
+                connections.spawn(async move { let _permit = permit; crate::observer_socket::connection(stream, store).await });
+            }
         }
     };
     drop(listener);
+    drop(observer_listener);
     let _ = stop.send(true);
     let mut final_result = result;
     while let Some(outcome) = connections.join_next().await {
@@ -4652,6 +4672,7 @@ mod tests {
             run_socket: Some(path.join("run.sock")),
             run_peer_uid: None,
             managed_run_reader: None,
+            observer_socket: None,
             managed_run_transport: None,
         };
         let socket = config.run_socket.as_ref().ok_or("Run socket")?;
@@ -5552,6 +5573,7 @@ mod tests {
             run_socket: Some(path.join("run.sock")),
             run_peer_uid: None,
             managed_run_reader: None,
+            observer_socket: None,
             managed_run_transport: None,
         };
         let socket = config.run_socket.as_ref().ok_or("missing socket")?;
@@ -5697,6 +5719,7 @@ mod tests {
             run_socket: Some(path.join("run.sock")),
             run_peer_uid: None,
             managed_run_reader: None,
+            observer_socket: None,
             managed_run_transport: None,
         };
         let listener = UnixListener::bind(config.run_socket.as_ref().ok_or("Run socket")?)?;
@@ -5804,6 +5827,7 @@ mod tests {
             run_socket: Some(path.join("run.sock")),
             run_peer_uid: None,
             managed_run_reader: None,
+            observer_socket: None,
             managed_run_transport: None,
         };
         let socket = config.run_socket.as_ref().ok_or("missing socket")?;
@@ -6096,6 +6120,7 @@ mod tests {
             run_socket: Some(path.join("run.sock")),
             run_peer_uid: None,
             managed_run_reader: None,
+            observer_socket: None,
             managed_run_transport: None,
         };
         let socket = config.run_socket.as_ref().ok_or("missing socket")?;
@@ -6353,6 +6378,7 @@ mod tests {
             run_socket: Some(path.join("run.sock")),
             run_peer_uid: None,
             managed_run_reader: None,
+            observer_socket: None,
             managed_run_transport: None,
         };
         let socket = config.run_socket.as_ref().ok_or("missing socket")?;
@@ -6476,6 +6502,7 @@ mod tests {
             run_socket: Some(path.join("run.sock")),
             run_peer_uid: None,
             managed_run_reader: None,
+            observer_socket: None,
             managed_run_transport: None,
         };
         let socket = config.run_socket.as_ref().ok_or("fixture socket missing")?;
@@ -6738,6 +6765,7 @@ mod tests {
             run_socket: Some(path.join("run.sock")),
             run_peer_uid: None,
             managed_run_reader: None,
+            observer_socket: None,
             managed_run_transport: None,
         };
         let listener = UnixListener::bind(config.run_socket.as_ref().ok_or("socket")?)?;
@@ -6953,6 +6981,7 @@ mod tests {
             run_socket: Some(home.join("api.sock")),
             run_peer_uid: None,
             managed_run_reader: None,
+            observer_socket: None,
             managed_run_transport: None,
         };
         let mut initial = Store::open(&config.database_path)?;
@@ -7167,6 +7196,7 @@ mod tests {
             run_socket: Some(home.join("api.sock")),
             run_peer_uid: None,
             managed_run_reader: None,
+            observer_socket: None,
             managed_run_transport: None,
         };
         let mut initial = Store::open(&config.database_path)?;
@@ -7677,6 +7707,7 @@ mod tests {
             run_socket: None,
             run_peer_uid: None,
             managed_run_reader: None,
+            observer_socket: None,
             managed_run_transport: None,
         };
         let mut initial = Store::open(&config.database_path)?;
@@ -7809,6 +7840,7 @@ mod tests {
                 run_store_id: "store_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
                 run_route_id: "run-route".into(),
             }),
+            observer_socket: None,
             managed_run_transport: None,
         };
         let initial = Store::open(&config.database_path)?;
@@ -11119,6 +11151,7 @@ mod tests {
             run_socket: None,
             run_peer_uid: None,
             managed_run_reader: None,
+            observer_socket: None,
             managed_run_transport: None,
         };
         let mut initial = Store::open(&config.database_path)?;
@@ -11226,6 +11259,7 @@ mod tests {
             run_socket: Some(path.join("run.sock")),
             run_peer_uid: None,
             managed_run_reader: None,
+            observer_socket: None,
             managed_run_transport: None,
         };
         let socket = config.run_socket.as_ref().ok_or("missing Run socket")?;
@@ -11553,6 +11587,7 @@ mod tests {
             run_socket: None,
             run_peer_uid: None,
             managed_run_reader: None,
+            observer_socket: None,
             managed_run_transport: None,
         };
         let (stop, stopped) = watch::channel(false);
