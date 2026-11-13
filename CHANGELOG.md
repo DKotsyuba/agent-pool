@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.1.1
+
+Security release, 2026-11-13. Qualification fields are unchanged from 0.1.0: `x86_64-unknown-linux-gnu` on the host `dobi`; this release ships that target only.
+
 ### Security
 
 - The live proof for pinned Pool and Run peers now meets errata E13/E14, matching Run's own peer proof. It applies to the Run attempt endpoint, the Run reader and the managed frontend/resident session. The peer may not have any `LD_*` variable in its initial environment or a tracer, and `/etc/ld.so.preload` must be absent or blank. The pinned path may not name a generic interpreter. Pool opens `/proc/PID/exe` and checks the same descriptor three ways: the file must currently be owned by the Pool UID or root without group/other write; its fdinfo `mnt_id` must resolve to a filesystem that denies writes to a running executable (ext2/3/4, xfs, btrfs, tmpfs); and its own digest must equal the pin. After hashing, its identity and the configured path's inode must be unchanged. Previously Pool accepted a genuine pinned build started with a loader override or under a tracer, a writable loaded file, or a file on any filesystem. Operator re-pin also refuses an interpreter path.
