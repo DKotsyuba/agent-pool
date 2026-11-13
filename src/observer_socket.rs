@@ -204,7 +204,8 @@ pub(crate) async fn listener(
 }
 
 /// Allowlist, closed read set, endpoint policy and DB immutability, without a live resident.
-#[cfg(test)]
+/// Linux only, like the endpoint itself.
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use crate::{
