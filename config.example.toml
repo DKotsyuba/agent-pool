@@ -29,6 +29,19 @@ bridge_server_sha256 = "00000000000000000000000000000000000000000000000000000000
 # Optional independent owner-only Pool observation grant; absent disables `observe`.
 # Provision a separate protected token explicitly; this is not a Bridge assertion or grant.
 # owner_observer_credential_file = "/absolute/private/agent-pool/owner-observer.token"
+# Optional Linux-only read-only observer socket for another local user, such as
+# the owner's Hub. No credential: the peer's kernel UID must be in allowed_uids.
+# Only identity, list, get (state sections, no bindings or Run proof),
+# inventory_snapshot, completion_get and enrollment_get are served. The directory
+# must exist, be owned by expected_uid or root, without group/other write and
+# without other access (for example 0750 with the readers' group); Pool does not
+# create it. The resident must be a member of gid. Clients use
+# `agent-pool observe --socket <path> --server-uid <expected_uid>`.
+# [observer_socket]
+# path = "/run/agent-pool/observer.sock"
+# gid = 986
+# mode = 0o660
+# allowed_uids = [1000]
 # Optional private Run reader for the P1 outcome/seal endpoint. This grant does not
 # enable managed participant commands. Provision the exact executable and routes.
 # [managed_run_reader]

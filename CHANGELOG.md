@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Added
+
+- Optional group observer socket (`[observer_socket]`, Linux only, capability `observer_socket_v1`). The resident binds a second endpoint with a configured group and mode (0660 by default) in an existing directory owned by the Pool UID or root, without group/other write and without other access. Peers are admitted only when their kernel-reported UID is in `allowed_uids`; others get one `unauthorized` line before any input is read. There is no credential. The request is the plain observer request, and only `identity`, `list`, `get` (state sections, without bindings or Run proof), `inventory_snapshot`, `completion_get` and `enrollment_get` are served. `managed_capacity`, the `binding` and `run_proof` sections and `include_bindings` are `unauthorized`; anything else is `invalid` and never dispatched. At most 8 observer connections, 64 KiB request lines.
+- `agent-pool observe --socket PATH --server-uid UID` reads through that socket without a config or credential. It applies the cross-user path policy for the server UID and checks the peer UID before writing.
+
 ## 0.1.1
 
 Security release, 2026-11-13. Qualification fields are unchanged from 0.1.0: `x86_64-unknown-linux-gnu` on the host `dobi`; this release ships that target only.

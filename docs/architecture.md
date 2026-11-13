@@ -346,6 +346,72 @@ Both page families include `cursor` (string; get also accepts exact decimal text
 Identity contains product, compiled package version, embedded qualification,
 capabilities and observed time, without claiming an installed/source revision.
 
+### Group observer socket (`observer_socket_v1`)
+
+An optional `[observer_socket]` section (Linux only) makes the resident bind a
+second, read-only endpoint for another local user, such as the owner's Hub. It
+has no credential: the kernel-reported peer UID (`SO_PEERCRED`) must be in
+`allowed_uids`. The resident checks the full identity UID map before binding.
+
+```toml
+[observer_socket]
+path = "/run/agent-pool/observer.sock"
+gid = 986              # numeric group given to the socket; the resident must belong to it
+mode = 0o660           # optional; 0o660 (default) or 0o600
+allowed_uids = [1000]  # 1 to 32 peer UIDs; nothing else is admitted
+```
+
+The immediate directory must already exist, be owned by `expected_uid` or root,
+deny group and other write and deny other access (for example 0750
+`agent-mcp:agent-run`). Pool never creates or changes it. At start the resident
+refuses a live socket or a non-socket entry at the path (`conflict`), removes a
+stale socket owned by `expected_uid` only after connection refusal, binds, sets
+the group and mode, and verifies owner, group, mode, inode and directory identity
+before serving. Any failure stops the resident; the endpoint is removed on exit
+only if it is still the bound inode.
+
+Admission happens before any input is read. A peer UID outside the allowlist
+receives one line
+`{"schema_version":1,"kind":"error","error":{"code":"unauthorized","outcome":"blocked",...}}`
+and is closed. At most 8 observer connections run at once, independent of the
+resident's own 32; an excess peer receives the same line with `unavailable`.
+An admitted peer sends one request line of at most 64 KiB within 10 s and gets
+one envelope line (at most 1 MiB), then the connection closes.
+
+The request is the plain observer request above, without
+`observer_credential`/`observe` wrapping:
+`{"schema_version":1,"operation":"list","params":{}}`. Responses use the same
+envelope and families. Only these operations are served:
+
+- `identity`: its capabilities omit `run_proof_v1` and `managed_capacity_v1` and
+  add `observer_socket_v1`;
+- `list`;
+- `get` with section `overview`, `members`, `history`, `proposal`, `votes`,
+  `criteria`, `content`, `deliveries` or `decisions`, without
+  `include_bindings`;
+- `inventory_snapshot` (`inventory_completion_v1` totals);
+- `completion_get` (`completion_record_v1`);
+- `enrollment_get` (`managed_enrollment_v1`).
+
+`managed_capacity`, the `binding` and `run_proof` sections and
+`include_bindings:true` are refused with `unauthorized`: they expose private
+native/Run mappings, owner diagnostics, or make the resident call Run. Any other
+input — an unknown operation, a participant command, an assertion, a credential,
+a managed or JSON-RPC frame, extra fields, invalid UTF-8, a second line or an
+oversized line — is `invalid` with kind `error` and is never dispatched. Reads
+use the same Store projections as the owner observer and never write.
+
+A client may speak this NDJSON protocol directly, or run
+`agent-pool observe --socket /run/agent-pool/observer.sock --server-uid 1003`,
+which reads the request from stdin and writes one envelope line like
+`observe --config`, without any config or credential. `--socket` requires
+`--server-uid` and excludes `--config`. Before writing, the client applies the
+Run cross-user path policy for `server_uid` (every ancestor from `/` owned by
+root or `server_uid` without group/other write, the immediate directory without
+other access, the socket owned by `server_uid` without other access), checks the
+connected peer UID and rechecks the path identities. A direct client should do
+the same. A refusal line is the only reply accepted after a failed write.
+
 ### Source-wide inventory snapshot v1
 
 Identity advertises `inventory_snapshot_v1`. This owner-only operation is distinct
