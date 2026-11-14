@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.1.3
+
+Fix release, 2026-11-14. Qualification fields are unchanged from 0.1.0: `x86_64-unknown-linux-gnu` on the host `dobi`; this release ships that target only.
+
 ### Fixed
 
 - A pending managed delivery whose route, binding or Run attempt is unavailable now waits out a durable pause before its next attempt (5 s doubling per non-decisive attempt, capped at 300 s) instead of retrying on every 5-second resident pass. Each retry repeated a new durable currentness request and executable peer proofs of Run and Bridge; undeliverable final notices of closed pools kept the resident and Run busy indefinitely. Freezing an effect clears the count, so unknown-outcome lookups keep their full budget.
