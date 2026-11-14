@@ -411,6 +411,9 @@ impl Store {
     pub(crate) fn egress_liveness_failed(&mut self, id: &str, now: i64) -> Result<i64, Fault> {
         crate::managed_egress::liveness_failed(&mut self.db, id, now)
     }
+    pub(crate) fn egress_pending_deferred(&mut self, id: &str, now: i64) -> Result<bool, Fault> {
+        crate::managed_egress::pending_deferred(&mut self.db, id, now)
+    }
     pub(crate) fn egress_begin_liveness_abort(&mut self, id: &str) -> Result<(), Fault> {
         crate::managed_egress::begin_liveness_abort(&mut self.db, id)
     }

@@ -49,6 +49,14 @@ pub(crate) fn liveness_failed(
     now: i64,
 ) -> Result<i64, Fault> {
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let failures = schedule_retry(&tx, effect_id, now)?;
+    tx.commit()?;
+    Ok(failures)
+}
+
+/// Count one more failure and pause the effect for 5 s doubling per failure,
+/// capped at 300 s, inside the caller's transaction. Returns the new count.
+fn schedule_retry(tx: &Connection, effect_id: &str, now: i64) -> Result<i64, Fault> {
     let failures: i64 = tx
         .query_row(
             "SELECT failures FROM managed_delivery_liveness WHERE effect_id=?1",
@@ -64,8 +72,30 @@ pub(crate) fn liveness_failed(
         "INSERT INTO managed_delivery_liveness(effect_id,failures,next_attempt) VALUES(?1,?2,?3) ON CONFLICT(effect_id) DO UPDATE SET failures=excluded.failures,next_attempt=excluded.next_attempt",
         params![effect_id, failures, next.max(0)],
     )?;
-    tx.commit()?;
     Ok(failures)
+}
+
+/// Pause a still-pending effect after a non-decisive delivery attempt.
+///
+/// An unavailable route, binding or Run attempt leaves the effect pending
+/// without changing its target. Without a pause every resident pass repeats
+/// the target checks, a new durable currentness request and both executable
+/// peer proofs for as long as the recipient stays unavailable. The pause uses
+/// the liveness schedule (5 s doubling, capped at 300 s); `freeze` clears the
+/// count, so unknown-outcome lookups after a later publish start from zero.
+/// Returns whether a pause was recorded; any other state is left unchanged.
+pub(crate) fn pending_deferred(
+    db: &mut Connection,
+    effect_id: &str,
+    now: i64,
+) -> Result<bool, Fault> {
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if state(&tx, effect_id)? != Some(State::Pending) {
+        return Ok(false);
+    }
+    schedule_retry(&tx, effect_id, now)?;
+    tx.commit()?;
+    Ok(true)
 }
 
 /// After bounded non-decisive lookups, fence the exact original effect for abort.
@@ -882,6 +912,11 @@ pub(crate) fn freeze(
     {
         return Err(Fault::Stale);
     }
+    // Pre-freeze retry pauses must not count toward the unknown-outcome lookups.
+    tx.execute(
+        "UPDATE managed_delivery_liveness SET failures=0,next_attempt=0 WHERE effect_id=?1",
+        [&target.seed.effect_id],
+    )?;
     tx.commit()?;
     Ok(Frozen {
         seed: target.seed.clone(),
@@ -2645,6 +2680,66 @@ pub(crate) mod tests {
             begin_publish(store.test_db(), &current).err(),
             Some(Fault::Stale)
         );
+    }
+
+    /// A pending effect whose recipient stays unavailable is retried after a
+    /// capped, growing durable pause rather than on every resident pass. The
+    /// pause never applies outside `pending`, and freezing clears its count so
+    /// unknown-outcome lookups keep their full E12 budget.
+    #[test]
+    fn unavailable_pending_effect_backs_off_until_frozen() {
+        let (_directory, mut store, binding, incarnation, _run) = fixture();
+        index_managed_member(store.test_db(), &binding);
+        add_seed(&mut store, &binding, "waiting", "hello", false);
+        for (round, expected) in [5_i64, 10, 20, 40, 80, 160, 300, 300]
+            .into_iter()
+            .enumerate()
+        {
+            assert!(liveness_due(store.test_db(), "waiting", unix_now()).unwrap());
+            assert!(pending_deferred(store.test_db(), "waiting", unix_now()).unwrap());
+            let delay = pause(&mut store, "waiting");
+            assert!(
+                (expected - 2..=expected).contains(&delay),
+                "round {round}: pause {delay} vs {expected}"
+            );
+            assert!(!liveness_due(store.test_db(), "waiting", unix_now()).unwrap());
+            // Rewind the pause, as if it had elapsed, for the next round.
+            store
+                .test_db()
+                .execute(
+                    "UPDATE managed_delivery_liveness SET next_attempt=0 WHERE effect_id='waiting'",
+                    [],
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            state(store.test_db(), "waiting").unwrap(),
+            Some(State::Pending)
+        );
+        let frozen = freeze_next(&mut store, &binding, &incarnation, "waiting", "next", 2);
+        assert!(!pending_deferred(store.test_db(), "waiting", unix_now()).unwrap());
+        assert!(liveness_due(store.test_db(), "waiting", unix_now()).unwrap());
+        begin_publish(store.test_db(), &frozen.seed.effect_id).unwrap();
+        attention(store.test_db(), "waiting", "outcome_unknown").unwrap();
+        assert_eq!(
+            liveness_failed(store.test_db(), "waiting", unix_now()).unwrap(),
+            1,
+            "pre-freeze pauses must not consume unknown-outcome lookups"
+        );
+        add_seed(&mut store, &binding, "removed", "hello", false);
+        store
+            .egress_not_delivered("removed", "member_removed")
+            .unwrap();
+        assert!(!pending_deferred(store.test_db(), "removed", unix_now()).unwrap());
+        let rows: i64 = store
+            .test_db()
+            .query_row(
+                "SELECT count(*) FROM managed_delivery_liveness WHERE effect_id='removed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0);
     }
 
     /// Only deterministic reasons end delivery: once the member is no longer

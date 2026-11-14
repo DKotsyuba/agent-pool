@@ -2064,64 +2064,76 @@ mod managed_egress_dispatch {
             {
                 return Ok(());
             }
-            let Some(transport) = transport.filter(|value| value.egress_enabled) else {
-                return note(store, &lease, &id, "route_unavailable").await;
-            };
-            let prefix = transport
-                .producer_scope_prefix
-                .clone()
-                .ok_or(Fault::Invalid)?;
-            let key = id.clone();
-            let check_prefix = prefix.clone();
-            let target = match stored_managed(store, &lease, move |store| {
-                store.egress_target(&key, &check_prefix)
-            })
-            .await
-            {
-                Ok(target) => target,
-                Err(Fault::Stale) => {
-                    let key = id.clone();
-                    return stored_managed(store, &lease, move |store| {
-                        store.egress_not_delivered(&key, "member_removed")
-                    })
-                    .await;
+            let attempted: Result<(), Fault> = async {
+                let Some(transport) = transport.filter(|value| value.egress_enabled) else {
+                    return note(store, &lease, &id, "route_unavailable").await;
+                };
+                let prefix = transport
+                    .producer_scope_prefix
+                    .clone()
+                    .ok_or(Fault::Invalid)?;
+                let key = id.clone();
+                let check_prefix = prefix.clone();
+                let target = match stored_managed(store, &lease, move |store| {
+                    store.egress_target(&key, &check_prefix)
+                })
+                .await
+                {
+                    Ok(target) => target,
+                    Err(Fault::Stale) => {
+                        let key = id.clone();
+                        return stored_managed(store, &lease, move |store| {
+                            store.egress_not_delivered(&key, "member_removed")
+                        })
+                        .await;
+                    }
+                    Err(_) => return note(store, &lease, &id, "binding_unavailable").await,
+                };
+                let run = match RunPeer::from_config(config, &target.binding.pool_store_id) {
+                    Ok(run) => run,
+                    Err(_) => return note(store, &lease, &id, "route_unavailable").await,
+                };
+                if run.route != target.binding.run_route
+                    || run.bridge_route != target.binding.bridge_route
+                {
+                    return note(store, &lease, &id, "route_unavailable").await;
                 }
-                Err(_) => return note(store, &lease, &id, "binding_unavailable").await,
-            };
-            let run = match RunPeer::from_config(config, &target.binding.pool_store_id) {
-                Ok(run) => run,
-                Err(_) => return note(store, &lease, &id, "route_unavailable").await,
-            };
-            if run.route != target.binding.run_route
-                || run.bridge_route != target.binding.bridge_route
-            {
-                return note(store, &lease, &id, "route_unavailable").await;
+                let cfg = config.clone();
+                let route = target.binding.bridge_route.clone();
+                let (bridge, bridge_pin) = match tokio::task::spawn_blocking(move || {
+                    crate::managed_bridge::SdkBridge::capture(&cfg, route)
+                })
+                .await
+                .map_err(|_| Fault::Unavailable)?
+                {
+                    Ok(value) => value,
+                    Err(_) => return note(store, &lease, &id, "route_unavailable").await,
+                };
+                if let Some(frozen) = freeze_target(
+                    store,
+                    &lease,
+                    target,
+                    prefix,
+                    &run,
+                    bridge_pin,
+                    config.bridge_audience.clone(),
+                )
+                .await?
+                {
+                    return publish(store, &lease, frozen, bridge).await;
+                }
+                Ok(())
             }
-            let cfg = config.clone();
-            let route = target.binding.bridge_route.clone();
-            let (bridge, bridge_pin) = match tokio::task::spawn_blocking(move || {
-                crate::managed_bridge::SdkBridge::capture(&cfg, route)
+            .await;
+            // A still-pending effect waits out a capped durable pause instead of
+            // repeating the probe and peer proofs on every resident pass.
+            let key = id.clone();
+            let deferred = stored_managed(store, &lease, move |store| {
+                store.egress_pending_deferred(&key, now)
             })
-            .await
-            .map_err(|_| Fault::Unavailable)?
-            {
-                Ok(value) => value,
-                Err(_) => return note(store, &lease, &id, "route_unavailable").await,
-            };
-            if let Some(frozen) = freeze_target(
-                store,
-                &lease,
-                target,
-                prefix,
-                &run,
-                bridge_pin,
-                config.bridge_audience.clone(),
-            )
-            .await?
-            {
-                return publish(store, &lease, frozen, bridge).await;
-            }
-            return Ok(());
+            .await;
+            attempted?;
+            return deferred.map(|_| ());
         }
         if state == State::Publishing {
             note(store, &lease, &id, "outcome_unknown").await?;
