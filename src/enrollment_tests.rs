@@ -458,6 +458,10 @@ pub(crate) struct Harness {
 
 impl Harness {
     pub(crate) fn new() -> Self {
+        Self::with_acceptance(None)
+    }
+    /// A fresh pool created by the owner with optional structured acceptance.
+    pub(crate) fn with_acceptance(acceptance: Option<Vec<crate::domain::Criterion>>) -> Self {
         let root = std::env::var_os("TMPDIR").expect("task TMPDIR required");
         let dir = tempfile::tempdir_in(root).unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -472,7 +476,7 @@ impl Harness {
                     request_key: "create".into(),
                     name: "P3".into(),
                     purpose: "Managed enrollment".into(),
-                    acceptance: None,
+                    acceptance,
                 }),
             )
             .unwrap()
@@ -542,7 +546,15 @@ impl Harness {
         reopened.configure_enrollment(Some(self.route.clone()));
         self.store = Arc::new(Mutex::new(reopened));
     }
-    fn db<T>(&self, f: impl FnOnce(&mut rusqlite::Connection) -> T) -> T {
+    /// The pool's SQLite file, for components that key their state by it.
+    pub(crate) fn db_path(&self) -> &std::path::Path {
+        &self.path
+    }
+    /// The verified owner identity that created the pool.
+    pub(crate) fn owner(&self) -> &Actor {
+        &self.owner
+    }
+    pub(crate) fn db<T>(&self, f: impl FnOnce(&mut rusqlite::Connection) -> T) -> T {
         let mut guard = self.store.lock().unwrap();
         f(guard.test_db())
     }
@@ -562,14 +574,14 @@ impl Harness {
         self.keys += 1;
         format!("key-{}", self.keys)
     }
-    fn change(&mut self) -> Change {
+    pub(crate) fn change(&mut self) -> Change {
         Change {
             pool_id: self.pool.clone(),
             expected_revision: self.revision(),
             request_key: self.key(),
         }
     }
-    fn execute(&self, actor: &Actor, command: &Command) -> Result<Reply, Fault> {
+    pub(crate) fn execute(&self, actor: &Actor, command: &Command) -> Result<Reply, Fault> {
         self.store.lock().unwrap().execute(actor, command)
     }
     fn spec(task: &str) -> Value {
@@ -593,7 +605,7 @@ impl Harness {
             receipt.created_ids[0].clone(),
         )
     }
-    fn batch(&mut self, count: usize) -> Result<(String, Vec<String>), Fault> {
+    pub(crate) fn batch(&mut self, count: usize) -> Result<(String, Vec<String>), Fault> {
         let command = Command::StartBatch(StartBatch {
             change: self.change(),
             members: (0..count)
@@ -613,7 +625,7 @@ impl Harness {
             receipt.created_ids.clone(),
         ))
     }
-    async fn drive(&self, id: &str) {
+    pub(crate) async fn drive(&self, id: &str) {
         enrollment_dispatch::drive(&self.store, &self.run, id)
             .await
             .unwrap();
@@ -654,10 +666,10 @@ impl Harness {
             })
         })
     }
-    fn qualify(&self, member: &str) {
+    pub(crate) fn qualify(&self, member: &str) {
         self.run.state().qualified.insert(member.into());
     }
-    fn count(&self, sql: &str) -> i64 {
+    pub(crate) fn count(&self, sql: &str) -> i64 {
         self.db(|db| db.query_row(sql, [], |row| row.get(0)).unwrap())
     }
     /// Admit, qualify and bind one owner start, returning (enrollment, member).
@@ -670,7 +682,7 @@ impl Harness {
         (id, member)
     }
     /// The real store-level P1 pool_join for a bound managed member.
-    fn join(&mut self, member: &str, revision: u64) -> Result<Reply, Fault> {
+    pub(crate) fn join(&mut self, member: &str, revision: u64) -> Result<Reply, Fault> {
         let key = self.key();
         self.p1(
             member,
@@ -682,7 +694,7 @@ impl Harness {
         )
     }
     /// Freeze the exact P1 context, reserve its intent, admit and run the domain CAS.
-    fn p1(&mut self, member: &str, command: Command) -> Result<Reply, Fault> {
+    pub(crate) fn p1(&mut self, member: &str, command: Command) -> Result<Reply, Fault> {
         use crate::managed_state::tests::{
             FakeRun, fake_bridge_pin, fake_consumed, fake_run_endpoint, fresh_authority,
             prepare_command,
@@ -795,7 +807,14 @@ impl Harness {
             },
         };
         crate::managed_state::mark_admitted(db, &intent, &digest, &admission)?;
-        let committed = crate::managed_state::commit_domain(db, &intent, &digest)?;
+        let committed = if matches!(command, Command::Vote(_)) {
+            // A managed vote commits only under a verified all-voter consensus fence.
+            let pending = crate::managed_state::snapshot_consensus(db, &intent, &digest)?;
+            let fence = pending.verify(&LiveVoters(run))?;
+            crate::managed_state::commit_domain_vote(db, &intent, &digest, fence)?
+        } else {
+            crate::managed_state::commit_domain(db, &intent, &digest)?
+        };
         Ok(serde_json::from_str(&committed).unwrap())
     }
     /// Stage a rootless first-hook ingress receipt and select the binding as the resident does.
@@ -917,7 +936,7 @@ impl Harness {
             }),
         )
     }
-    fn replace(&mut self, member: &str) -> Result<(String, String), Fault> {
+    pub(crate) fn replace(&mut self, member: &str) -> Result<(String, String), Fault> {
         let command = Command::Replace(Replace {
             change: self.change(),
             member_id: member.into(),
@@ -932,7 +951,7 @@ impl Harness {
         ))
     }
     /// Make the old member's lineage terminal and cleaned at its admitted tip.
-    fn old_terminal(&self, member: &str) -> Target {
+    pub(crate) fn old_terminal(&self, member: &str) -> Target {
         let (binding, _) = self.member(member);
         let target = Target {
             agent_id: binding.run_id.unwrap(),
@@ -944,12 +963,43 @@ impl Harness {
         target
     }
     /// An active, joined P3 member.
-    async fn active_member(&mut self, name: &str) -> (String, String) {
+    pub(crate) async fn active_member(&mut self, name: &str) -> (String, String) {
         let (id, member) = self.bound_member(name).await;
         let revision = self.revision();
         self.join(&member, revision).unwrap();
         assert_eq!(self.member(&member).0.member.state, MemberState::Active);
         (id, member)
+    }
+}
+
+/// Synthetic Run authority whose consensus reports every voter's exact bound
+/// first-generation attempt as live; current receipts come from the inner fake.
+struct LiveVoters(crate::managed_state::tests::FakeRun);
+impl crate::managed_state::RunAuthority for LiveVoters {
+    fn current_receipt(&self, route: &Route, receipt_id: &str) -> Result<CurrentReceipt, Fault> {
+        self.0.current_receipt(route, receipt_id)
+    }
+    fn consensus(
+        &self,
+        _route: &Route,
+        attempt: &AttemptRef,
+        incarnation: &Incarnation,
+    ) -> Result<crate::managed_state::VoterObservation, Fault> {
+        Ok(crate::managed_state::VoterObservation {
+            state: crate::managed_state::VoterState::Live,
+            last_attempt: Some(attempt.clone()),
+            last_incarnation: Some(incarnation.clone()),
+            successor_proof: Some(SuccessorProof {
+                lineage_root_id: attempt.lineage_root_id.clone(),
+                bound_execution_id: attempt.execution_id.clone(),
+                current_execution_id: attempt.execution_id.clone(),
+                chain: vec![SuccessorLink {
+                    execution_id: attempt.execution_id.clone(),
+                    parent_execution_id: None,
+                    sequence: attempt.sequence,
+                }],
+            }),
+        })
     }
 }
 
