@@ -29,7 +29,8 @@ New single and grouped admissions request durable Run history pins. A single
 admission requires Run's read-only batch receipt lookup before it can start; after
 removal Pool only looks up its original receipt and never starts it again.
 After closure, an owner may explicitly request release; Pool sends it only to the
-original verified Run store. Guarded replacement requires a terminal, cleaned
+original verified Run store, with the admission key Run 0.32 requires as ownership
+proof (older Run versions use the previous release method). Guarded replacement requires a terminal, cleaned
 lineage and an atomic Run precondition; uncertain results freeze the old roster.
 Admission receipts alone cannot establish completion. Older uncertain intents
 without a stored identity remain on hold.

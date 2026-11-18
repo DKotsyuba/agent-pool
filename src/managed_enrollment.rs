@@ -188,6 +188,32 @@ impl Key {
     }
 }
 
+/// Owner proof for releasing one pin minted by this enrollment (`_managed_pin_release_v1`).
+/// Run derives its internal batch key from the authenticated Pool route and this key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PinRelease {
+    pub expected_store_id: String,
+    pub pool_store_id: String,
+    pub request_id: String,
+    pub pin_id: String,
+}
+impl PinRelease {
+    /// Closed release parameter object.
+    pub(crate) fn params(&self) -> Value {
+        json!({"version":1,"expected_store_id":self.expected_store_id,"pool_store_id":self.pool_store_id,"request_id":self.request_id,"pin_id":self.pin_id})
+    }
+}
+/// Closed `_managed_pin_release_v1` result; both `already_released` values confirm release.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PinReleased {
+    pub version: u8,
+    pub store_id: String,
+    pub pin_id: String,
+    pub status: String,
+    pub already_released: bool,
+}
+
 /// Typed Run enrollment outcome classes; diagnostics stay fixed and bounded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Failure {

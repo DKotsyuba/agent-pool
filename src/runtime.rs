@@ -1,7 +1,7 @@
 //! One persistent resident, authenticated one-call frontend and owned serial outbox worker.
 use crate::{
     config::{Config, private_file, private_parent, private_socket},
-    domain::{Actor, Binding, Command, Effect, Fault, Reply, Work},
+    domain::{Actor, Binding, Command, Effect, Fault, PinOwner, Reply, Work},
     integrations::{self, Assertion, EXCHANGE_TIMEOUT, MAX_FRAME},
     store::{Admitted, Store},
 };
@@ -669,8 +669,8 @@ mod managed_dispatch {
 pub(crate) mod enrollment_dispatch {
     use super::*;
     use crate::managed_enrollment::{
-        self as journal, Attested, EnrollmentRoute, Failure, Key, Lookup, OldStatus, StartReceipt,
-        Switch,
+        self as journal, Attested, EnrollmentRoute, Failure, Key, Lookup, OldStatus, PinRelease,
+        StartReceipt, Switch,
     };
     use crate::managed_run::RunPeer;
     use crate::run_status::Target;
@@ -700,6 +700,50 @@ pub(crate) mod enrollment_dispatch {
             store: &'a str,
             target: &'a Target,
         ) -> Pin<Box<dyn Future<Output = OldStatus> + Send + 'a>>;
+        /// Owner-keyed release of one enrollment-minted pin. `Ok` confirms release (new or
+        /// repeated); `Refused("intent_conflict")` is Run's definitive refusal; anything else
+        /// leaves the outcome unknown for a same-key retry.
+        fn release_pin<'a>(&'a self, release: &'a PinRelease) -> Response<'a, ()>;
+    }
+
+    /// Releases one managed-enrollment pin with its immutable enrollment key and returns the
+    /// effect state. A changed route, mismatched key or unconfirmed reply stays unknown.
+    pub(crate) async fn release_pin<C: Client>(
+        store: &SharedStore,
+        client: &C,
+        enrollment_id: &str,
+        request_id: &str,
+        pin_id: &str,
+    ) -> Result<&'static str, Fault> {
+        let load_id = enrollment_id.to_owned();
+        let Ok((enrollment, jobs)) = stored(store, move |store| {
+            journal::load(store.completion_db(), &load_id)
+        })
+        .await
+        else {
+            return Ok("unknown");
+        };
+        if enrollment.request_id != request_id
+            || !jobs.iter().any(|job| {
+                job.admission
+                    .as_ref()
+                    .is_some_and(|admission| admission.pin_id == pin_id)
+            })
+            || !client.route().same_identity(&enrollment.route)
+        {
+            return Ok("unknown");
+        }
+        let release = PinRelease {
+            expected_store_id: enrollment.route.run.route.component_store_id.clone(),
+            pool_store_id: enrollment.route.pool_route.component_store_id.clone(),
+            request_id: enrollment.request_id.clone(),
+            pin_id: pin_id.to_owned(),
+        };
+        Ok(match client.release_pin(&release).await {
+            Ok(()) => "accepted",
+            Err(Failure::Refused("intent_conflict")) => "refused",
+            Err(_) => "unknown",
+        })
     }
 
     /// The configured route for NEW enrollments; absent when not fully provisioned.
@@ -767,14 +811,7 @@ pub(crate) mod enrollment_dispatch {
             target: &'a Target,
         ) -> Pin<Box<dyn Future<Output = OldStatus> + Send + 'a>> {
             Box::pin(async move {
-                let pinned = self.route.status.as_ref();
-                if !configured_run_route(&self.config).is_ok_and(|configured| {
-                    pinned.is_some_and(|route| {
-                        configured.socket == route.socket
-                            && configured.expected_uid == route.expected_uid
-                            && configured.peer_uid == route.peer_uid
-                    })
-                }) {
+                if !self.status_route_current() {
                     return OldStatus::Unavailable;
                 }
                 let Ok(snapshot) =
@@ -791,6 +828,59 @@ pub(crate) mod enrollment_dispatch {
                     None if item.replacement_not_ready() => OldStatus::NotReady,
                     None => OldStatus::Unavailable,
                 }
+            })
+        }
+        fn release_pin<'a>(&'a self, release: &'a PinRelease) -> Response<'a, ()> {
+            Box::pin(async move {
+                let capabilities = self
+                    .peer
+                    .capabilities(&crate::domain::id())
+                    .await
+                    .map_err(|_| Failure::Unknown)?;
+                if capabilities
+                    .capabilities
+                    .iter()
+                    .any(|item| item == "managed_pin_release_v1")
+                {
+                    return self.peer.managed_pin_release(release).await.map(|_| ());
+                }
+                // Run before 0.32 has no managed release and no owner check: its combined
+                // socket method is the only release path. A current Run that withholds the
+                // capability rejects that method, so the outcome stays unknown.
+                if !self.status_route_current() {
+                    return Err(Failure::Unknown);
+                }
+                match integrations::run_store_identity(&self.config).await {
+                    Ok(current) if current == release.expected_store_id => {}
+                    _ => return Err(Failure::Unknown),
+                }
+                integrations::release_history_pin(
+                    &self.config,
+                    &release.pin_id,
+                    &release.expected_store_id,
+                    None,
+                )
+                .await
+                .map_err(|failure| {
+                    if integrations::pin_release_refused(&failure) {
+                        Failure::Refused("intent_conflict")
+                    } else {
+                        Failure::Unknown
+                    }
+                })
+            })
+        }
+    }
+    impl Live {
+        /// Whether the public socket route pinned with this client is still the configured one.
+        fn status_route_current(&self) -> bool {
+            let pinned = self.route.status.as_ref();
+            configured_run_route(&self.config).is_ok_and(|configured| {
+                pinned.is_some_and(|route| {
+                    configured.socket == route.socket
+                        && configured.expected_uid == route.expected_uid
+                        && configured.peer_uid == route.peer_uid
+                })
             })
         }
     }
@@ -1362,6 +1452,10 @@ pub(crate) mod enrollment_dispatch {
         ) -> Pin<Box<dyn Future<Output = OldStatus> + Send + 'a>> {
             self.tick();
             self.inner.status(store, target)
+        }
+        fn release_pin<'a>(&'a self, release: &'a PinRelease) -> Response<'a, ()> {
+            self.tick();
+            self.inner.release_pin(release)
         }
     }
 
@@ -3785,7 +3879,34 @@ async fn effect(
                 .ok_or(Fault::Internal)?;
             resolve_run(store, config, &effect.effect_id, &agent_id, sequence).await?
         }
-        Work::ReleasePin { pin_id, route } => {
+        Work::ReleasePin { pin_id, route, .. } => {
+            let id = effect.effect_id.clone();
+            let owner = stored(store, move |store| store.pin_release_owner(&id)).await?;
+            if let Some(PinOwner::Managed {
+                enrollment_id,
+                request_id,
+            }) = &owner
+            {
+                let pool_store = stored(store, |store| store.managed_store_id()).await?;
+                let state = match enrollment_dispatch::Live::new(config, &pool_store) {
+                    Some(client) => {
+                        enrollment_dispatch::release_pin(
+                            store,
+                            &client,
+                            enrollment_id,
+                            request_id,
+                            pin_id,
+                        )
+                        .await?
+                    }
+                    None => "unknown",
+                };
+                return settle(store, effect.effect_id, state).await;
+            }
+            let owner_key = match &owner {
+                Some(PinOwner::Batch { request_key }) => Some(request_key.as_str()),
+                _ => None,
+            };
             let Some(route) = route else {
                 return settle(store, effect.effect_id, "unknown").await;
             };
@@ -3802,8 +3923,11 @@ async fn effect(
             }
             match integrations::run_store_identity(config).await {
                 Ok(current) if current == expected => {
-                    match integrations::release_history_pin(config, pin_id, expected).await {
+                    match integrations::release_history_pin(config, pin_id, expected, owner_key)
+                        .await
+                    {
                         Ok(()) => "accepted",
+                        Err(failure) if integrations::pin_release_refused(&failure) => "refused",
                         Err(_) => "unknown",
                     }
                 }
@@ -6788,9 +6912,24 @@ mod tests {
         Ok(())
     }
 
-    /// A closed pool can record release intent, but cannot send it to an unverified Run store.
-    #[tokio::test]
-    async fn pin_release_waits_for_run_store_identity() -> Result<(), Box<dyn std::error::Error>> {
+    /// A closed pool with one store-fenced batch member whose pin release was requested.
+    struct ReleaseFixture {
+        _directory: tempfile::TempDir,
+        config: Config,
+        listener: UnixListener,
+        store: SharedStore,
+        owner: Actor,
+        pool_id: String,
+        member_id: String,
+        release_id: String,
+        release: Effect,
+        pin: String,
+        store_identity: String,
+        batch_key: String,
+    }
+
+    /// Builds the closed pool, its fenced admission and the first claimed release intent.
+    async fn release_fixture() -> Result<ReleaseFixture, Box<dyn std::error::Error>> {
         use crate::domain::{Change, Create, ReleaseHistory, RunRoute, StartBatch, StartMember};
         use serde_json::json;
         let directory =
@@ -6854,6 +6993,13 @@ mod tests {
             return Err("batch receipt".into());
         };
         let admission = store.next_effect()?.ok_or("admission effect")?;
+        let Work::StartBatch {
+            request_key: batch_key,
+            ..
+        } = admission.work.clone()
+        else {
+            return Err("batch admission".into());
+        };
         let route = RunRoute {
             socket: path.join("run.sock").to_str().ok_or("path")?.into(),
             expected_uid: config.expected_uid,
@@ -6874,7 +7020,23 @@ mod tests {
                 Some(pin.clone()),
             )],
         )?;
-        let Reply::Receipt(closed) = store.execute(
+        let member_id = started.created_ids[0].clone();
+        // The after-close rule: an open pool never records a release intent.
+        assert!(matches!(
+            store.execute(
+                &owner,
+                &Command::ReleaseHistory(ReleaseHistory {
+                    change: Change {
+                        pool_id: pool_id.clone(),
+                        expected_revision: started.revision,
+                        request_key: "early-release".into(),
+                    },
+                    member_id: member_id.clone(),
+                }),
+            ),
+            Err(Fault::Conflict)
+        ));
+        let Reply::Receipt(_) = store.execute(
             &owner,
             &Command::Close(Change {
                 pool_id: pool_id.clone(),
@@ -6885,109 +7047,394 @@ mod tests {
         else {
             return Err("close receipt".into());
         };
-        let Reply::Receipt(requested) = store.execute(
-            &owner,
-            &Command::ReleaseHistory(ReleaseHistory {
-                change: Change {
-                    pool_id,
-                    expected_revision: closed.revision,
-                    request_key: "release".into(),
-                },
-                member_id: started.created_ids[0].clone(),
-            }),
-        )?
+        let store = Arc::new(Mutex::new(store));
+        let (release_id, release) =
+            request_release(&store, &owner, &pool_id, &member_id, "release").await?;
+        Ok(ReleaseFixture {
+            _directory: directory,
+            config,
+            listener,
+            store,
+            owner,
+            pool_id,
+            member_id,
+            release_id,
+            release,
+            pin,
+            store_identity,
+            batch_key,
+        })
+    }
+
+    /// Records one owner release request at the current revision and claims its effect.
+    async fn request_release(
+        store: &SharedStore,
+        owner: &Actor,
+        pool_id: &str,
+        member_id: &str,
+        request_key: &str,
+    ) -> Result<(String, Effect), Box<dyn std::error::Error>> {
+        use crate::domain::{Change, ReleaseHistory};
+        let release = Command::ReleaseHistory(ReleaseHistory {
+            change: Change {
+                pool_id: pool_id.into(),
+                expected_revision: pool_revision(store, pool_id)?,
+                request_key: request_key.into(),
+            },
+            member_id: member_id.into(),
+        });
+        let leader = owner.clone();
+        let Reply::Receipt(requested) =
+            stored(store, move |store| store.execute(&leader, &release)).await?
         else {
             return Err("release receipt".into());
         };
         let release_id = requested.created_id.ok_or("release ID")?;
-        let release = loop {
-            let next = store.next_effect()?.ok_or("release effect")?;
+        loop {
+            let next = stored(store, |store| store.next_effect())
+                .await?
+                .ok_or("release effect")?;
             if next.effect_id == release_id {
-                break next;
+                return Ok((release_id, next));
             }
-        };
-        let store = Arc::new(Mutex::new(store));
-        let wrong = format!("store_{}", "2".repeat(32));
-        let (outcome, _) = tokio::time::timeout(Duration::from_secs(20), async {
-            tokio::join!(effect(&store, &config, release, false), async {
-                let (stream, request) = receive_run_request(&listener).await?;
-                reply_to_run_request(
-                    stream,
-                    &request,
-                    json!({"schema_version":1,"product":"agent-run","store_id":wrong}),
-                )
-                .await?;
-                Ok::<_, Box<dyn std::error::Error>>(())
-            })
+        }
+    }
+
+    /// Current pool revision, read directly from the private test database.
+    fn pool_revision(
+        store: &SharedStore,
+        pool_id: &str,
+    ) -> Result<u64, Box<dyn std::error::Error>> {
+        let mut guard = store.lock().map_err(|_| "store lock")?;
+        let data: String =
+            guard
+                .test_db()
+                .query_row("SELECT data FROM pools WHERE id=?1", [pool_id], |row| {
+                    row.get(0)
+                })?;
+        serde_json::from_str::<serde_json::Value>(&data)?["revision"]
+            .as_u64()
+            .ok_or_else(|| "revision".into())
+    }
+
+    /// Durable state column of one effect.
+    fn effect_state(store: &SharedStore, id: &str) -> Result<String, Box<dyn std::error::Error>> {
+        let mut guard = store.lock().map_err(|_| "store lock")?;
+        Ok(guard
+            .test_db()
+            .query_row("SELECT state FROM effects WHERE id=?1", [id], |row| {
+                row.get(0)
+            })?)
+    }
+
+    /// One scripted fake Run socket reply.
+    enum RunScript {
+        Result(serde_json::Value),
+        Error(serde_json::Value),
+        Drop,
+    }
+
+    /// Runs one release pass against scripted replies and returns every received request.
+    async fn scripted_release(
+        fixture: &ReleaseFixture,
+        effect_value: Effect,
+        reconcile: bool,
+        script: Vec<RunScript>,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+        let (outcome, requests) = tokio::time::timeout(Duration::from_secs(20), async {
+            tokio::join!(
+                effect(&fixture.store, &fixture.config, effect_value, reconcile),
+                async {
+                    let mut requests = Vec::new();
+                    for step in script {
+                        let (mut stream, request) = receive_run_request(&fixture.listener).await?;
+                        let mut envelope = serde_json::json!({"jsonrpc":"2.0","id":request["id"]});
+                        match step {
+                            RunScript::Result(result) => envelope["result"] = result,
+                            RunScript::Error(error) => envelope["error"] = error,
+                            RunScript::Drop => {
+                                requests.push(request);
+                                continue;
+                            }
+                        }
+                        let mut bytes = serde_json::to_vec(&envelope)?;
+                        bytes.push(b'\n');
+                        stream.write_all(&bytes).await?;
+                        requests.push(request);
+                    }
+                    Ok::<_, Box<dyn std::error::Error>>(requests)
+                }
+            )
         })
         .await?;
         outcome?;
+        let requests = requests?;
         assert!(
-            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+            tokio::time::timeout(Duration::from_millis(100), fixture.listener.accept())
                 .await
-                .is_err()
+                .is_err(),
+            "no unscripted Run request"
         );
-        drop(store);
-        let store = Arc::new(Mutex::new(Store::open(&config.database_path)?));
-        let retry = stored(&store, |store| store.pending_unknown())
+        Ok(requests)
+    }
+
+    /// Run's typed domain error envelope.
+    fn domain_error(code: &str) -> RunScript {
+        RunScript::Error(
+            serde_json::json!({"code":-32000,"message":"refused","data":{"code":code,"message":"refused"}}),
+        )
+    }
+
+    /// A closed pool can record release intent, but cannot send it to an unverified Run store.
+    #[tokio::test]
+    async fn pin_release_waits_for_run_store_identity() -> Result<(), Box<dyn std::error::Error>> {
+        use serde_json::json;
+        let fixture = release_fixture().await?;
+        let (pin, store_identity, release_id) = (
+            fixture.pin.clone(),
+            fixture.store_identity.clone(),
+            fixture.release_id.clone(),
+        );
+        let wrong = format!("store_{}", "2".repeat(32));
+        scripted_release(
+            &fixture,
+            fixture.release.clone(),
+            false,
+            vec![RunScript::Result(
+                json!({"schema_version":1,"product":"agent-run","store_id":wrong}),
+            )],
+        )
+        .await?;
+        let retry = stored(&fixture.store, |store| store.pending_unknown())
             .await?
             .into_iter()
             .find(|item| item.effect_id == release_id)
             .ok_or("release retry")?;
         assert_eq!(retry.state, "unknown");
-        let (outcome, first_release) = tokio::time::timeout(Duration::from_secs(20), async {
-            tokio::join!(effect(&store, &config, retry, true), async {
-                let (stream, capabilities) = receive_run_request(&listener).await?;
-                reply_to_run_request(
-                    stream,
-                    &capabilities,
-                    json!({"schema_version":1,"product":"agent-run","store_id":store_identity}),
-                )
-                .await?;
-                let (stream, request) = receive_run_request(&listener).await?;
-                drop(stream);
-                Ok::<_, Box<dyn std::error::Error>>(request)
-            })
-        })
-        .await?;
-        outcome?;
-        let first_release = first_release?;
-        assert_eq!(first_release["method"], "history_pins");
+        let capabilities = || {
+            RunScript::Result(
+                json!({"schema_version":1,"product":"agent-run","store_id":store_identity}),
+            )
+        };
+        let first =
+            scripted_release(&fixture, retry, true, vec![capabilities(), RunScript::Drop]).await?;
+        assert_eq!(first[1]["method"], "history_pins_release");
         assert_eq!(
-            first_release["params"],
-            json!({"action":"release","pin_id":pin,"expected_store_id":store_identity})
+            first[1]["params"],
+            json!({"pin_id":pin,"request_id":fixture.batch_key,"expected_store_id":store_identity})
         );
-        drop(store);
-        let store = Arc::new(Mutex::new(Store::open(&config.database_path)?));
-        let retry = stored(&store, |store| store.pending_unknown())
+        let retry = stored(&fixture.store, |store| store.pending_unknown())
             .await?
             .into_iter()
             .find(|item| item.effect_id == release_id)
             .ok_or("release retry after lost ACK")?;
-        let (outcome, repeated) = tokio::time::timeout(Duration::from_secs(20), async {
-            tokio::join!(effect(&store, &config, retry, true), async {
-                let (stream, capabilities) = receive_run_request(&listener).await?;
-                reply_to_run_request(
-                    stream,
-                    &capabilities,
-                    json!({"schema_version":1,"product":"agent-run","store_id":store_identity}),
-                )
-                .await?;
-                let (stream, request) = receive_run_request(&listener).await?;
-                reply_to_run_request(
-                    stream,
-                    &request,
+        let repeated = scripted_release(
+            &fixture,
+            retry,
+            true,
+            vec![
+                capabilities(),
+                RunScript::Result(
                     json!({"pin_id":pin,"status":"released","already_released":true}),
-                )
-                .await?;
-                Ok::<_, Box<dyn std::error::Error>>(request)
-            })
-        })
+                ),
+            ],
+        )
         .await?;
-        outcome?;
-        assert_eq!(first_release["params"], repeated?["params"]);
-        let pending = stored(&store, |store| store.pending_unknown()).await?;
+        assert_eq!(first[1]["params"], repeated[1]["params"]);
+        let pending = stored(&fixture.store, |store| store.pending_unknown()).await?;
         assert!(!pending.iter().any(|item| item.effect_id == release_id));
+        assert_eq!(effect_state(&fixture.store, &release_id)?, "accepted");
+        Ok(())
+    }
+
+    /// Run 0.32 error classes: PinNotFound and StoreIdentityMismatch stay unknown; RequestConflict
+    /// and ValidationError refuse the intent so the owner may request again (after a hold).
+    #[tokio::test]
+    async fn pin_release_maps_run_032_errors() -> Result<(), Box<dyn std::error::Error>> {
+        use serde_json::json;
+        let fixture = release_fixture().await?;
+        let store_identity = fixture.store_identity.clone();
+        let capabilities = || {
+            RunScript::Result(
+                json!({"schema_version":1,"product":"agent-run","store_id":store_identity}),
+            )
+        };
+        let retry = |id: String| {
+            let store = fixture.store.clone();
+            async move {
+                stored(&store, |store| store.pending_unknown())
+                    .await?
+                    .into_iter()
+                    .find(|item| item.effect_id == id)
+                    .ok_or_else(|| Box::<dyn std::error::Error>::from("pending release"))
+            }
+        };
+        for (index, code) in ["PinNotFound", "StoreIdentityMismatch"]
+            .into_iter()
+            .enumerate()
+        {
+            let next = if index == 0 {
+                fixture.release.clone()
+            } else {
+                retry(fixture.release_id.clone()).await?
+            };
+            scripted_release(
+                &fixture,
+                next,
+                index > 0,
+                vec![capabilities(), domain_error(code)],
+            )
+            .await?;
+            assert_eq!(
+                effect_state(&fixture.store, &fixture.release_id)?,
+                "unknown",
+                "{code}"
+            );
+            // An unresolved intent keeps blocking a second owner request.
+            assert!(
+                request_release(
+                    &fixture.store,
+                    &fixture.owner,
+                    &fixture.pool_id,
+                    &fixture.member_id,
+                    &format!("again-{index}"),
+                )
+                .await
+                .is_err()
+            );
+        }
+        let requests = scripted_release(
+            &fixture,
+            retry(fixture.release_id.clone()).await?,
+            true,
+            vec![capabilities(), domain_error("RequestConflict")],
+        )
+        .await?;
+        assert_eq!(
+            requests[1]["params"]["request_id"],
+            json!(fixture.batch_key)
+        );
+        assert_eq!(
+            effect_state(&fixture.store, &fixture.release_id)?,
+            "refused"
+        );
+        assert!(
+            !stored(&fixture.store, |store| store.pending_unknown())
+                .await?
+                .iter()
+                .any(|item| item.effect_id == fixture.release_id),
+            "a refusal is terminal and never retried automatically"
+        );
+        // After a refusal (for example a lineage hold) the owner may ask again.
+        let (second_id, second) = request_release(
+            &fixture.store,
+            &fixture.owner,
+            &fixture.pool_id,
+            &fixture.member_id,
+            "after-hold",
+        )
+        .await?;
+        let Work::ReleasePin { owner, .. } = &second.work else {
+            return Err("release work".into());
+        };
+        assert_eq!(
+            owner,
+            &Some(PinOwner::Batch {
+                request_key: fixture.batch_key.clone()
+            })
+        );
+        scripted_release(
+            &fixture,
+            second,
+            false,
+            vec![capabilities(), domain_error("ValidationError")],
+        )
+        .await?;
+        assert_eq!(effect_state(&fixture.store, &second_id)?, "refused");
+        let (third_id, third) = request_release(
+            &fixture.store,
+            &fixture.owner,
+            &fixture.pool_id,
+            &fixture.member_id,
+            "third",
+        )
+        .await?;
+        scripted_release(
+            &fixture,
+            third,
+            false,
+            vec![
+                capabilities(),
+                RunScript::Result(
+                    json!({"pin_id":fixture.pin,"status":"released","already_released":false}),
+                ),
+            ],
+        )
+        .await?;
+        assert_eq!(effect_state(&fixture.store, &third_id)?, "accepted");
+        assert!(
+            request_release(
+                &fixture.store,
+                &fixture.owner,
+                &fixture.pool_id,
+                &fixture.member_id,
+                "after-accepted",
+            )
+            .await
+            .is_err(),
+            "an accepted release is never requested twice"
+        );
+        Ok(())
+    }
+
+    /// Run before 0.32 answers method-not-found: Pool falls back to the combined method. An
+    /// intent recorded before the owner key was frozen re-derives it from the origin.
+    #[tokio::test]
+    async fn pin_release_falls_back_on_old_run_and_rederives_legacy_owner()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use serde_json::json;
+        let fixture = release_fixture().await?;
+        let mut legacy = fixture.release.clone();
+        let Work::ReleasePin { owner, .. } = &mut legacy.work else {
+            return Err("release work".into());
+        };
+        assert!(owner.take().is_some());
+        {
+            let mut guard = fixture.store.lock().map_err(|_| "store lock")?;
+            guard.test_db().execute(
+                "UPDATE effects SET data=?2 WHERE id=?1",
+                rusqlite::params![fixture.release_id, serde_json::to_string(&legacy)?],
+            )?;
+        }
+        let requests = scripted_release(
+            &fixture,
+            legacy,
+            false,
+            vec![
+                RunScript::Result(
+                    json!({"schema_version":1,"product":"agent-run","store_id":fixture.store_identity}),
+                ),
+                RunScript::Error(json!({"code":-32601,"message":"method not found"})),
+                RunScript::Result(
+                    json!({"pin_id":fixture.pin,"status":"released","already_released":false}),
+                ),
+            ],
+        )
+        .await?;
+        assert_eq!(requests[1]["method"], "history_pins_release");
+        assert_eq!(
+            requests[1]["params"]["request_id"],
+            json!(fixture.batch_key)
+        );
+        assert_eq!(requests[2]["method"], "history_pins");
+        assert_eq!(
+            requests[2]["params"],
+            json!({"action":"release","pin_id":fixture.pin,"expected_store_id":fixture.store_identity})
+        );
+        assert_eq!(
+            effect_state(&fixture.store, &fixture.release_id)?,
+            "accepted"
+        );
         Ok(())
     }
 

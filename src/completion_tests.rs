@@ -2757,6 +2757,9 @@ async fn completed_pool_late_start_recovery_keeps_worker_running() {
         work: Work::ReleasePin {
             pin_id: released.clone(),
             route: Some(route),
+            owner: Some(crate::domain::PinOwner::Batch {
+                request_key: "released-request".into(),
+            }),
         },
     };
     fixture.with(|db| {
@@ -2810,8 +2813,10 @@ async fn completed_pool_late_start_recovery_keeps_worker_running() {
                     json!({"schema_version":1,"product":"agent-run","store_id":RUN_STORE})
                 }
                 "batch_receipt" => json!({"found":true,"receipt":receipt}),
-                "history_pins" => json!({"pin_id":request["params"]["pin_id"],
-                    "status":"released","already_released":false}),
+                "history_pins_release" if request["params"]["request_id"] == "released-request" => {
+                    json!({"pin_id":request["params"]["pin_id"],
+                    "status":"released","already_released":false})
+                }
                 _ => continue,
             };
             let mut bytes =

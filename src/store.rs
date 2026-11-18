@@ -1630,6 +1630,39 @@ PRAGMA user_version=5;")?;
         }
         Ok(out)
     }
+    /// Re-derives the Run ownership proof of a release intent recorded before it was frozen.
+    /// Origins are immutable, so the result equals what a new intent would have recorded.
+    pub fn pin_release_owner(&self, effect_id: &str) -> Result<Option<PinOwner>, Fault> {
+        let e = effect(&self.db, effect_id)?;
+        let Work::ReleasePin { pin_id, owner, .. } = &e.work else {
+            return Err(Fault::Internal);
+        };
+        if owner.is_some() {
+            return Ok(owner.clone());
+        }
+        let Some(member_id) = e.member_id.as_deref() else {
+            return Ok(None);
+        };
+        let raw: Option<String> = self
+            .db
+            .query_row("SELECT data FROM members WHERE id=?1", [member_id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        let Some(raw) = raw else { return Ok(None) };
+        let binding: Binding = decode(&raw)?;
+        if binding.run_pin_id.as_deref() != Some(pin_id.as_str()) {
+            return Ok(None);
+        }
+        Ok(pin_release_origin(
+            &self.db,
+            &e.pool_id,
+            member_id,
+            binding.run_store_id.as_deref(),
+            pin_id,
+        )?
+        .1)
+    }
     /// Returns the retained exact membership of an effect, including removal and immediate Run receipt.
     /// This private view lets reconciliation inspect admitted work without starting a removed agent.
     pub fn effect_binding(&self, effect_id: &str) -> Result<Option<(Binding, bool)>, Fault> {
@@ -2098,6 +2131,10 @@ PRAGMA user_version=5;")?;
                         "Run batch admission outcome unknown; exact request reconciliation required."
                     } else if matches!(effect.work, Work::StartBatch { .. }) {
                         "Run batch admission refused; no member was admitted by this request."
+                    } else if matches!(effect.work, Work::ReleasePin { .. }) && state == "unknown" {
+                        "History release outcome unknown; Pool retries the same pin and owner key."
+                    } else if matches!(effect.work, Work::ReleasePin { .. }) {
+                        "History release refused by Run; the pin stays retained. Request it again after any lineage hold is released."
                     } else if state == "unknown" {
                         "Delivery or admission outcome unknown; reconciliation required."
                     } else {
@@ -3203,8 +3240,9 @@ fn execute_authorized(
                 return Err(Fault::Conflict);
             }
             target = Some(x.member_id.clone());
-            let route = pin_origin_route(db, pid, &x.member_id, binding.run_store_id.as_deref())?;
-            release_pin = Some((x.member_id.clone(), pin, route));
+            let (route, owner) =
+                pin_release_origin(db, pid, &x.member_id, binding.run_store_id.as_deref(), &pin)?;
+            release_pin = Some((x.member_id.clone(), pin, route, owner));
             (
                 "history_release_requested",
                 "Owner requested release of the closed member's retained Run history.".into(),
@@ -3647,12 +3685,16 @@ fn execute_authorized(
             },
         )?);
     }
-    if let Some((member_id, pin_id, route)) = release_pin {
+    if let Some((member_id, pin_id, route, owner)) = release_pin {
         created = Some(queue(
             db,
             pid,
             Some(&member_id),
-            Work::ReleasePin { pin_id, route },
+            Work::ReleasePin {
+                pin_id,
+                route,
+                owner,
+            },
         )?);
     }
     // A removed member receives only the independent final service notice, never the remaining roster.
@@ -4641,21 +4683,72 @@ fn validate_replacement_source(db: &Connection, effect: &Effect) -> Result<(), F
     }
     Ok(())
 }
-/// Prevents a second release intent for the same exact pin under a different request key.
+/// Prevents a second live release intent for the same exact pin under a different request key.
+/// Only a definitive Run refusal (for example while a lineage hold protected the pin) admits a
+/// new owner request; queued, unknown and accepted intents keep blocking.
 fn pin_release_exists(
     db: &Connection,
     pool_id: &str,
     member_id: &str,
     pin: &str,
 ) -> Result<bool, Fault> {
-    let mut stmt = db.prepare("SELECT data FROM effects WHERE pool=?1 AND member=?2")?;
-    for row in stmt.query_map(params![pool_id, member_id], |row| row.get::<_, String>(0))? {
-        let effect: Effect = decode(&row?)?;
-        if matches!(&effect.work, Work::ReleasePin { pin_id, .. } if pin_id == pin) {
+    let mut stmt = db.prepare("SELECT data,state FROM effects WHERE pool=?1 AND member=?2")?;
+    for row in stmt.query_map(params![pool_id, member_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })? {
+        let (data, state) = row?;
+        let effect: Effect = decode(&data)?;
+        if state != "refused"
+            && matches!(&effect.work, Work::ReleasePin { pin_id, .. } if pin_id == pin)
+        {
             return Ok(true);
         }
     }
     Ok(false)
+}
+/// Resolves the release route and Run ownership proof of one member's exact pin.
+///
+/// A public admission yields its frozen store-fenced route and `start_batch` request key; a
+/// managed enrollment yields its immutable enrollment key and needs no socket route. Legacy
+/// data without a proven origin keeps both absent, so the intent stays unknown.
+fn pin_release_origin(
+    db: &Connection,
+    pool_id: &str,
+    member_id: &str,
+    store: Option<&str>,
+    pin: &str,
+) -> Result<(Option<RunRoute>, Option<PinOwner>), Fault> {
+    if let Some((route, request_key)) = pin_origin(db, pool_id, member_id, store)? {
+        return Ok((Some(route), Some(PinOwner::Batch { request_key })));
+    }
+    Ok((None, managed_pin_owner(db, pool_id, member_id, pin)?))
+}
+/// Finds the managed enrollment whose recorded admission minted this member's exact pin.
+fn managed_pin_owner(
+    db: &Connection,
+    pool_id: &str,
+    member_id: &str,
+    pin: &str,
+) -> Result<Option<PinOwner>, Fault> {
+    let row: Option<(String, String, Option<String>)> = db
+        .query_row(
+            "SELECT e.id,e.request_id,j.admission FROM managed_enrollment_jobs j JOIN managed_enrollments e ON e.id=j.enrollment WHERE j.member=?1 AND e.pool=?2",
+            params![member_id, pool_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((enrollment_id, request_id, Some(admission))) = row else {
+        return Ok(None);
+    };
+    let admission: crate::managed_enrollment::Admission = decode(&admission)?;
+    Ok(
+        (admission.member_id == member_id && admission.pin_id == pin).then_some(
+            PinOwner::Managed {
+                enrollment_id,
+                request_id,
+            },
+        ),
+    )
 }
 /// Resolves a member's unique accepted store-fenced admission route, or keeps legacy data unknown.
 fn pin_origin_route(
@@ -4664,6 +4757,16 @@ fn pin_origin_route(
     member_id: &str,
     store: Option<&str>,
 ) -> Result<Option<RunRoute>, Fault> {
+    Ok(pin_origin(db, pool_id, member_id, store)?.map(|(route, _)| route))
+}
+/// Resolves a member's unique accepted store-fenced admission route and its exact Run
+/// request key, or keeps legacy data unknown.
+fn pin_origin(
+    db: &Connection,
+    pool_id: &str,
+    member_id: &str,
+    store: Option<&str>,
+) -> Result<Option<(RunRoute, String)>, Fault> {
     let Some(store) = store else { return Ok(None) };
     store_id(store)?;
     let mut stmt = db.prepare("SELECT data FROM effects WHERE pool=?1 AND state='accepted'")?;
@@ -4677,6 +4780,7 @@ fn pin_origin_route(
                 jobs,
                 store_fence,
                 route,
+                request_key,
                 ..
             } => {
                 let matches = jobs.iter().filter(|job| job.member_id == member_id).count();
@@ -4687,8 +4791,9 @@ fn pin_origin_route(
                     return Err(Fault::Conflict);
                 }
                 seen = true;
-                found =
-                    route.filter(|route| store_fence && route.store_id.as_deref() == Some(store));
+                found = route
+                    .filter(|route| store_fence && route.store_id.as_deref() == Some(store))
+                    .map(|route| (route, request_key));
             }
             Work::Start { .. } if effect.member_id.as_deref() == Some(member_id) => {
                 if seen {
@@ -4701,6 +4806,7 @@ fn pin_origin_route(
                 new,
                 job,
                 route,
+                request_key,
                 ..
             } if new.member.member_id == member_id => {
                 if seen
@@ -4711,7 +4817,7 @@ fn pin_origin_route(
                     return Err(Fault::Conflict);
                 }
                 seen = true;
-                found = (route.store_id.as_deref() == Some(store)).then_some(route);
+                found = (route.store_id.as_deref() == Some(store)).then_some((route, request_key));
             }
             _ => {}
         }
@@ -7978,11 +8084,21 @@ mod tests {
         let Work::ReleasePin {
             pin_id,
             route: Some(saved),
+            owner: Some(PinOwner::Batch { request_key }),
         } = release.work
         else {
             panic!("fenced release")
         };
         assert_eq!(pin_id, pin);
+        // The owner proof is the exact request key of the accepted origin.
+        let Work::StartBatch {
+            request_key: origin_key,
+            ..
+        } = effect(&s.db, &start.effect_id).unwrap().work
+        else {
+            panic!("origin batch")
+        };
+        assert_eq!(request_key, origin_key);
         assert_eq!(saved.socket, route.socket);
         assert_eq!(saved.store_id.as_deref(), Some(store.as_str()));
     }

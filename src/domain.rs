@@ -1220,6 +1220,30 @@ pub enum Work {
         /// Original fenced admission route; absent legacy intents remain on hold.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         route: Option<RunRoute>,
+        /// Run ownership proof frozen with the intent; absent on intents recorded before
+        /// Run 0.32, which re-derive it from the immutable admission records.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner: Option<PinOwner>,
+    },
+}
+/// The admission key that proves Pool owns one Run history pin.
+///
+/// Run 0.32 releases a pin only for the request that admitted it; a pin ID alone grants
+/// no authority. Both keys are already durable in immutable Pool records.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PinOwner {
+    /// Public `start_batch` admission (batch start or replacement) and its exact request key.
+    Batch {
+        /// Run `start_batch` request ID that minted the pin.
+        request_key: String,
+    },
+    /// Managed enrollment admission, released over the authenticated attempt channel.
+    Managed {
+        /// Pool enrollment row; its frozen route selects the Run endpoint.
+        enrollment_id: String,
+        /// Pool's own enrollment request key sent to Run.
+        request_id: String,
     },
 }
 /// Run endpoint configuration frozen before one durable external admission.
