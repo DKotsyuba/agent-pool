@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Fixed
+
+- Closing a pool no longer leaves member states and delivery work open (#17, #29). Members of a closed pool are recorded `removed`. Never-published deliveries settle as `not_delivered`: final notices to members without a managed binding settle in the close transaction with attention `pool_closed`, and a bound member's final notice settles `pool_closed` after at most three non-decisive attempts instead of being retried every 300 s forever (each retry cost a rejected Run egress receipt and a Pool currentness row). Known-unsent and uncertain effects of closed pools keep their original identity and receipts, are only reconciled under that identity (never republished) and are paced by a backoff of 60 s doubling to one hour.
+- A member created by `pool_add`, `pool_start_agent` or `pool_start_batch` no longer receives a second native turn for its own creation event in addition to its onboarding (#18). Onboarding delivery after binding is unchanged.
+
+### Added
+
+- Owner observer operation `delivery_attention` (capability `delivery_attention_v1`, owner grant only) with counts of closed pools, their open members, unsettled and unresolved deliveries. `agent-pool doctor --config` reports it as `closed_pool_attention`; it does not change the exit code.
+
+### Changed
+
+- Store schema v16: non-current incarnations are recorded `removed`, and every open settles closed pools' never-published deliveries idempotently, so pools closed by 0.1.3 settle on upgrade. 0.1.3 and older refuse a v16 store.
+
 ### Changed
 
 - `deny.toml` now ignores RUSTSEC-2026-0543 ("chrono is unmaintained", informational, no vulnerability) with an owner-approved re-check date of 2027-02-01; chrono remains required by rmcp and by our own use.

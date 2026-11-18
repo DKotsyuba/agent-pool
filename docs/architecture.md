@@ -11,10 +11,12 @@ its EOF never starts, stops or replaces the resident.
 - `domain.rs` defines strict flat commands, safe public views and private outbox work.
 - `store.rs` owns the single SQLite writer and synchronous transactions. A process
   lifetime file lock excludes a second writer. WAL, full synchronization, foreign
-  keys and schema version 15 are explicit. Future schema versions refuse to open.
-  Schema v1–v14 upgrades transactionally to v15 before use; older binaries must
-  refuse v15 because they cannot preserve newer durable state. The v5 replacement
+  keys and schema version 16 are explicit. Future schema versions refuse to open.
+  Schema v1–v15 upgrades transactionally to v16 before use; older binaries must
+  refuse v16 because they cannot preserve newer durable state. The v5 replacement
   and stable-slot migration and v6 inventory revision fence remain in that upgrade.
+  v16 records every non-current incarnation as `removed`; every open then settles
+  closed pools' never-published deliveries (see "Closed pools").
 - `runtime.rs` supervises bounded frontend connections, one serial effect worker
   and rotating observation batches. Blocking database work never spans provider I/O.
 - `integrations.rs` uses Bridge's public SDK and Run's public NDJSON JSON-RPC API.
@@ -311,7 +313,7 @@ a native actor, leader, membership or assertion consumption.
 
 `agent-pool observe --config /absolute/config.toml` accepts exactly one bounded
 UTF-8 JSON line on stdin followed by EOF, and emits one JSON line. Input is
-`{"schema_version":1,"operation":"identity|list|get|inventory_snapshot|managed_capacity|completion_get","params":{...}}`.
+`{"schema_version":1,"operation":"identity|list|get|inventory_snapshot|managed_capacity|delivery_attention|completion_get","params":{...}}`.
 `identity` requires `{}`; `list` accepts `after` (last pool ID). `get` requires
 `pool_id`, accepts numeric `after` (default 0), `section` (default `overview`),
 `proposal_id`, `member_id`, `field`, `include_bindings` (default false), and optional
@@ -336,7 +338,7 @@ not count. Read the next `checks_count` matching `vote_check` events through
 `event_id_exact` for event navigation, including IDs beyond JavaScript's exact
 number range. `check` and `vote_event_id` are omitted from unrelated events.
 
-Success is `{schema_version:1,kind:"identity|pool_page|pool_detail|run_proof|inventory_snapshot|managed_capacity|completion_page",data:...}`.
+Success is `{schema_version:1,kind:"identity|pool_page|pool_detail|run_proof|inventory_snapshot|managed_capacity|delivery_attention|completion_page",data:...}`.
 Failure has the same family (or `error` for undecodable input), `error` instead
 of `data`, and fixed `code`, `outcome` (`blocked|unavailable`), `detail` fields.
 Inventory data has `pools:[{pool,leader_id}]`; detail has `section`, `view`
@@ -383,8 +385,8 @@ The request is the plain observer request above, without
 `{"schema_version":1,"operation":"list","params":{}}`. Responses use the same
 envelope and families. Only these operations are served:
 
-- `identity`: its capabilities omit `run_proof_v1` and `managed_capacity_v1` and
-  add `observer_socket_v1`;
+- `identity`: its capabilities omit `run_proof_v1`, `managed_capacity_v1` and
+  `delivery_attention_v1` and add `observer_socket_v1`;
 - `list`;
 - `get` with section `overview`, `members`, `history`, `proposal`, `votes`,
   `criteria`, `content`, `deliveries` or `decisions`, without
@@ -393,7 +395,7 @@ envelope and families. Only these operations are served:
 - `completion_get` (`completion_record_v1`);
 - `enrollment_get` (`managed_enrollment_v1`).
 
-`managed_capacity`, the `binding` and `run_proof` sections and
+`managed_capacity`, `delivery_attention`, the `binding` and `run_proof` sections and
 `include_bindings:true` are refused with `unauthorized`: they expose private
 native/Run mappings, owner diagnostics, or make the resident call Run. Any other
 input — an unknown operation, a participant command, an assertion, a credential,
@@ -954,7 +956,35 @@ pin after re-pin, including in an already-used final-notice scope. On removal, P
 records a pinned Bridge retirement receipt before requesting bounded compaction.
 The final-notice scope drains when the pool closes. Uncertain effects and fences
 survive restart; scope retirement never claims that an accepted or unknown effect
-was recalled. Each of the active outbox and active scope sets is bounded at
+was recalled.
+
+**Closed pools.** Closing a pool makes every member terminal: the incarnation is
+non-current and recorded `removed`, and its enrollment job is retired or
+unassigned. Nothing that was never published stays open. In the close
+transaction, ordinary `pending`/`frozen` seeds become `not_delivered`
+(`member_removed`), and a final notice whose member has no managed binding
+(none can be installed in a closed pool) becomes `not_delivered` with attention
+`pool_closed`. The final notice of a bound member is a best-effort courtesy (E10
+permits it; nothing obliges it): it gets at most three non-decisive pre-freeze
+attempts on the normal 5/10/20 s pause and then settles `pool_closed` in the
+transaction that would schedule the next pause. A closed pool's frozen,
+known-unsent or uncertain (`publishing`, `unknown`, `abort_pending`) effect
+keeps its frozen identity, Bridge pin and Run receipt and pursues only its
+existing operation: a frozen final notice may still be published, but after
+three non-decisive passes without reaching Bridge it settles `pool_closed`; a
+known-unsent one is fenced and aborted under its original key instead of being
+published again; unknown/abort-pending work keeps the draining-scope same-key
+abort. These passes are paced by a durable 60 s doubling backoff capped at one
+hour; a definite `accepted` or `aborted` terminalizes, nothing is republished,
+and work that never becomes determinable stays visible. Every
+store open re-runs the settlement idempotently, so pools closed by older
+releases settle on upgrade. The owner observer capability `delivery_attention_v1`
+(`{"schema_version":1,"operation":"delivery_attention","params":{}}`, owner
+grant only, not on the group socket) returns counts of closed pools, their open
+members, unsettled never-published deliveries and unresolved effects, with
+`attention_required`; `agent-pool doctor --config` reports it as
+`closed_pool_attention` without affecting readiness. `pool_get
+section=deliveries` shows `pool_closed` attention per delivery. Each of the active outbox and active scope sets is bounded at
 100,000; terminal records and rejecting fences remain retained. Scope retirement
 freezes the active pin and audience when retirement is first prepared, before
 I/O, and uses the SDK's same-connection pinned Bridge method, retaining that
@@ -1000,8 +1030,8 @@ namespace compacts no-longer-actionable command and snapshot payloads while
 preserving intent outcomes, domain replay keys, routes and remote recovery
 receipts. Sealed namespace fences and per-key tombstones do not expire; retained
 storage can still grow and requires operator monitoring. `doctor --config PATH`
-uses that same explicitly configured owner grant to include the capacity snapshot;
-without a config, `doctor` remains a nonmutating local resource check.
+uses that same explicitly configured owner grant to include the capacity snapshot
+and the closed-pool `delivery_attention` counts (diagnostic only); without a config, `doctor` remains a nonmutating local resource check.
 
 ### Run execution evidence v1
 

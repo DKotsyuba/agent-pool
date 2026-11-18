@@ -57,6 +57,19 @@ pub(crate) fn liveness_failed(
 /// Count one more failure and pause the effect for 5 s doubling per failure,
 /// capped at 300 s, inside the caller's transaction. Returns the new count.
 fn schedule_retry(tx: &Connection, effect_id: &str, now: i64) -> Result<i64, Fault> {
+    schedule_backoff(tx, effect_id, now, 5, 300)
+}
+
+/// Count one more failure and pause the effect for `base` seconds doubling per
+/// failure (at most six doublings), capped at `cap` seconds, inside the
+/// caller's transaction. Returns the new count.
+fn schedule_backoff(
+    tx: &Connection,
+    effect_id: &str,
+    now: i64,
+    base: i64,
+    cap: i64,
+) -> Result<i64, Fault> {
     let failures: i64 = tx
         .query_row(
             "SELECT failures FROM managed_delivery_liveness WHERE effect_id=?1",
@@ -67,7 +80,7 @@ fn schedule_retry(tx: &Connection, effect_id: &str, now: i64) -> Result<i64, Fau
         .unwrap_or(0_i64)
         .saturating_add(1);
     let shift = u32::try_from((failures - 1).clamp(0, 6)).map_err(|_| Fault::Internal)?;
-    let next = now.saturating_add(5_i64.saturating_mul(1_i64 << shift).min(300));
+    let next = now.saturating_add(base.saturating_mul(1_i64 << shift).min(cap));
     tx.execute(
         "INSERT INTO managed_delivery_liveness(effect_id,failures,next_attempt) VALUES(?1,?2,?3) ON CONFLICT(effect_id) DO UPDATE SET failures=excluded.failures,next_attempt=excluded.next_attempt",
         params![effect_id, failures, next.max(0)],
@@ -84,6 +97,11 @@ fn schedule_retry(tx: &Connection, effect_id: &str, now: i64) -> Result<i64, Fau
 /// the liveness schedule (5 s doubling, capped at 300 s); `freeze` clears the
 /// count, so unknown-outcome lookups after a later publish start from zero.
 /// Returns whether a pause was recorded; any other state is left unchanged.
+///
+/// A closed pool's final notice is a best-effort courtesy, not a standing
+/// obligation: after [`CLOSED_FINAL_ATTEMPTS`] non-decisive attempts it is
+/// settled `not_delivered` with attention `pool_closed` in the same
+/// transaction instead of being paused again.
 pub(crate) fn pending_deferred(
     db: &mut Connection,
     effect_id: &str,
@@ -93,7 +111,43 @@ pub(crate) fn pending_deferred(
     if state(&tx, effect_id)? != Some(State::Pending) {
         return Ok(false);
     }
-    schedule_retry(&tx, effect_id, now)?;
+    let failures = schedule_retry(&tx, effect_id, now)?;
+    if failures >= CLOSED_FINAL_ATTEMPTS && pool_closed(&tx, effect_id)? {
+        settle_not_delivered(&tx, effect_id, POOL_CLOSED)?;
+    }
+    tx.commit()?;
+    Ok(true)
+}
+
+/// Pause a closed pool's unresolved effect (frozen, known-unsent or uncertain)
+/// after a non-decisive pass: 60 s doubling, capped at one hour. Only the
+/// existing frozen operation is pursued meanwhile; nothing new is published.
+/// A still-`frozen` effect was never handed to Bridge, so after
+/// [`CLOSED_FINAL_ATTEMPTS`] such passes it settles `pool_closed` instead.
+/// Returns whether a pause was recorded; terminal and pending effects are unchanged.
+pub(crate) fn closed_deferred(
+    db: &mut Connection,
+    effect_id: &str,
+    now: i64,
+) -> Result<bool, Fault> {
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if !matches!(
+        state(&tx, effect_id)?,
+        Some(
+            State::Frozen
+                | State::Publishing
+                | State::KnownUnsent
+                | State::Unknown
+                | State::AbortPending
+        )
+    ) || !pool_closed(&tx, effect_id)?
+    {
+        return Ok(false);
+    }
+    let failures = schedule_backoff(&tx, effect_id, now, 60, 3600)?;
+    if failures >= CLOSED_FINAL_ATTEMPTS && state(&tx, effect_id)? == Some(State::Frozen) {
+        settle_not_delivered(&tx, effect_id, POOL_CLOSED)?;
+    }
     tx.commit()?;
     Ok(true)
 }
@@ -193,7 +247,8 @@ fn republish_in(tx: &Connection, effect_id: &str) -> Result<Option<String>, Faul
     } else {
         current && scope_state == "open"
     };
-    if !deliverable {
+    // A closed pool never gains a new publication, not even a successor.
+    if !deliverable || pool_closed(tx, effect_id)? {
         return Ok(None);
     }
     // The original is already `aborted` here, so it no longer counts as active.
@@ -582,6 +637,7 @@ pub(crate) fn owner_attention(
                 | "conflict"
                 | "delivery_refused_attempt_mismatch"
                 | "delivery_retrying_outcome_unknown"
+                | "pool_closed"
         )
     }) {
         return Err(Fault::Internal);
@@ -781,15 +837,23 @@ pub(crate) fn mark_not_delivered(
 ) -> Result<(), Fault> {
     if !matches!(
         reason,
-        "member_removed" | "different_lineage" | "origin_unavailable"
+        "member_removed" | "different_lineage" | "origin_unavailable" | "pool_closed"
     ) {
         return Err(Fault::Invalid);
     }
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    settle_not_delivered(&tx, effect_id, reason)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Inside the caller's transaction, settle a never-published (`pending` or
+/// `frozen`) effect as definitively `not_delivered`: its pending Run probe is
+/// fenced and its effect cancelled. Any other state is left unchanged.
+fn settle_not_delivered(tx: &Connection, effect_id: &str, reason: &str) -> Result<(), Fault> {
     tx.execute("UPDATE managed_current_requests SET state='aborted' WHERE state IN ('prepared','received') AND id=(SELECT probe_request_id FROM managed_delivery_outbox WHERE effect_id=?1 AND state='pending')", [effect_id])?;
     tx.execute("UPDATE managed_delivery_outbox SET state='not_delivered',attention=?2 WHERE effect_id=?1 AND state IN ('pending','frozen')",params![effect_id,reason])?;
-    tx.execute("UPDATE effects SET state='cancelled' WHERE id=?1 AND EXISTS(SELECT 1 FROM managed_delivery_outbox WHERE effect_id=?1 AND state='not_delivered')",[effect_id])?;
-    tx.commit()?;
+    tx.execute("UPDATE effects SET state='cancelled' WHERE id=?1 AND state NOT IN ('accepted','refused','cancelled') AND EXISTS(SELECT 1 FROM managed_delivery_outbox WHERE effect_id=?1 AND state='not_delivered')",[effect_id])?;
     Ok(())
 }
 
@@ -1401,6 +1465,101 @@ pub(crate) fn retire_member_scope(db: &Connection, pool: &str, member: &str) -> 
 pub(crate) fn retire_final_scope(db: &Connection, pool: &str) -> Result<(), Fault> {
     db.execute("UPDATE managed_delivery_scopes SET state='draining' WHERE pool_id=?1 AND member_id IS NULL AND state='open'",[pool])?;
     Ok(())
+}
+
+/// Attention and terminal reason of deliveries settled because their pool closed.
+pub(crate) const POOL_CLOSED: &str = "pool_closed";
+/// Non-decisive pre-freeze attempts a closed pool's final notice gets before
+/// it settles as `pool_closed`.
+pub(crate) const CLOSED_FINAL_ATTEMPTS: i64 = LIVENESS_LOOKUPS;
+
+/// Whether the pool of this seeded effect has been explicitly closed.
+pub(crate) fn pool_closed(db: &Connection, effect_id: &str) -> Result<bool, Fault> {
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM managed_delivery_seeds s JOIN pools p ON p.id=s.pool_id WHERE s.effect_id=?1 AND json_extract(p.data,'$.closed')=1)",
+        [effect_id],
+        |row| row.get(0),
+    )?)
+}
+
+/// Idempotently settle, inside the caller's transaction, every delivery of a
+/// closed pool (one pool, or all when `pool` is `None`) that was never
+/// published and can no longer be: ordinary `pending`/`frozen` seeds, and
+/// `pending` or `frozen` final notices whose member has no managed binding (a
+/// closed pool never installs one) or whose bounded attempts are spent. They become
+/// `not_delivered` with attention `pool_closed`. Published, known-unsent and
+/// uncertain effects keep their frozen identity and receipts; they are never
+/// recalled or republished here. Returns the number of settled effects.
+pub(crate) fn settle_closed_pools(db: &Connection, pool: Option<&str>) -> Result<usize, Fault> {
+    if db.is_autocommit() {
+        return Err(Fault::Internal);
+    }
+    let ids = {
+        let mut statement = db.prepare("SELECT s.effect_id FROM managed_delivery_seeds s JOIN managed_delivery_outbox o ON o.effect_id=s.effect_id JOIN pools p ON p.id=s.pool_id LEFT JOIN managed_delivery_liveness l ON l.effect_id=s.effect_id WHERE json_extract(p.data,'$.closed')=1 AND (?1 IS NULL OR s.pool_id=?1) AND ((s.final_notice=0 AND o.state IN ('pending','frozen')) OR (s.final_notice=1 AND o.state IN ('pending','frozen') AND (COALESCE(l.failures,0)>=?2 OR NOT EXISTS(SELECT 1 FROM managed_bindings b WHERE b.member=s.member_id AND b.pool=s.pool_id)))) ORDER BY s.rowid")?;
+        statement
+            .query_map(params![pool, CLOSED_FINAL_ATTEMPTS], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for id in &ids {
+        settle_not_delivered(db, id, POOL_CLOSED)?;
+    }
+    Ok(ids.len())
+}
+
+/// Owner diagnostics for explicitly closed pools; counts only, never identifiers.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClosedPoolAttention {
+    /// Explicitly closed pools.
+    pub closed_pools: u64,
+    /// Members of closed pools that are still current or not recorded as removed.
+    pub open_members: u64,
+    /// Never-published deliveries of closed pools still pending or frozen
+    /// (a final notice within its bounded attempts, or awaiting settlement).
+    pub unsettled: u64,
+    /// Known-unsent or uncertain (`publishing`, `unknown`, `abort_pending`)
+    /// deliveries of closed pools, retained and reconciled under their original
+    /// identity with long backoff until a definite outcome is known.
+    pub unresolved: u64,
+    /// Whether any closed pool still has open members or unfinished delivery work.
+    pub attention_required: bool,
+}
+
+impl ClosedPoolAttention {
+    /// The summary flag must agree with the counts it summarizes.
+    pub(crate) fn valid(&self) -> bool {
+        self.attention_required
+            == (self.open_members > 0 || self.unsettled > 0 || self.unresolved > 0)
+    }
+}
+
+/// One SQLite snapshot of what closed pools still leave open.
+pub(crate) fn closed_pool_attention(db: &Connection) -> Result<ClosedPoolAttention, Fault> {
+    let tx = db.unchecked_transaction()?;
+    let count = |sql: &str| -> Result<u64, Fault> {
+        let value: i64 = tx.query_row(sql, [], |row| row.get(0))?;
+        u64::try_from(value).map_err(|_| Fault::Internal)
+    };
+    let closed_pools = count("SELECT count(*) FROM pools WHERE json_extract(data,'$.closed')=1")?;
+    let open_members = count(
+        "SELECT count(*) FROM members m JOIN pools p ON p.id=m.pool WHERE json_extract(p.data,'$.closed')=1 AND (m.current=1 OR json_extract(m.data,'$.member.state')!='removed')",
+    )?;
+    let unsettled = count(
+        "SELECT count(*) FROM managed_delivery_seeds s JOIN managed_delivery_outbox o ON o.effect_id=s.effect_id JOIN pools p ON p.id=s.pool_id WHERE json_extract(p.data,'$.closed')=1 AND o.state IN ('pending','frozen')",
+    )?;
+    let unresolved = count(
+        "SELECT count(*) FROM managed_delivery_seeds s JOIN managed_delivery_outbox o ON o.effect_id=s.effect_id JOIN pools p ON p.id=s.pool_id WHERE json_extract(p.data,'$.closed')=1 AND o.state IN ('publishing','known_unsent','unknown','abort_pending')",
+    )?;
+    tx.commit()?;
+    Ok(ClosedPoolAttention {
+        closed_pools,
+        open_members,
+        unsettled,
+        unresolved,
+        attention_required: open_members > 0 || unsettled > 0 || unresolved > 0,
+    })
 }
 
 /// Rotate past draining scopes with unresolved effects; they cannot be retired yet.
@@ -2950,5 +3109,288 @@ pub(crate) mod tests {
             state(store.test_db(), "stale").unwrap(),
             Some(State::NotDelivered)
         );
+    }
+
+    fn close_pool(store: &mut Store) {
+        let db = store.test_db();
+        db.execute("UPDATE members SET current=0 WHERE id='member'", [])
+            .unwrap();
+        db.execute(
+            "UPDATE pools SET data=json_set(data,'$.closed',json('true')) WHERE id='pool'",
+            [],
+        )
+        .unwrap();
+        db.execute("UPDATE managed_delivery_scopes SET state='draining' WHERE pool_id='pool' AND state='open'",[]).unwrap();
+    }
+    fn settle_all(store: &mut Store) -> usize {
+        let tx = store
+            .test_db()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let settled = settle_closed_pools(&tx, None).unwrap();
+        tx.commit().unwrap();
+        settled
+    }
+    fn outbox(store: &mut Store, effect_id: &str) -> (String, Option<String>, String) {
+        store.test_db().query_row(
+            "SELECT o.state,o.attention,e.state FROM managed_delivery_outbox o JOIN effects e ON e.id=o.effect_id WHERE o.effect_id=?1",
+            [effect_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap()
+    }
+
+    /// #17/#29: a closed pool's never-published ordinary seed settles with the
+    /// close; its final notice gets a bounded number of attempts and then
+    /// settles `pool_closed`, after which nothing retries or probes it again.
+    #[test]
+    fn closed_pool_final_notice_settles_after_bounded_attempts() {
+        let (_directory, mut store, binding, _incarnation, _run) = fixture();
+        index_managed_member(store.test_db(), &binding);
+        add_seed(&mut store, &binding, "ordinary", "hello", false);
+        add_seed(&mut store, &binding, "final", "Membership ended.", true);
+        close_pool(&mut store);
+        assert_eq!(settle_all(&mut store), 1);
+        assert_eq!(
+            outbox(&mut store, "ordinary"),
+            (
+                "not_delivered".into(),
+                Some("pool_closed".into()),
+                "cancelled".into()
+            )
+        );
+        // The bound member's final notice keeps its bounded best-effort attempts.
+        assert_eq!(
+            state(store.test_db(), "final").unwrap(),
+            Some(State::Pending)
+        );
+        let now = unix_now();
+        for attempt in 1..CLOSED_FINAL_ATTEMPTS {
+            assert!(pending_deferred(store.test_db(), "final", now).unwrap());
+            assert_eq!(
+                state(store.test_db(), "final").unwrap(),
+                Some(State::Pending),
+                "attempt {attempt}"
+            );
+        }
+        assert!(pending_deferred(store.test_db(), "final", now).unwrap());
+        assert_eq!(
+            outbox(&mut store, "final"),
+            (
+                "not_delivered".into(),
+                Some("pool_closed".into()),
+                "cancelled".into()
+            )
+        );
+        assert_eq!(
+            owner_attention(store.test_db(), "final")
+                .unwrap()
+                .0
+                .as_deref(),
+            Some("pool_closed")
+        );
+        // Settled: idempotent, no further pause, probe or publication.
+        assert_eq!(settle_all(&mut store), 0);
+        assert!(!pending_deferred(store.test_db(), "final", now).unwrap());
+        assert!(!closed_deferred(store.test_db(), "final", now).unwrap());
+        let prefix = format!("pool/{}/", binding.pool_store_id);
+        assert_eq!(
+            store.egress_target("final", &prefix).err(),
+            Some(Fault::Stale)
+        );
+        assert_eq!(
+            begin_publish(store.test_db(), "final").err(),
+            Some(Fault::Stale)
+        );
+        let attention = closed_pool_attention(store.test_db()).unwrap();
+        assert_eq!((attention.unsettled, attention.unresolved), (0, 0));
+    }
+
+    /// A closed pool's frozen final notice that never reaches Bridge settles
+    /// after the bounded passes; it was never handed over, so nothing is recalled.
+    #[test]
+    fn closed_pool_frozen_final_notice_settles_after_bounded_passes() {
+        let (_directory, mut store, binding, incarnation, _run) = fixture();
+        index_managed_member(store.test_db(), &binding);
+        store
+            .test_db()
+            .execute("UPDATE members SET current=0 WHERE id='member'", [])
+            .unwrap();
+        add_seed(&mut store, &binding, "final", "Membership ended.", true);
+        freeze_current(&mut store, &binding, &incarnation, "final");
+        close_pool(&mut store);
+        assert_eq!(
+            settle_all(&mut store),
+            0,
+            "a fresh freeze keeps its attempts"
+        );
+        let now = unix_now();
+        for _ in 1..CLOSED_FINAL_ATTEMPTS {
+            assert!(closed_deferred(store.test_db(), "final", now).unwrap());
+            assert_eq!(
+                state(store.test_db(), "final").unwrap(),
+                Some(State::Frozen)
+            );
+        }
+        assert!(closed_deferred(store.test_db(), "final", now).unwrap());
+        assert_eq!(
+            outbox(&mut store, "final"),
+            (
+                "not_delivered".into(),
+                Some("pool_closed".into()),
+                "cancelled".into()
+            )
+        );
+        assert_eq!(
+            begin_publish(store.test_db(), "final").err(),
+            Some(Fault::Stale)
+        );
+    }
+
+    /// Uncertain and frozen effects of a closed pool keep their original
+    /// identity and receipts, are reconciled only under that identity with a
+    /// long backoff, and never gain a successor publication.
+    #[test]
+    fn closed_pool_uncertain_effects_are_retained_paced_and_never_republished() {
+        let (_directory, mut store, binding, incarnation, _run) = fixture();
+        index_managed_member(store.test_db(), &binding);
+        add_seed(&mut store, &binding, "unknown", "one", false);
+        add_seed(&mut store, &binding, "fenced", "two", false);
+        add_seed(&mut store, &binding, "lost", "three", false);
+        let unknown = freeze_next(&mut store, &binding, &incarnation, "unknown", "next", 2);
+        let fenced = freeze_current(&mut store, &binding, &incarnation, "fenced");
+        let lost = freeze_current(&mut store, &binding, &incarnation, "lost");
+        for frozen in [&unknown, &fenced, &lost] {
+            begin_publish(store.test_db(), &frozen.seed.effect_id).unwrap();
+            attention(store.test_db(), &frozen.seed.effect_id, "outcome_unknown").unwrap();
+        }
+        begin_abort(store.test_db(), "fenced").unwrap();
+        begin_liveness_abort(store.test_db(), "lost").unwrap();
+        close_pool(&mut store);
+        assert_eq!(settle_all(&mut store), 0);
+        assert_eq!(
+            state(store.test_db(), "unknown").unwrap(),
+            Some(State::Unknown)
+        );
+        assert_eq!(
+            state(store.test_db(), "fenced").unwrap(),
+            Some(State::AbortPending)
+        );
+        assert!(frozen(store.test_db(), "unknown").unwrap().digest == unknown.digest);
+        let attention = closed_pool_attention(store.test_db()).unwrap();
+        assert_eq!(attention.unresolved, 3);
+        assert!(attention.attention_required);
+        // Long durable backoff: 60 s, then 120 s; the effect is not due meanwhile.
+        let now = unix_now();
+        assert!(closed_deferred(store.test_db(), "fenced", now).unwrap());
+        assert!(!liveness_due(store.test_db(), "fenced", now + 59).unwrap());
+        assert!(liveness_due(store.test_db(), "fenced", now + 60).unwrap());
+        assert!(closed_deferred(store.test_db(), "fenced", now).unwrap());
+        assert!(!liveness_due(store.test_db(), "fenced", now + 119).unwrap());
+        assert!(liveness_due(store.test_db(), "fenced", now + 120).unwrap());
+        // A definite outcome terminalizes; a liveness-fenced original of a
+        // closed pool is never republished.
+        let aborted = result(&lost, ManagedOwnerStateV1::Aborted, None);
+        assert_eq!(
+            record_result(store.test_db(), "lost", None, &aborted, true).unwrap(),
+            State::Aborted
+        );
+        assert_eq!(successor_of(&mut store, "lost"), None);
+        assert_eq!(effects_for_event(&mut store, "lost"), 1);
+        assert!(!closed_deferred(store.test_db(), "lost", now).unwrap());
+        let aborted = result(&fenced, ManagedOwnerStateV1::Aborted, None);
+        assert_eq!(
+            record_result(store.test_db(), "fenced", None, &aborted, true).unwrap(),
+            State::Aborted
+        );
+        assert_eq!(
+            closed_pool_attention(store.test_db()).unwrap().unresolved,
+            1
+        );
+    }
+
+    /// Stores closed before this release settle on open (schema v16 upgrade
+    /// and every later open), idempotently; uncertain work is left alone.
+    #[test]
+    fn already_closed_pool_is_reconciled_on_open_idempotently() {
+        let (directory, mut store, binding, incarnation, _run) = fixture();
+        index_managed_member(store.test_db(), &binding);
+        add_seed(&mut store, &binding, "ordinary", "hello", false);
+        add_seed(&mut store, &binding, "unknown", "lost", false);
+        let original = freeze_current(&mut store, &binding, &incarnation, "unknown");
+        begin_publish(store.test_db(), "unknown").unwrap();
+        attention(store.test_db(), "unknown", "outcome_unknown").unwrap();
+        add_seed(&mut store, &binding, "final", "Membership ended.", true);
+        close_pool(&mut store);
+        // A 0.1.3 store: retried final notice, member still recorded pending.
+        store
+            .test_db()
+            .execute(
+                "INSERT INTO managed_delivery_liveness(effect_id,failures,next_attempt) VALUES('final',1044,0)",
+                [],
+            )
+            .unwrap();
+        store
+            .test_db()
+            .execute_batch("PRAGMA user_version=15;")
+            .unwrap();
+        drop(store);
+        let path = directory.path().join("pool.db");
+        let mut store = Store::open(&path).unwrap();
+        let version: i64 = store
+            .test_db()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, crate::completion::SCHEMA_VERSION);
+        for id in ["ordinary", "final"] {
+            assert_eq!(
+                outbox(&mut store, id),
+                (
+                    "not_delivered".into(),
+                    Some("pool_closed".into()),
+                    "cancelled".into()
+                ),
+                "{id}"
+            );
+        }
+        assert_eq!(
+            state(store.test_db(), "unknown").unwrap(),
+            Some(State::Unknown)
+        );
+        assert!(frozen(store.test_db(), "unknown").unwrap().digest == original.digest);
+        let member_state: String = store
+            .test_db()
+            .query_row(
+                "SELECT json_extract(data,'$.member.state') FROM members WHERE id='member'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(member_state, "removed");
+        let attention = closed_pool_attention(store.test_db()).unwrap();
+        assert_eq!(
+            (
+                attention.closed_pools,
+                attention.open_members,
+                attention.unsettled,
+                attention.unresolved
+            ),
+            (1, 0, 0, 1)
+        );
+        let snapshot = |store: &mut Store| -> Vec<(String, String, Option<String>)> {
+            let mut statement = store
+                .test_db()
+                .prepare("SELECT effect_id,state,attention FROM managed_delivery_outbox ORDER BY effect_id")
+                .unwrap();
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let before = snapshot(&mut store);
+        drop(store);
+        let mut store = Store::open(&path).unwrap();
+        assert_eq!(snapshot(&mut store), before);
+        assert_eq!(settle_all(&mut store), 0);
     }
 }

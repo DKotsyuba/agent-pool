@@ -2146,7 +2146,46 @@ mod managed_egress_dispatch {
             return Ok(());
         }
         let key = id.clone();
-        let frozen = stored_managed(store, &lease, move |store| store.egress_frozen(&key)).await?;
+        let closed =
+            stored_managed(store, &lease, move |store| store.egress_pool_closed(&key)).await?;
+        if !closed {
+            return unresolved(store, config, &lease, id, state, false).await;
+        }
+        // A closed pool's frozen or unresolved effect pursues only its existing
+        // operation, paced by a long durable backoff (60 s doubling, cap 1 h).
+        let now = unix_now()?;
+        let key = id.clone();
+        if !stored_managed(store, &lease, move |store| {
+            store.egress_liveness_due(&key, now)
+        })
+        .await?
+        {
+            return Ok(());
+        }
+        let attempted = unresolved(store, config, &lease, id.clone(), state, true).await;
+        let key = id.clone();
+        let deferred = stored_managed(store, &lease, move |store| {
+            store.egress_closed_deferred(&key, now)
+        })
+        .await;
+        attempted?;
+        deferred.map(|_| ())
+    }
+
+    /// One pass over a frozen, known-unsent or uncertain effect. In a closed
+    /// pool a known-unsent final notice is fenced and aborted under its
+    /// original identity instead of being published again.
+    async fn unresolved(
+        store: &SharedStore,
+        config: &Config,
+        lease: &ManagedLease,
+        id: String,
+        state: State,
+        closed: bool,
+    ) -> Result<(), Fault> {
+        let transport = config.managed_run_transport.as_ref();
+        let key = id.clone();
+        let frozen = stored_managed(store, lease, move |store| store.egress_frozen(&key)).await?;
         let cfg = config.clone();
         let pin = frozen.bridge_pin.clone();
         let bridge = match tokio::task::spawn_blocking(move || {
@@ -2156,23 +2195,21 @@ mod managed_egress_dispatch {
         .map_err(|_| Fault::Unavailable)?
         {
             Ok(value) => value,
-            Err(_) => return note(store, &lease, &id, "route_unavailable").await,
+            Err(_) => return note(store, lease, &id, "route_unavailable").await,
         };
         let key = id.clone();
-        let draining = stored_managed(store, &lease, move |store| {
-            store.egress_scope_draining(&key)
-        })
-        .await?;
+        let draining =
+            stored_managed(store, lease, move |store| store.egress_scope_draining(&key)).await?;
         if matches!(state, State::Unknown | State::AbortPending) && !draining {
             let now = unix_now()?;
-            return liveness(store, &lease, frozen, bridge, state, now).await;
+            return liveness(store, lease, frozen, bridge, state, now).await;
         }
         if matches!(state, State::Unknown | State::AbortPending)
-            || (state == State::KnownUnsent && draining && !frozen.seed.final_notice)
+            || (state == State::KnownUnsent && draining && (!frozen.seed.final_notice || closed))
         {
             return reconcile(
                 store,
-                &lease,
+                lease,
                 frozen,
                 bridge,
                 state == State::AbortPending || draining,
@@ -2186,17 +2223,17 @@ mod managed_egress_dispatch {
                     .as_deref()
                     .is_some_and(|prefix| frozen.seed.producer_scope.starts_with(prefix))
         }) {
-            return note(store, &lease, &id, "route_unavailable").await;
+            return note(store, lease, &id, "route_unavailable").await;
         }
         let configured =
             match RunPeer::from_config(config, &frozen.intent.target_binding.pool_store_id) {
                 Ok(value) => value,
-                Err(_) => return note(store, &lease, &id, "route_unavailable").await,
+                Err(_) => return note(store, lease, &id, "route_unavailable").await,
             };
         if configured.endpoint_pin() != frozen.run_pin.endpoint() {
-            return note(store, &lease, &id, "route_unavailable").await;
+            return note(store, lease, &id, "route_unavailable").await;
         }
-        publish(store, &lease, frozen, bridge).await
+        publish(store, lease, frozen, bridge).await
     }
 }
 
@@ -10323,6 +10360,124 @@ mod tests {
         );
         let result=stored_managed(&store,&lease,|store|Ok(store.test_db().query_row::<(String,String),_,_>("SELECT state,attention FROM managed_delivery_outbox WHERE effect_id='final-foreign'",[],|row|Ok((row.get(0)?,row.get(1)?)))?)).await?;
         assert_eq!(result, ("not_delivered".into(), "different_lineage".into()));
+        Ok(())
+    }
+
+    /// #17/#29 through the resident: a closed pool's undeliverable final notice
+    /// stops after its bounded attempts, and a retained uncertain effect is
+    /// paced by the long closed-pool backoff instead of every resident pass.
+    #[tokio::test]
+    async fn resident_stops_closed_pool_final_notice_and_paces_uncertain_effect()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::managed_egress::tests::{add_seed, freeze_current};
+        use crate::managed_state::tests::{fixture, index_managed_member};
+        let (directory, mut initial, binding, incarnation, _run) = fixture();
+        index_managed_member(initial.test_db(), &binding);
+        add_seed(&mut initial, &binding, "uncertain", "lost reply", false);
+        freeze_current(&mut initial, &binding, &incarnation, "uncertain");
+        initial.egress_begin_publish("uncertain")?;
+        initial.egress_attention("uncertain", "outcome_unknown")?;
+        add_seed(&mut initial, &binding, "final", "Membership ended.", true);
+        let db = initial.test_db();
+        db.execute("UPDATE members SET current=0 WHERE id='member'", [])?;
+        db.execute(
+            "UPDATE pools SET data=json_set(data,'$.closed',json('true')) WHERE id='pool'",
+            [],
+        )?;
+        db.execute(
+            "UPDATE managed_delivery_scopes SET state='draining' WHERE state='open'",
+            [],
+        )?;
+        let path = directory.path();
+        // No managed transport or reachable Bridge: every attempt is non-decisive.
+        let config = Config {
+            socket_path: path.join("pool.sock"),
+            database_path: path.join("pool.db"),
+            expected_uid: fs::metadata(path)?.uid(),
+            bridge_registration_socket: path.join("absent-register"),
+            bridge_core_socket: path.join("absent-bridge"),
+            bridge_credential_file: path.join("absent-token"),
+            bridge_producer_id: "fixture".into(),
+            bridge_audience: "fixture".into(),
+            bridge_server_executable: "/fixture/bridge".into(),
+            bridge_server_sha256: "0".repeat(64),
+            bridge_observer_socket: None,
+            bridge_observer_credential_file: None,
+            owner_observer_credential_file: None,
+            run_socket: None,
+            run_peer_uid: None,
+            managed_run_reader: None,
+            observer_socket: None,
+            managed_run_transport: None,
+        };
+        let store = Arc::new(Mutex::new(initial));
+        let activity = Arc::new(ManagedActivity::default());
+        let effect = |id: &str| Effect {
+            effect_id: id.into(),
+            pool_id: "pool".into(),
+            member_id: Some("member".into()),
+            work: Work::Deliver {
+                address: binding.actor.address.clone(),
+                scope: "final:member".into(),
+                text: String::new(),
+            },
+            state: "custody".into(),
+        };
+        let row = |store: &SharedStore, id: &str| -> Result<(String, Option<String>, i64), Fault> {
+            let mut guard = store.lock().map_err(|_| Fault::Internal)?;
+            Ok(guard.test_db().query_row(
+                "SELECT o.state,o.attention,COALESCE(l.next_attempt,0) FROM managed_delivery_outbox o LEFT JOIN managed_delivery_liveness l ON l.effect_id=o.effect_id WHERE o.effect_id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?)
+        };
+        let due_now = |store: &SharedStore, id: &str| -> Result<(), Fault> {
+            let mut guard = store.lock().map_err(|_| Fault::Internal)?;
+            guard.test_db().execute(
+                "UPDATE managed_delivery_liveness SET next_attempt=0 WHERE effect_id=?1",
+                [id],
+            )?;
+            Ok(())
+        };
+        for attempt in 1..=crate::managed_egress::CLOSED_FINAL_ATTEMPTS {
+            managed_egress_dispatch::drive(&store, &config, &effect("final"), &activity).await?;
+            let (state, _, _) = row(&store, "final")?;
+            let expected = if attempt < crate::managed_egress::CLOSED_FINAL_ATTEMPTS {
+                "pending"
+            } else {
+                "not_delivered"
+            };
+            assert_eq!(state, expected, "attempt {attempt}");
+            due_now(&store, "final")?;
+        }
+        assert_eq!(row(&store, "final")?.1.as_deref(), Some("pool_closed"));
+        let requests = |store: &SharedStore| -> Result<i64, Fault> {
+            let mut guard = store.lock().map_err(|_| Fault::Internal)?;
+            Ok(guard.test_db().query_row(
+                "SELECT count(*) FROM managed_current_requests",
+                [],
+                |r| r.get(0),
+            )?)
+        };
+        let before = requests(&store)?;
+        managed_egress_dispatch::drive(&store, &config, &effect("final"), &activity).await?;
+        assert_eq!(row(&store, "final")?.0, "not_delivered");
+        assert_eq!(requests(&store)?, before, "no further Run probe");
+        // The uncertain effect keeps its state and is paced at least a minute.
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs(),
+        )?;
+        managed_egress_dispatch::drive(&store, &config, &effect("uncertain"), &activity).await?;
+        let (state, _, next) = row(&store, "uncertain")?;
+        assert_eq!(state, "unknown");
+        assert!(next >= now + 59, "paced: {next} vs {now}");
+        managed_egress_dispatch::drive(&store, &config, &effect("uncertain"), &activity).await?;
+        assert_eq!(
+            row(&store, "uncertain")?,
+            (state, Some("route_unavailable".into()), next)
+        );
         Ok(())
     }
 

@@ -1022,6 +1022,17 @@ async fn doctor_reports_owner_capacity_without_opening_database() {
             let data = serde_json::json!({"namespaces":gauge,"bootstraps":gauge,"contexts":gauge,"intents":gauge,"current_requests":gauge,"bootstrap_reservations":0,"contexts_without_intent":0});
             let response = serde_json::json!({"schema_version":1,"kind":"managed_capacity","data":data});
             stream.write_all(format!("{response}\n").as_bytes()).await.unwrap();
+            // Closed-pool attention is a second, diagnostic-only owner read.
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["observer_credential"], "fixture-only-observer");
+            assert_eq!(request["observe"]["operation"], "delivery_attention");
+            let data = serde_json::json!({"closed_pools":8,"open_members":0,"unsettled":0,"unresolved":1,"attention_required":true});
+            let response = serde_json::json!({"schema_version":1,"kind":"delivery_attention","data":data});
+            stream.write_all(format!("{response}\n").as_bytes()).await.unwrap();
         };
         let run = async {
             tokio::process::Command::new(env!("CARGO_BIN_EXE_agent-pool"))
@@ -1035,6 +1046,8 @@ async fn doctor_reports_owner_capacity_without_opening_database() {
         let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(report["managed_capacity"]["intents"]["retained"], 3);
         assert_eq!(report["managed_capacity"]["intents"]["headroom"], 100000);
+        assert_eq!(report["closed_pool_attention"]["unresolved"], 1);
+        assert_eq!(report["closed_pool_attention"]["attention_required"], true);
         assert!(!output.stdout.windows(b"fixture-only-observer".len()).any(|bytes| bytes == b"fixture-only-observer"));
     }).await.expect("doctor fixture deadline");
     assert!(!path.join("must-not-open.db").exists());
