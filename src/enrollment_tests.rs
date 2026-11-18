@@ -1217,12 +1217,13 @@ async fn p3_single_enrollment() {
     assert_eq!(binding.member.state, MemberState::Pending);
     assert!(binding.run_id.is_none());
     assert_eq!(h.view(&id).state, "reserved");
-    // Onboarding is reserved in P2 as an exact member seed, awaiting binding.
+    // Onboarding is reserved in P2 as an exact member seed, awaiting binding;
+    // the member does not also get its own creation notice (#18).
     assert_eq!(
         h.count(&format!(
             "SELECT count(*) FROM managed_delivery_seeds WHERE member_id='{member}' AND final_notice=0"
         )),
-        2
+        1
     );
     h.drive(&id).await;
     let view = h.view(&id);
@@ -2555,7 +2556,7 @@ fn p3_schema_v15_migration_and_rollback() {
     let version: i64 = db
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 15);
+    assert_eq!(version, crate::completion::SCHEMA_VERSION);
     assert_eq!(
         db.query_row("SELECT count(*) FROM pools", [], |row| row.get::<_, i64>(0))
             .unwrap(),
@@ -2573,7 +2574,11 @@ fn p3_schema_v15_migration_and_rollback() {
     // A newer schema is refused without mutation (older-binary behavior).
     {
         let db = rusqlite::Connection::open(&path).unwrap();
-        db.execute_batch("PRAGMA user_version=16;").unwrap();
+        db.execute_batch(&format!(
+            "PRAGMA user_version={};",
+            crate::completion::SCHEMA_VERSION + 1
+        ))
+        .unwrap();
     }
     assert!(matches!(Store::open(&path), Err(Fault::Conflict)));
 }

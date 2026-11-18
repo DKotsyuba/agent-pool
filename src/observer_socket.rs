@@ -30,7 +30,11 @@ pub(crate) const MAX_REQUEST: usize = 65_536;
 /// Advertised on this endpoint's identity so a client can tell which route answered.
 pub(crate) const CAPABILITY: &str = "observer_socket_v1";
 /// Resident capabilities whose operations this endpoint never serves.
-const WITHHELD: [&str; 2] = ["run_proof_v1", "managed_capacity_v1"];
+const WITHHELD: [&str; 3] = [
+    "run_proof_v1",
+    "managed_capacity_v1",
+    "delivery_attention_v1",
+];
 /// `get` sections that only project retained Pool state.
 const SECTIONS: [&str; 9] = [
     "overview",
@@ -58,7 +62,9 @@ pub(crate) fn permitted(request: &Request) -> Result<(), Fault> {
         {
             Ok(())
         }
-        Operation::Get(_) | Operation::ManagedCapacity(_) => Err(Fault::Unauthorized),
+        Operation::Get(_) | Operation::ManagedCapacity(_) | Operation::DeliveryAttention(_) => {
+            Err(Fault::Unauthorized)
+        }
     }
 }
 
@@ -393,6 +399,10 @@ mod tests {
             (
                 json!({"schema_version":1,"operation":"managed_capacity","params":{}}),
                 "managed_capacity",
+            ),
+            (
+                json!({"schema_version":1,"operation":"delivery_attention","params":{}}),
+                "delivery_attention",
             ),
             (
                 json!({"schema_version":1,"operation":"get","params":{"pool_id":pool,"section":"run_proof","member_id":"member"}}),

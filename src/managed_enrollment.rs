@@ -786,7 +786,7 @@ fn release_refused(tx: &Connection, id: &str) -> Result<(), Fault> {
         None,
     )?;
     let roster = crate::store::bindings(tx, &pool.pool_id)?;
-    crate::store::system_deliveries(tx, &pool, &event, &roster, None)?;
+    crate::store::system_deliveries(tx, &pool, &event, &roster, &[])?;
     Ok(())
 }
 
@@ -1470,7 +1470,7 @@ pub(crate) fn switch(db: &mut Connection, id: &str, attested: &Attested) -> Resu
         &pool,
         &event,
         &roster,
-        Some(&candidate.member.member_id),
+        &[candidate.member.member_id.as_str()],
     )?;
     crate::store::final_notice(&tx, &pool, &replacement.old, event.event_id)?;
     let intro = crate::store::onboarding(&pool, &roster, &candidate.member)?;
@@ -1670,7 +1670,7 @@ pub(crate) fn owner_resolve(
     )?;
     let roster = crate::store::bindings(db, &pool.pool_id)?;
     if !removed.is_empty() {
-        crate::store::system_deliveries(db, &pool, &event, &roster, None)?;
+        crate::store::system_deliveries(db, &pool, &event, &roster, &[])?;
     }
     let reply = Reply::Receipt(Box::new(Receipt {
         pool_id: pool.pool_id.clone(),

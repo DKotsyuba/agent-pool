@@ -371,6 +371,19 @@ async fn main() -> ExitCode {
                         capacity_ready = false;
                     }
                 }
+                // Diagnostic only: remaining closed-pool work never fails readiness.
+                let request = observer::Request {
+                    schema_version: 1,
+                    operation: observer::Operation::DeliveryAttention(observer::IdentityParams {}),
+                };
+                report["closed_pool_attention"] = match observer::frontend(request, &path).await {
+                    Ok(observer::Envelope {
+                        data: Some(observer::Data::DeliveryAttention(attention)),
+                        error: None,
+                        ..
+                    }) => serde_json::to_value(attention).unwrap_or(serde_json::Value::Null),
+                    _ => serde_json::json!({"state":"unavailable"}),
+                };
             }
             let output = print_json(report);
             if ready && capacity_ready {

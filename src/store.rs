@@ -414,6 +414,12 @@ impl Store {
     pub(crate) fn egress_pending_deferred(&mut self, id: &str, now: i64) -> Result<bool, Fault> {
         crate::managed_egress::pending_deferred(&mut self.db, id, now)
     }
+    pub(crate) fn egress_pool_closed(&self, id: &str) -> Result<bool, Fault> {
+        crate::managed_egress::pool_closed(&self.db, id)
+    }
+    pub(crate) fn egress_closed_deferred(&mut self, id: &str, now: i64) -> Result<bool, Fault> {
+        crate::managed_egress::closed_deferred(&mut self.db, id, now)
+    }
     pub(crate) fn egress_begin_liveness_abort(&mut self, id: &str) -> Result<(), Fault> {
         crate::managed_egress::begin_liveness_abort(&mut self.db, id)
     }
@@ -1213,6 +1219,9 @@ impl Store {
             Operation::ManagedCapacity(_) => Ok(Data::ManagedCapacity(Box::new(
                 crate::managed_state::managed_capacity(&self.db)?,
             ))),
+            Operation::DeliveryAttention(_) => Ok(Data::DeliveryAttention(Box::new(
+                crate::managed_egress::closed_pool_attention(&self.db)?,
+            ))),
             Operation::InventorySnapshot(args) => {
                 inventory_snapshot(&self.db, &self.read_epoch, args)
             }
@@ -1460,8 +1469,21 @@ PRAGMA user_version=5;")?;
             crate::managed_egress::migrate_liveness(&db)?;
             db.execute_batch("PRAGMA user_version=15;")?;
         }
+        // Version 16 records every non-current incarnation as terminal
+        // `removed` and settles closed pools' never-published deliveries as
+        // `pool_closed`; older binaries cannot project that attention.
+        if version < 16 {
+            db.execute("UPDATE members SET data=json_set(data,'$.member.state','removed') WHERE current=0 AND json_extract(data,'$.member.state')!='removed'",[])?;
+            db.execute_batch("PRAGMA user_version=16;")?;
+        }
         if version < crate::completion::SCHEMA_VERSION {
             db.execute_batch("COMMIT;")?;
+        }
+        // Idempotent startup reconciliation, also covering stores closed before v16.
+        {
+            let tx = rusqlite::Transaction::new_unchecked(&db, TransactionBehavior::Immediate)?;
+            crate::managed_egress::settle_closed_pools(&tx, None)?;
+            tx.commit()?;
         }
         // Transaction-local managed mutation provenance, never retained after restart.
         db.execute_batch("CREATE TEMP TABLE managed_delivery_origin(singleton INTEGER PRIMARY KEY CHECK(singleton=1),namespace_id TEXT NOT NULL);")?;
@@ -2389,7 +2411,7 @@ PRAGMA user_version=5;")?;
             ),
             Some(installed.member.member_id.clone()),
         )?;
-        system_deliveries(&tx, &pool, &event, &bindings(&tx, &effect.pool_id)?, None)?;
+        system_deliveries(&tx, &pool, &event, &bindings(&tx, &effect.pool_id)?, &[])?;
         final_notice(&tx, &pool, &previous, event.event_id)?;
         queue(
             &tx,
@@ -2545,7 +2567,7 @@ PRAGMA user_version=5;")?;
             format!("Member {member_id}: execution {runtime}."),
             Some(member_id.into()),
         )?;
-        system_deliveries(&tx, &p, &ev, &bindings(&tx, pool_id)?, None)?;
+        system_deliveries(&tx, &p, &ev, &bindings(&tx, pool_id)?, &[])?;
         if matches!(runtime, "failed" | "lost") {
             let addr = owner_address(&tx, &owner)?;
             queue_delivery(
@@ -3408,13 +3430,21 @@ fn execute_authorized(
     }
     save_pool(db, &p)?;
     if system {
-        system_deliveries(
-            db,
-            &p,
-            &event,
-            &roster,
-            caller.as_ref().map(|b| b.member.member_id.as_str()),
-        )?;
+        // A member created by this command gets its onboarding (same event,
+        // same roster), never a second native turn for its own creation.
+        let mut skip: Vec<&str> = caller
+            .as_ref()
+            .map(|b| b.member.member_id.as_str())
+            .into_iter()
+            .collect();
+        if matches!(
+            command,
+            Command::Add(_) | Command::Start(_) | Command::StartBatch(_)
+        ) {
+            skip.extend(created.as_deref());
+            skip.extend(created_ids.iter().map(String::as_str));
+        }
+        system_deliveries(db, &p, &event, &roster, &skip)?;
     } else if matches!(command, Command::Send(_) | Command::Notify(_)) {
         let own_target = target.as_deref() == caller.as_ref().map(|b| b.member.member_id.as_str());
         if (!own_target || matches!(command, Command::Notify(_)))
@@ -3431,13 +3461,12 @@ fn execute_authorized(
             )?;
         }
     } else {
-        system_deliveries(
-            db,
-            &p,
-            &event,
-            &roster,
-            caller.as_ref().map(|b| b.member.member_id.as_str()),
-        )?;
+        let skip: Vec<&str> = caller
+            .as_ref()
+            .map(|b| b.member.member_id.as_str())
+            .into_iter()
+            .collect();
+        system_deliveries(db, &p, &event, &roster, &skip)?;
     }
     if let Some(member_id) = created
         .as_deref()
@@ -3635,6 +3664,9 @@ fn execute_authorized(
     }
     if p.closed {
         crate::managed_egress::retire_final_scope(db, &p.pool_id)?;
+        // Nothing of a closed pool that was never published stays open: its
+        // ordinary seeds and unbindable final notices settle with the close.
+        crate::managed_egress::settle_closed_pools(db, Some(&p.pool_id))?;
     }
     let managed_status = enrollment.is_some()
         && matches!(
@@ -4167,7 +4199,22 @@ pub(crate) fn binding_any(db: &Connection, id: &str) -> Result<(Binding, bool), 
     Ok((decode(&s)?, current))
 }
 /// Writes private binding and indexed uniqueness columns together.
+/// Persists one incarnation. A non-current incarnation (removed, replaced or
+/// left by a closed pool) is terminal and is always stored as `removed`.
 pub(crate) fn save_binding(db: &Connection, b: &Binding, current: bool) -> Result<(), Fault> {
+    let terminal;
+    let b = if current || b.member.state == MemberState::Removed {
+        b
+    } else {
+        terminal = Binding {
+            member: Member {
+                state: MemberState::Removed,
+                ..b.member.clone()
+            },
+            ..b.clone()
+        };
+        &terminal
+    };
     db.execute("INSERT INTO members(id,pool,actor,address,current,data) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(id) DO UPDATE SET actor=excluded.actor,address=excluded.address,current=excluded.current,data=excluded.data",params![b.member.member_id,b.pool_id,b.actor,b.address,current,encode(b)?])?;
     Ok(())
 }
@@ -5174,17 +5221,18 @@ pub(crate) fn queue_delivery(
     }
     Ok(())
 }
-/// Sends safe system/message events to current members, excluding the caller's redundant wakeup.
+/// Sends safe system/message events to current members, excluding the caller's redundant
+/// wakeup and members the event itself created (their onboarding carries the same roster).
 pub(crate) fn system_deliveries(
     db: &Connection,
     p: &Pool,
     e: &Event,
     roster: &[Binding],
-    skip: Option<&str>,
+    skip: &[&str],
 ) -> Result<(), Fault> {
     let text = notification(p, roster, e)?;
     for b in roster {
-        if skip == Some(b.member.member_id.as_str()) {
+        if skip.contains(&b.member.member_id.as_str()) {
             continue;
         }
         {
@@ -5315,7 +5363,7 @@ fn failure_event(
         member.map(str::to_owned),
     )?;
     let roster = bindings(db, pool_id)?;
-    system_deliveries(db, &p, &e, &roster, None)?;
+    system_deliveries(db, &p, &e, &roster, &[])?;
     if notify_owner {
         let address = owner_address(db, &owner)?;
         queue_delivery(
@@ -9550,6 +9598,129 @@ mod tests {
             binding_any(&s.db, &mid).unwrap().0.member.state,
             MemberState::Active
         );
+    }
+    /// #17: close makes every member terminal and, in the same transaction,
+    /// settles final notices that can never be delivered (no managed binding
+    /// can be installed in a closed pool) as `pool_closed`.
+    #[test]
+    fn close_terminalizes_members_and_settles_unbindable_final_notices() {
+        let (_d, mut s) = fixture();
+        let lead = actor("lead");
+        let a = actor("a");
+        let p = make(&mut s, &lead, "one");
+        let joined = add(&mut s, &lead, &p, &a);
+        join(&mut s, &a, &p);
+        let c = change(&s, &p);
+        let reply=s.execute(&lead,&Command::Start(Start{change:c,name:"Started".into(),role:"Test".into(),task:"Verify".into(),spec:serde_json::json!({"task":"Original","provider":"codex","model":"test","profile":"implement","workdir":"/known"})})).unwrap();
+        let started = match reply {
+            Reply::Receipt(r) => r.created_id.unwrap(),
+            _ => panic!("receipt"),
+        };
+        // As in the qualification pools: Run admitted the start, no managed binding exists.
+        s.db.execute(
+            "UPDATE members SET data=json_set(data,'$.run_id','ag-admitted') WHERE id=?1",
+            [&started],
+        )
+        .unwrap();
+        let c = change(&s, &p);
+        s.execute(&lead, &Command::Close(c)).unwrap();
+        for member in [&joined, &started] {
+            let (current, state): (bool, String) =
+                s.db.query_row(
+                    "SELECT current,json_extract(data,'$.member.state') FROM members WHERE id=?1",
+                    [member],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!((current, state.as_str()), (false, "removed"));
+        }
+        let (outbox, attention): (String, String) = s
+            .db
+            .query_row(
+                "SELECT o.state,o.attention FROM managed_delivery_seeds x JOIN managed_delivery_outbox o ON o.effect_id=x.effect_id WHERE x.member_id=?1 AND x.final_notice=1",
+                [&started],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (outbox.as_str(), attention.as_str()),
+            ("not_delivered", "pool_closed")
+        );
+        let attention = crate::managed_egress::closed_pool_attention(&s.db).unwrap();
+        assert_eq!(
+            (
+                attention.closed_pools,
+                attention.open_members,
+                attention.unsettled,
+                attention.unresolved,
+                attention.attention_required
+            ),
+            (1, 0, 0, 0, false)
+        );
+        // The owner observer round trip decodes the same typed counts.
+        let request: crate::observer::Request = serde_json::from_value(serde_json::json!({
+            "schema_version": 1, "operation": "delivery_attention", "params": {}
+        }))
+        .unwrap();
+        let envelope =
+            crate::observer::Envelope::success("delivery_attention", s.observe(&request).unwrap());
+        let bytes = crate::observer::encode(&envelope).unwrap();
+        let decoded: crate::observer::Envelope = serde_json::from_slice(&bytes).unwrap();
+        assert!(matches!(
+            decoded.data,
+            Some(crate::observer::Data::DeliveryAttention(ref counts)) if **counts == attention
+        ));
+        // The pool-closed attention is projected to the owner, not refused.
+        let page = s
+            .execute(
+                &lead,
+                &Command::Get(Get {
+                    pool_id: p.clone(),
+                    after: 0,
+                    section: Section::Deliveries,
+                    proposal_id: None,
+                    member_id: None,
+                    wait_seconds: 0.0,
+                    reverse: false,
+                    before: None,
+                    field: None,
+                    expected_revision: None,
+                }),
+            )
+            .unwrap();
+        let view = match page {
+            Reply::View(view) | Reply::OwnerView { view, .. } => view,
+            _ => panic!("view"),
+        };
+        assert!(
+            view.deliveries
+                .iter()
+                .any(|d| d.attention.as_deref() == Some("pool_closed"))
+        );
+    }
+    /// #18: a member created by a command gets its onboarding for that event,
+    /// never a second native turn carrying the creation notice itself.
+    #[test]
+    fn created_member_gets_onboarding_not_its_creation_notice() {
+        let (_d, mut s) = fixture();
+        let lead = actor("lead");
+        let a = actor("a");
+        let b = actor("b");
+        let p = make(&mut s, &lead, "one");
+        let first = add(&mut s, &lead, &p, &a);
+        let deliveries = |s: &Store, member: &str| -> i64 {
+            s.db.query_row(
+                "SELECT count(*) FROM effects WHERE member=?1",
+                [member],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(deliveries(&s, &first), 1, "onboarding only");
+        let second = add(&mut s, &lead, &p, &b);
+        assert_eq!(deliveries(&s, &second), 1, "onboarding only");
+        // The existing member is still told about the new one.
+        assert_eq!(deliveries(&s, &first), 2);
     }
     /// A start provably cancelled before admission leaves no impossible final-notice delivery pending.
     #[test]

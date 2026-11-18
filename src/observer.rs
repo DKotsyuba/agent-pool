@@ -35,6 +35,8 @@ pub enum Operation {
     InventorySnapshot(InventoryRequest),
     /// Owner-only managed capacity and retained-fence diagnostics.
     ManagedCapacity(IdentityParams),
+    /// Owner-only counts of what explicitly closed pools still leave open.
+    DeliveryAttention(IdentityParams),
     /// One bounded section of an exact immutable completion record.
     CompletionGet(crate::completion::GetRequest),
     /// One P3 managed enrollment's bounded per-job facts; never contacts Run.
@@ -256,7 +258,9 @@ impl Request {
             }
         }
         match &self.operation {
-            Operation::Identity(_) | Operation::ManagedCapacity(_) => Ok(()),
+            Operation::Identity(_)
+            | Operation::ManagedCapacity(_)
+            | Operation::DeliveryAttention(_) => Ok(()),
             Operation::CompletionGet(args) => args.validate(),
             Operation::EnrollmentGet(args) => {
                 domain::identifier(&args.pool_id)?;
@@ -310,6 +314,7 @@ impl Request {
             Operation::List(_) => "pool_page",
             Operation::InventorySnapshot(_) => "inventory_snapshot",
             Operation::ManagedCapacity(_) => "managed_capacity",
+            Operation::DeliveryAttention(_) => "delivery_attention",
             Operation::CompletionGet(_) => "completion_page",
             Operation::EnrollmentGet(_) => "enrollment",
             Operation::Get(ref args) if args.section == "run_proof" => "run_proof",
@@ -362,6 +367,8 @@ pub enum Data {
     Inventory(Box<InventorySnapshot>),
     /// Active headroom and durable retained fence counts.
     ManagedCapacity(Box<crate::managed_state::ManagedCapacity>),
+    /// Closed-pool members and deliveries that still need settlement or attention.
+    DeliveryAttention(Box<crate::managed_egress::ClosedPoolAttention>),
     /// Complete metadata rows for one pool inventory page.
     Pools(PoolPage),
     /// Existing safe section projection plus explicit owner-only mappings when requested.
@@ -626,6 +633,7 @@ impl Envelope {
                 "run_proof_v1".into(),
                 "inventory_snapshot_v1".into(),
                 "managed_capacity_v1".into(),
+                "delivery_attention_v1".into(),
                 "completion_record_v1".into(),
                 "inventory_completion_v1".into(),
                 "managed_enrollment_v1".into(),
@@ -775,6 +783,7 @@ impl Expected {
                     | ("pool_page", Data::Pools(_))
                     | ("inventory_snapshot", Data::Inventory(_))
                     | ("managed_capacity", Data::ManagedCapacity(_))
+                    | ("delivery_attention", Data::DeliveryAttention(_))
                     | ("pool_detail", Data::Detail(_))
                     | ("run_proof", Data::RunProof(_))
                     | ("completion_page", Data::Completion(_))
@@ -784,6 +793,10 @@ impl Expected {
             return Err(Fault::Unavailable);
         }
         if matches!(&envelope.data, Some(Data::ManagedCapacity(capacity)) if !capacity.valid()) {
+            return Err(Fault::Unavailable);
+        }
+        if matches!(&envelope.data, Some(Data::DeliveryAttention(attention)) if !attention.valid())
+        {
             return Err(Fault::Unavailable);
         }
         if let Some(Data::Completion(page)) = &envelope.data
