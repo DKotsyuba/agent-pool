@@ -165,6 +165,35 @@ The replaced member's pin remains retained until the pool is closed and the owne
 explicitly releases it. Frequent replacements can therefore grow retained Run
 history throughout the pool's lifetime; closure does not release any pin itself.
 
+### History-pin release
+
+`pool_release_history` is accepted only after the pool is closed. The intent
+freezes the pin and its Run ownership proof, both taken from immutable records:
+for a public `start_batch` admission (batch start or replacement) the exact batch
+request key of the accepted origin, and for a managed enrollment the enrollment
+row and its request key. Intents recorded before this proof existed re-derive it
+from the same records. No schema change is needed.
+
+Run 0.32 releases a pin only for its admitting key. A public pin goes to the
+original verified Run store over the operator socket as `history_pins_release
+{pin_id, request_id, expected_store_id}`; when Run answers method-not-found (Run
+before 0.32) Pool falls back to the combined `history_pins {"action":"release"}`.
+A managed pin goes over the authenticated attempt channel as
+`_managed_pin_release_v1` when `_attempt_capabilities_v1` lists
+`managed_pin_release_v1`; otherwise only the old combined socket method is tried,
+which a current Run rejects, so the outcome stays unknown. A changed route or
+store also stays unknown.
+
+A confirmed release (`already_released` false or true) settles `accepted`.
+`RequestConflict` or `ValidationError` on the socket, or `intent_conflict` on the
+wire, settles `refused`: Run will not release for this key, for example while
+a lineage hold protects the pin. A refused intent no longer blocks a new owner
+request, so the owner can retry after the hold is released. `PinNotFound`,
+`StoreIdentityMismatch`, `pin_not_found`, `route_mismatch`,
+`recovery_required`, `unsupported_version`, transport loss and malformed
+replies stay `unknown`, and Pool retries the same pin and key. Pool never lists
+pins, so `history_pins_list` is not used.
+
 `pool_get section=deliveries` exposes safe per-operation states without private
 addresses. Separate system observations record actionable failures and notify the
 owner; ordinary conversation and consensus do not subscribe the owner to delivery.

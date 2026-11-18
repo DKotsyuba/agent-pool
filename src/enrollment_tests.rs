@@ -72,6 +72,13 @@ struct RunState {
     route_override: Option<EnrollmentRoute>,
     in_progress_lookups: usize,
     counter: u64,
+    /// Pins released through the managed owner-keyed release, and every release call.
+    released: BTreeSet<String>,
+    release_calls: Vec<Value>,
+    /// One-shot injected release failure, applied before Run commits anything.
+    release_failure: Option<Failure>,
+    /// The release commits in Run but its response is lost on the wire.
+    lose_release_ack: bool,
 }
 
 #[derive(Clone)]
@@ -440,6 +447,34 @@ impl Client for SyntheticRun {
             let mut state = self.state();
             state.status_calls += 1;
             state.status.clone().unwrap_or(OldStatus::Unavailable)
+        })
+    }
+    fn release_pin<'a>(&'a self, release: &'a journal::PinRelease) -> Response<'a, ()> {
+        Box::pin(async move {
+            let mut state = self.state();
+            state.release_calls.push(release.params());
+            if let Some(failure) = state.release_failure.take() {
+                return Err(failure);
+            }
+            if release.expected_store_id != RUN_STORE
+                || release.pool_store_id != self.route.pool_route.component_store_id
+            {
+                return Err(Failure::Refused("route_mismatch"));
+            }
+            // Only the enrollment key whose receipt minted the pin owns it.
+            let owned = state
+                .keys
+                .get(&release.request_id)
+                .and_then(|(_, receipt, _)| receipt.as_ref())
+                .is_some_and(|receipt| receipt.jobs.iter().any(|job| job.pin_id == release.pin_id));
+            if !owned {
+                return Err(Failure::Refused("intent_conflict"));
+            }
+            state.released.insert(release.pin_id.clone());
+            if std::mem::take(&mut state.lose_release_ack) {
+                return Err(Failure::Unknown);
+            }
+            Ok(())
         })
     }
 }
@@ -1379,6 +1414,125 @@ async fn p3_single_enrollment() {
     assert!(h.db(|db| journal::pending(db, 0, 64).unwrap()).is_empty());
     h.drive(&id).await;
     assert_eq!(h.run.state().current_calls, calls);
+}
+
+/// Run 0.32 managed pin release: only after close, with the immutable enrollment key over
+/// the attempt channel; a lost reply retries the same key and a foreign key is refused.
+#[tokio::test]
+async fn p3_managed_pin_release_after_close() {
+    use crate::domain::{Effect, PinOwner, ReleaseHistory, Work};
+    let mut h = Harness::new();
+    let (id, member) = h.start("release");
+    h.drive(&id).await;
+    let pin = h.member(&member).0.run_pin_id.unwrap();
+    let owner = h.owner.clone();
+    let release = |h: &mut Harness| {
+        Command::ReleaseHistory(ReleaseHistory {
+            change: h.change(),
+            member_id: member.clone(),
+        })
+    };
+    let early = release(&mut h);
+    assert!(matches!(h.execute(&owner, &early), Err(Fault::Conflict)));
+    let close = Command::Close(h.change());
+    h.execute(&owner, &close).unwrap();
+    let requested = release(&mut h);
+    let Reply::Receipt(receipt) = h.execute(&owner, &requested).unwrap() else {
+        panic!("release receipt");
+    };
+    let effect_id = receipt.created_id.unwrap();
+    let effect: Effect = h.db(|db| {
+        serde_json::from_str(
+            &db.query_row(
+                "SELECT data FROM effects WHERE id=?1",
+                [&effect_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    });
+    let enrollment_key: String = h.db(|db| {
+        db.query_row(
+            "SELECT request_id FROM managed_enrollments WHERE id=?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    });
+    let expected_owner = PinOwner::Managed {
+        enrollment_id: id.clone(),
+        request_id: enrollment_key.clone(),
+    };
+    let Work::ReleasePin {
+        pin_id,
+        route,
+        owner: Some(frozen),
+    } = effect.work
+    else {
+        panic!("managed release intent");
+    };
+    assert_eq!(pin_id, pin);
+    assert!(
+        route.is_none(),
+        "a managed pin needs no public socket route"
+    );
+    assert_eq!(frozen, expected_owner);
+    assert_eq!(
+        h.store
+            .lock()
+            .unwrap()
+            .pin_release_owner(&effect_id)
+            .unwrap(),
+        Some(expected_owner)
+    );
+    let send = |h: &Harness, key: &str| {
+        let (store, run, id, key, pin) = (
+            h.store.clone(),
+            h.run.clone(),
+            id.clone(),
+            key.to_owned(),
+            pin.clone(),
+        );
+        async move {
+            enrollment_dispatch::release_pin(&store, &run, &id, &key, &pin)
+                .await
+                .unwrap()
+        }
+    };
+    // Run commits but the reply is lost: unknown, then the same key confirms.
+    h.run.state().lose_release_ack = true;
+    assert_eq!(send(&h, &enrollment_key).await, "unknown");
+    assert_eq!(send(&h, &enrollment_key).await, "accepted");
+    let calls = h.run.state().release_calls.clone();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0], calls[1]);
+    assert_eq!(
+        calls[0],
+        json!({"version":1,"expected_store_id":RUN_STORE,
+            "pool_store_id":h.route.pool_route.component_store_id,
+            "request_id":enrollment_key,"pin_id":pin})
+    );
+    assert!(h.run.state().released.contains(&pin));
+    // Typed wire classes: only intent_conflict is a definitive refusal.
+    for (failure, state) in [
+        (Failure::Refused("intent_conflict"), "refused"),
+        (Failure::Refused("route_mismatch"), "unknown"),
+        (Failure::Refused("unsupported_version"), "unknown"),
+        (Failure::Operator("recovery_required"), "unknown"),
+        (Failure::Unknown, "unknown"),
+    ] {
+        h.run.state().release_failure = Some(failure);
+        assert_eq!(send(&h, &enrollment_key).await, state, "{failure:?}");
+    }
+    // A key that is not this enrollment's, or a changed route, never reaches Run.
+    let before = h.run.state().release_calls.len();
+    assert_eq!(send(&h, "agent-pool.enroll.other").await, "unknown");
+    let mut moved = h.route.clone();
+    moved.pool_route.route_id = "other-pool-route".into();
+    h.run.state().route_override = Some(moved);
+    assert_eq!(send(&h, &enrollment_key).await, "unknown");
+    assert_eq!(h.run.state().release_calls.len(), before);
 }
 
 #[tokio::test]

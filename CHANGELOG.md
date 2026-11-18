@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Changed
+
+- History-pin release supports Run 0.32, where only the admitting key can release a pin. Public batch and replacement pins use `history_pins_release` with the original `start_batch` request key. Managed-enrollment pins use `_managed_pin_release_v1` over the attempt channel with the enrollment key, when `_attempt_capabilities_v1` lists `managed_pin_release_v1`. If Run answers method-not-found, Pool falls back to the old `history_pins {"action":"release"}`. Both keys already lived in immutable Pool records, so the store schema does not change. The release intent now freezes the key, and intents recorded earlier re-derive it.
+- Release outcomes are classified. `RequestConflict`, `ValidationError` and the wire `intent_conflict` settle the intent `refused` (for example while a lineage hold protects the pin), and the owner may then request release again. `PinNotFound`, `StoreIdentityMismatch` and other wire errors stay `unknown` and are retried with the same key. Before this change, every failure stayed unknown, and managed-enrollment pins were never sent.
+
 ## 0.1.4
 
 Fix release, 2026-11-18. Qualification fields are unchanged from 0.1.0: `x86_64-unknown-linux-gnu` on the host `dobi`; this release ships that target only.

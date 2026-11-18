@@ -1139,19 +1139,41 @@ pub async fn run_store_identity(config: &Config) -> Result<String, RunFailure> {
 }
 
 /// Releases one exact pin only within the expected Run store; malformed replies remain unknown.
+///
+/// With the admitting `start_batch` key this uses Run 0.32's owner-checked
+/// `history_pins_release`, falling back to the combined `history_pins` method only when
+/// Run answers method-not-found (Run before 0.32, which had no ownership check). Without
+/// a key only the old method is tried; a current Run rejects it, so the outcome stays
+/// unknown instead of guessing an owner.
 pub async fn release_history_pin(
     config: &Config,
     pin: &str,
     expected_store_id: &str,
+    owner_request_key: Option<&str>,
 ) -> Result<(), RunFailure> {
     crate::domain::pin_id(pin).map_err(|_| RunFailure::unknown())?;
     crate::domain::store_id(expected_store_id).map_err(|_| RunFailure::unknown())?;
-    let reply = run_rpc(
-        config,
-        "history_pins",
-        json!({"action":"release","pin_id":pin,"expected_store_id":expected_store_id}),
-    )
-    .await?;
+    let legacy = || {
+        run_rpc(
+            config,
+            "history_pins",
+            json!({"action":"release","pin_id":pin,"expected_store_id":expected_store_id}),
+        )
+    };
+    let reply = match owner_request_key {
+        Some("") => return Err(RunFailure::unknown()),
+        Some(key) => match run_rpc(
+            config,
+            "history_pins_release",
+            json!({"pin_id":pin,"request_id":key,"expected_store_id":expected_store_id}),
+        )
+        .await
+        {
+            Err(failure) if failure.code == "method_not_found" => legacy().await?,
+            outcome => outcome?,
+        },
+        None => legacy().await?,
+    };
     if reply.get("pin_id").and_then(Value::as_str) != Some(pin)
         || reply.get("status").and_then(Value::as_str) != Some("released")
         || reply
@@ -1162,6 +1184,14 @@ pub async fn release_history_pin(
         return Err(RunFailure::unknown());
     }
     Ok(())
+}
+
+/// Whether a history-pin release failure is Run's definitive refusal rather than an unknown
+/// outcome: `RequestConflict` (not the owner key, a managed-enrollment pin, or an active
+/// lineage hold) and `ValidationError` (a request Run will never accept). `PinNotFound`,
+/// `StoreIdentityMismatch`, transport loss and malformed replies stay unknown.
+pub fn pin_release_refused(failure: &RunFailure) -> bool {
+    matches!(failure.code, "RequestConflict" | "ValidationError")
 }
 
 /// Sends one frozen group and accepts only a complete, ordered, correlated receipt.
@@ -2397,7 +2427,7 @@ mod tests {
             [1, 1, 1, 1],
             "lookup and retry must not create additional work or pins"
         );
-        release_history_pin(&config, pin, &store)
+        release_history_pin(&config, pin, &store, Some(&key))
             .await
             .map_err(|error| format!("pin release failed: {}", error.code))?;
         let after = batch_receipt(&config, &key, &jobs, true, Some(&store))
@@ -2548,12 +2578,23 @@ mod tests {
         assert!(
             run_rpc(
                 &config,
-                "history_pins",
-                json!({"action":"release","pin_id":pin,"expected_store_id":wrong_store_id})
+                "history_pins_release",
+                json!({"pin_id":pin,"request_id":"pool-synthetic-accept","expected_store_id":wrong_store_id})
             )
             .await
             .is_err()
         );
+        let foreign = release_history_pin(
+            &config,
+            pin,
+            &expected_store_id,
+            Some("pool-synthetic-other"),
+        )
+        .await
+        .err()
+        .ok_or("a foreign key must not release a pin")?;
+        assert_eq!(foreign.code, "RequestConflict");
+        assert!(pin_release_refused(&foreign));
         let db = rusqlite::Connection::open_with_flags(
             home.join("state.db"),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -2567,8 +2608,8 @@ mod tests {
         drop(db);
         let released = run_rpc(
             &config,
-            "history_pins",
-            json!({"action":"release","pin_id":pin,"expected_store_id":expected_store_id}),
+            "history_pins_release",
+            json!({"pin_id":pin,"request_id":"pool-synthetic-accept","expected_store_id":expected_store_id}),
         )
         .await
         .map_err(|error| format!("release failed: {}", error.code))?;
@@ -2577,8 +2618,8 @@ mod tests {
         assert_eq!(released["already_released"], false);
         let repeated = run_rpc(
             &config,
-            "history_pins",
-            json!({"action":"release","pin_id":pin,"expected_store_id":expected_store_id}),
+            "history_pins_release",
+            json!({"pin_id":pin,"request_id":"pool-synthetic-accept","expected_store_id":expected_store_id}),
         )
         .await
         .map_err(|error| format!("release retry failed: {}", error.code))?;

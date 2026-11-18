@@ -1166,6 +1166,31 @@ impl RunPeer {
         )
         .await
     }
+    /// Owner-keyed release of one managed-enrollment pin; callers must first see
+    /// `managed_pin_release_v1` in `_attempt_capabilities_v1`. Only an exact echo of the pin
+    /// with `status:"released"` confirms release; `intent_conflict` is a definitive refusal.
+    pub async fn managed_pin_release(
+        &self,
+        release: &crate::managed_enrollment::PinRelease,
+    ) -> Result<crate::managed_enrollment::PinReleased, crate::managed_enrollment::Failure> {
+        use crate::managed_enrollment::{Failure, PinReleased};
+        if release.expected_store_id != self.route.component_store_id
+            || release.pool_store_id != self.pool_route.component_store_id
+        {
+            return Err(Failure::Unknown);
+        }
+        let reply: PinReleased = self
+            .enrollment_exchange(
+                "_managed_pin_release_v1",
+                &release.params(),
+                &["pin_id", "status", "already_released"],
+            )
+            .await?;
+        if reply.version != 1 || reply.pin_id != release.pin_id || reply.status != "released" {
+            return Err(Failure::Unknown);
+        }
+        Ok(reply)
+    }
     /// Qualified current attestation under the original admission, re-read by receipt lookup.
     pub async fn enrollment_current(
         &self,
@@ -2803,6 +2828,111 @@ mod tests {
             peer.enrollment_lookup(&key).await.err(),
             Some(Failure::Unknown),
             "an unknown reply field is never accepted"
+        );
+        server.await.unwrap();
+    }
+
+    /// Run 0.32 managed pin release: closed params with the enrollment key, closed reply
+    /// keys, both `already_released` values confirm, typed wire errors stay classified.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn managed_pin_release_wire_exact_keys_and_typed_errors() {
+        if crate::peer_proof::rerun_without_loader_environment(
+            "managed_run::tests::managed_pin_release_wire_exact_keys_and_typed_errors",
+        ) {
+            return;
+        }
+        use crate::managed_enrollment::{Failure, PinRelease};
+        let _hash_guard = crate::TEST_EXEC_HASH_LOCK.lock().await;
+        let root = std::env::var_os("TMPDIR").unwrap();
+        let dir = tempfile::tempdir_in(root).unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = dir.path().join("attempt.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        let trusted = crate::peer_proof::TrustedTestExecutable::current().unwrap();
+        let executable = trusted.path().to_path_buf();
+        let sha256 = format!("{:x}", Sha256::digest(fs::read(&executable).unwrap()));
+        let uid = fs::metadata(dir.path()).unwrap().uid();
+        let peer = local_peer(socket, uid, executable, sha256);
+        let store_id = peer.route.component_store_id.clone();
+        let pin = "pin_550e8400e29b41d4a716446655440000".to_owned();
+        let release = PinRelease {
+            expected_store_id: store_id.clone(),
+            pool_store_id: peer.pool_route.component_store_id.clone(),
+            request_id: "agent-pool.enroll.1".into(),
+            pin_id: pin.clone(),
+        };
+        let expected = serde_json::json!({"version":1,"expected_store_id":store_id,
+            "pool_store_id":peer.pool_route.component_store_id,
+            "request_id":"agent-pool.enroll.1","pin_id":pin});
+        let server_pin = pin.clone();
+        let server = tokio::spawn(async move {
+            for index in 0..8 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request: Value =
+                    serde_json::from_slice(&read_frame(&mut stream).await.unwrap()).unwrap();
+                assert_eq!(request["method"], "_managed_pin_release_v1");
+                assert_eq!(request["params"], expected);
+                let error = |code: &str, recovery: &str| serde_json::json!({"id":request["id"],"error":{"version":1,"store_id":store_id,"code":code,"recovery":recovery}});
+                let ok = |already: bool| serde_json::json!({"id":request["id"],"result":{"version":1,"store_id":store_id,"pin_id":server_pin,"status":"released","already_released":already}});
+                let response = match index {
+                    0 => ok(false),
+                    1 => ok(true),
+                    2 => error("intent_conflict", "none"),
+                    3 => error("pin_not_found", "none"),
+                    4 => error("recovery_required", "operator"),
+                    5 => error("unsupported_version", "none"),
+                    6 => {
+                        serde_json::json!({"id":request["id"],"result":{"version":1,"store_id":store_id,"pin_id":"pin_650e8400e29b41d4a716446655440000","status":"released","already_released":false}})
+                    }
+                    _ => {
+                        serde_json::json!({"id":request["id"],"result":{"version":1,"store_id":store_id,"pin_id":server_pin,"status":"released","already_released":false,"extra":true}})
+                    }
+                };
+                stream
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let first = peer.managed_pin_release(&release).await.unwrap();
+        assert!(!first.already_released);
+        let repeated = peer.managed_pin_release(&release).await.unwrap();
+        assert!(repeated.already_released);
+        assert_eq!(
+            peer.managed_pin_release(&release).await.err(),
+            Some(Failure::Refused("intent_conflict"))
+        );
+        assert_eq!(
+            peer.managed_pin_release(&release).await.err(),
+            Some(Failure::Unknown),
+            "pin_not_found never confirms release"
+        );
+        assert_eq!(
+            peer.managed_pin_release(&release).await.err(),
+            Some(Failure::Operator("recovery_required"))
+        );
+        assert_eq!(
+            peer.managed_pin_release(&release).await.err(),
+            Some(Failure::Refused("unsupported_version"))
+        );
+        assert_eq!(
+            peer.managed_pin_release(&release).await.err(),
+            Some(Failure::Unknown),
+            "another pin's echo is not this release"
+        );
+        assert_eq!(
+            peer.managed_pin_release(&release).await.err(),
+            Some(Failure::Unknown),
+            "an unknown reply field is never accepted"
+        );
+        // A key for another Run or Pool store is refused locally before any I/O.
+        let mut foreign = release.clone();
+        foreign.pool_store_id = "00000000-0000-4000-8000-0000000000ff".into();
+        assert_eq!(
+            peer.managed_pin_release(&foreign).await.err(),
+            Some(Failure::Unknown)
         );
         server.await.unwrap();
     }
