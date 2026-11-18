@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed
+
+- `deny.toml` now ignores RUSTSEC-2026-0543 ("chrono is unmaintained", informational, no vulnerability) with an owner-approved re-check date of 2027-02-01; chrono remains required by rmcp and by our own use.
+
 ## 0.1.3
 
 Fix release, 2026-11-14. Qualification fields are unchanged from 0.1.0: `x86_64-unknown-linux-gnu` on the host `dobi`; this release ships that target only.
