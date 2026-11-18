@@ -2965,3 +2965,368 @@ async fn driver_startup_migrates_owned_legacy_keys_only() {
     assert_eq!(fixture.key_files(), 0);
     assert!(foreign.exists() && staged.exists());
 }
+
+/// Legacy-parity row (PLAN WP-C, `p3_legacy_parity`): one pool driven through
+/// the whole orchestrator flow the legacy Run pool offered, on the synthetic
+/// Run peer: owner create with structured acceptance, owner `pool_start_batch`
+/// of two managed members, admission, binding and P1 joins, owner broadcast,
+/// member broadcast, member-to-owner notice, member proposal, unanimous
+/// structured ready votes, formal completion under a Run lineage hold, one
+/// owner completion notice, and the observer's inventory and completion view.
+#[tokio::test]
+async fn p3_legacy_parity() {
+    use crate::domain::{Message, Propose, Reply, Vote};
+    let mut h = crate::enrollment_tests::Harness::with_acceptance(Some(vec![Criterion {
+        id: "c1".into(),
+        text: "The result works.".into(),
+    }]));
+    let pool = h.pool.clone();
+    let owner = h.owner().clone();
+
+    // Owner batch start of two managed members; both admit, qualify, bind and join.
+    let (enrollment, members) = h.batch(2).unwrap();
+    assert_eq!(members.len(), 2);
+    h.drive(&enrollment).await;
+    for member in &members {
+        h.qualify(member);
+    }
+    h.drive(&enrollment).await;
+    let view = h.view(&enrollment);
+    assert!(
+        view.jobs
+            .iter()
+            .all(|job| job.state == "bound_pending_join"),
+        "both jobs bound"
+    );
+    for member in &members {
+        let revision = h.revision();
+        h.join(member, revision).unwrap();
+        assert_eq!(h.member(member).0.member.state, MemberState::Active);
+    }
+
+    // Owner broadcast, member broadcast and an explicit member-to-owner notice.
+    let change = h.change();
+    let reply = h
+        .execute(
+            &owner,
+            &Command::Post(Message {
+                change,
+                body: "Owner: please verify the result.".into(),
+            }),
+        )
+        .unwrap();
+    assert!(matches!(reply, Reply::Receipt(_)));
+    let change = h.change();
+    h.p1(
+        &members[0],
+        Command::Post(Message {
+            change,
+            body: "Member 0: result drafted.".into(),
+        }),
+    )
+    .unwrap();
+    let change = h.change();
+    h.p1(
+        &members[1],
+        Command::Notify(Message {
+            change,
+            body: "Member 1: one risk for the owner.".into(),
+        }),
+    )
+    .unwrap();
+
+    // Member proposal and unanimous structured ready votes.
+    let change = h.change();
+    h.p1(
+        &members[0],
+        Command::Propose(Propose {
+            change,
+            result: "Result ready.".into(),
+            criteria: "Everything verified.".into(),
+            snapshot: Some("final snapshot".into()),
+        }),
+    )
+    .unwrap();
+    let proposal = |h: &crate::enrollment_tests::Harness| -> Proposal {
+        h.db(|db| {
+            let data: String = db
+                .query_row("SELECT data FROM pools WHERE id=?1", [&pool], |r| r.get(0))
+                .unwrap();
+            serde_json::from_str::<Pool>(&data)
+                .unwrap()
+                .proposal
+                .unwrap()
+        })
+    };
+    let open = proposal(&h);
+    assert_eq!(open.state, ProposalState::Open);
+    assert_eq!(open.voters.len(), 2);
+    for member in &members {
+        let change = h.change();
+        h.p1(
+            member,
+            Command::Vote(Vote {
+                change,
+                proposal_id: open.proposal_id.clone(),
+                roster_key: open.roster_key.clone(),
+                choice: Choice::Ready,
+                evidence: format!("Verified by {member}."),
+                checks: vec![CriterionCheck {
+                    criterion_id: "c1".into(),
+                    status: CheckStatus::Met,
+                    evidence: "Checked.".into(),
+                }],
+            }),
+        )
+        .unwrap();
+    }
+    let accepted = proposal(&h);
+    assert_eq!(accepted.state, ProposalState::Accepted);
+    assert_eq!(accepted.votes.len(), 2);
+
+    // Shared history matches the legacy flow, in order.
+    let kinds: Vec<String> = h.db(|db| {
+        let mut stmt = db
+            .prepare("SELECT json_extract(data,'$.kind') FROM events WHERE pool=?1 ORDER BY rowid")
+            .unwrap();
+        stmt.query_map([&pool], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    });
+    assert_eq!(
+        kinds,
+        [
+            "pool_created",
+            "batch_start_requested",
+            "member_joined",
+            "member_joined",
+            "message",
+            "message",
+            "owner_message",
+            "proposal_opened",
+            "vote_recorded",
+            "vote_check",
+            "proposal_accepted",
+            "vote_check",
+        ]
+    );
+    // Deliveries: the owner broadcast reaches both members, a member broadcast
+    // only its peer, and only the explicit notice reaches the owner's address.
+    let deliveries = |needle: &str| {
+        h.count(&format!(
+            "SELECT count(*) FROM effects WHERE pool='{pool}' AND json_extract(data,'$.work.kind')='deliver' AND instr(json_extract(data,'$.work.text'),'{needle}')>0"
+        ))
+    };
+    assert_eq!(deliveries("Owner: please verify the result."), 2);
+    assert_eq!(deliveries("Member 0: result drafted."), 1);
+    let owner_notices = |h: &crate::enrollment_tests::Harness| -> Vec<String> {
+        h.db(|db| {
+            let mut stmt = db
+                .prepare(
+                    "SELECT json_extract(data,'$.work.text') FROM effects WHERE pool=?1 AND member IS NULL AND json_extract(data,'$.work.scope')=?2 AND json_extract(data,'$.work.address')=?3 ORDER BY rowid",
+                )
+                .unwrap();
+            stmt.query_map(
+                rusqlite::params![&pool, format!("owner:{pool}"), &owner.address],
+                |r| r.get(0),
+            )
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+        })
+    };
+    let before = owner_notices(&h);
+    assert_eq!(
+        before.len(),
+        1,
+        "only the explicit notice reached the owner"
+    );
+    assert!(before[0].contains("Member 1: one risk for the owner."));
+    assert_eq!(
+        h.count(&format!(
+            "SELECT count(*) FROM effects WHERE pool='{pool}' AND member IS NULL AND json_extract(data,'$.work.address')<>'{}'",
+            owner.address
+        )),
+        0,
+        "no owner-scoped delivery goes elsewhere"
+    );
+
+    // Formal completion: Run lineage hold, signed release, immutable record.
+    let uid = std::fs::metadata(h.db_path().parent().unwrap())
+        .unwrap()
+        .uid();
+    let pool_store_id: String = h.db(|db| {
+        db.query_row("SELECT store_id FROM inventory_source", [], |r| r.get(0))
+            .unwrap()
+    });
+    let keys = KeyStore::open(h.db_path(), uid, &pool_store_id).unwrap();
+    let run = FakeRun::new();
+    let run_store = h.member(&members[0]).0.run_store_id.unwrap();
+    run.state().store_id = run_store;
+    let mut driver = Driver::new(run.clone(), keys.clone());
+    let saga = driver.start(&h.store, &pool).await.unwrap().unwrap();
+    driver.advance(&h.store, &saga).await.unwrap();
+    let stage: String = h.db(|db| {
+        db.query_row(
+            "SELECT stage FROM completion_sagas WHERE id=?1",
+            [&saga],
+            |r| r.get(0),
+        )
+        .unwrap()
+    });
+    assert_eq!(stage, "released");
+    assert_eq!(run.state().created, 1);
+    assert_eq!(run.active_holds(), 0, "lineage hold released");
+    assert_eq!(
+        std::fs::read_dir(keys.directory())
+            .map(|entries| entries.count())
+            .unwrap_or(0),
+        0,
+        "key destroyed only after verified release"
+    );
+    assert_eq!(h.count("SELECT count(*) FROM completion_records"), 1);
+    assert_eq!(
+        h.count(&format!(
+            "SELECT count(*) FROM events WHERE pool='{pool}' AND json_extract(data,'$.kind')='pool_completed'"
+        )),
+        1
+    );
+    // Exactly one completion notice joined the earlier explicit notice.
+    let after = owner_notices(&h);
+    assert_eq!(after.len(), 2);
+    assert_eq!(after[0], before[0]);
+    let completion_id: String = h.db(|db| {
+        db.query_row("SELECT completion_id FROM completion_records", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    });
+    assert!(
+        after[1].contains(&format!("completed. Completion {completion_id}.")),
+        "{}",
+        after[1]
+    );
+    // A second pass is idempotent: no new saga, hold or notice.
+    assert!(driver.start(&h.store, &pool).await.unwrap().is_none());
+    assert_eq!(run.state().created, 1);
+    assert_eq!(owner_notices(&h).len(), 2);
+
+    // Observer (Hub) parity: completed totals and the frozen ballots.
+    let (inventory, ballots) = {
+        let guard = h.store.lock().unwrap();
+        let request: crate::observer::Request = serde_json::from_value(json!({"schema_version":1,
+            "operation":"inventory_snapshot","params":{"filter":"all","limit":10}}))
+        .unwrap();
+        let inventory = serde_json::to_value(guard.observe(&request).unwrap()).unwrap();
+        drop(guard);
+        let request: GetRequest = serde_json::from_value(json!({"pool_id":pool,
+            "completion_id":completion_id,"section":"ballots","limit":10}))
+        .unwrap();
+        let mut guard = h.store.lock().unwrap();
+        let page = completion::page(guard.completion_db(), &request).unwrap();
+        (inventory, page)
+    };
+    assert_eq!(inventory["totals"]["completed"], "1");
+    assert_eq!(inventory["totals"]["open"], "0");
+    assert_eq!(ballots.items.len(), 2);
+}
+
+/// Legacy-parity row for `pool_replace` through formal completion: a failed
+/// member is replaced, the candidate joins and votes on a fresh proposal, and
+/// completion freezes and holds only the current roster (the candidate and
+/// the untouched peer), never the retired member's lineage.
+#[tokio::test]
+async fn p3_legacy_parity_replace_then_complete() {
+    use crate::domain::{Propose, Vote};
+    let mut h = crate::enrollment_tests::Harness::new();
+    let pool = h.pool.clone();
+    let (_, old) = h.active_member("old").await;
+    let (_, other) = h.active_member("other").await;
+    h.old_terminal(&old);
+    let (replacement, candidate) = h.replace(&old).unwrap();
+    h.drive(&replacement).await;
+    h.qualify(&candidate);
+    h.drive(&replacement).await;
+    assert_eq!(h.view(&replacement).state, "switched");
+    let revision = h.revision();
+    h.join(&candidate, revision).unwrap();
+    assert_eq!(h.member(&candidate).0.member.state, MemberState::Active);
+
+    let change = h.change();
+    h.p1(
+        &candidate,
+        Command::Propose(Propose {
+            change,
+            result: "Replacement result.".into(),
+            criteria: "Verified by the current roster.".into(),
+            snapshot: None,
+        }),
+    )
+    .unwrap();
+    let open: Proposal = h.db(|db| {
+        let data: String = db
+            .query_row("SELECT data FROM pools WHERE id=?1", [&pool], |r| r.get(0))
+            .unwrap();
+        serde_json::from_str::<Pool>(&data)
+            .unwrap()
+            .proposal
+            .unwrap()
+    });
+    let mut voters = open.voters.clone();
+    voters.sort();
+    let mut expected = vec![candidate.clone(), other.clone()];
+    expected.sort();
+    assert_eq!(voters, expected, "the retired member never votes");
+    for member in [&candidate, &other] {
+        let change = h.change();
+        h.p1(
+            member,
+            Command::Vote(Vote {
+                change,
+                proposal_id: open.proposal_id.clone(),
+                roster_key: open.roster_key.clone(),
+                choice: Choice::Ready,
+                evidence: format!("Verified by {member}."),
+                checks: vec![],
+            }),
+        )
+        .unwrap();
+    }
+
+    let uid = std::fs::metadata(h.db_path().parent().unwrap())
+        .unwrap()
+        .uid();
+    let pool_store_id: String = h.db(|db| {
+        db.query_row("SELECT store_id FROM inventory_source", [], |r| r.get(0))
+            .unwrap()
+    });
+    let keys = KeyStore::open(h.db_path(), uid, &pool_store_id).unwrap();
+    let run = FakeRun::new();
+    run.state().store_id = h.member(&candidate).0.run_store_id.unwrap();
+    // The retired lineage is failed in Run; completion must not depend on it.
+    run.state().failed.insert(h.member(&old).0.run_id.unwrap());
+    let mut driver = Driver::new(run.clone(), keys);
+    let saga = driver.start(&h.store, &pool).await.unwrap().unwrap();
+    driver.advance(&h.store, &saga).await.unwrap();
+    assert_eq!(run.state().created, 1);
+    assert_eq!(run.active_holds(), 0);
+    assert_eq!(h.count("SELECT count(*) FROM completion_records"), 1);
+    let completion_id: String = h.db(|db| {
+        db.query_row("SELECT completion_id FROM completion_records", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    });
+    let request: GetRequest = serde_json::from_value(json!({"pool_id":pool,
+        "completion_id":completion_id,"section":"ballots","limit":10}))
+    .unwrap();
+    let ballots = {
+        let mut guard = h.store.lock().unwrap();
+        completion::page(guard.completion_db(), &request).unwrap()
+    };
+    let text = serde_json::to_string(&ballots.items).unwrap();
+    assert_eq!(ballots.items.len(), 2);
+    assert!(text.contains(&candidate) && text.contains(&other));
+    assert!(!text.contains(&old), "retired member is not a frozen voter");
+}

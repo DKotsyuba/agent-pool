@@ -55,6 +55,7 @@ invent a caller identity. The resident survives MCP frontend EOF. `get_status`,
 | `pool_create`, `pool_list`, `pool_get` | Create and inspect authorized persistent groups |
 | `pool_update`, `pool_close` | Owner changes metadata or explicitly closes a group |
 | `pool_add`, `pool_start_agent`, `pool_start_batch`, `pool_join` | Invite/start, onboard and confirm native membership |
+| `pool_enrollment_get`, `pool_enrollment_resolve` | Owner reads one managed start/replace enrollment, or closes an admitted but unbound one as `retain_unassigned` |
 | `pool_member_update`, `pool_remove`, `pool_replace`, `pool_cancel_replacement` | Change assignments, revoke or safely replace an exact incarnation |
 | `pool_release_history` | Request release of a closed member's retained Run history |
 | `pool_post`, `pool_send_member`, `pool_notify_owner` | Member broadcast, peer delivery and explicit owner contact |
