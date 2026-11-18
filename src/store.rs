@@ -1470,8 +1470,8 @@ PRAGMA user_version=5;")?;
             db.execute_batch("PRAGMA user_version=15;")?;
         }
         // Version 16 records every non-current incarnation as terminal
-        // `removed` and settles closed pools' never-published deliveries as
-        // `pool_closed`; older binaries cannot project that attention.
+        // `removed`. Older binaries must refuse it: they cannot project the
+        // `pool_closed` attention that the reconciliation below records.
         if version < 16 {
             db.execute("UPDATE members SET data=json_set(data,'$.member.state','removed') WHERE current=0 AND json_extract(data,'$.member.state')!='removed'",[])?;
             db.execute_batch("PRAGMA user_version=16;")?;
