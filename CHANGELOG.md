@@ -2,8 +2,20 @@
 
 ## Unreleased
 
-- Added Linux owner ingress and Pool chat v1 for ordinary Run profiles. Authorized owners share chat management, and current seats reach a durable agreement through Run-authenticated chat tools.
-- Schema v18 adds durable chat batches, agreement records and retry timing for closed batches. Take a private WAL-consistent backup before opening an existing store. The v0.1.5 binary refuses a v18 database.
+## 0.2.0
+
+Feature release, 2026-11-19. Qualification fields are unchanged from 0.1.0: `x86_64-unknown-linux-gnu` on the host `dobi`; this release ships that target only.
+
+Upgrade note: this release migrates the store to schema v18 on the first open. Take a private, WAL-consistent `pool.sqlite` backup before the upgrade: 0.1.5 and older refuse a v18 store, and restoring the backup loses later admissions and release credentials. Treat v18 database files, WAL files, dumps and backups as credential-bearing. Chat pools require Run 0.33.0 or newer; upgrade Pool before Run. Legacy managed pools keep working with older Run.
+
+### Added
+
+- Linux owner ingress and Pool chat v1 for ordinary Run profiles. Start the owner frontend with `agent-pool mcp --owner-socket PATH --server-uid UID`. Authorized owners share eight chat management tools, including `pool_start` and `pool_completion_get`, and current seats reach a durable agreement through Run-authenticated chat tools (`member_call_v1` and `chat_catalog_v1` on the Run relay). This requires Run 0.33.0 or newer.
+- Agreement records, resident reconciliation of uncertain chat admissions by Run request ID, and observer fields for Hub.
+
+### Changed
+
+- Store schema v18 adds durable chat batches, agreement records and retry timing for closed batches. 0.1.5 and older refuse a v18 store.
 
 ## 0.1.5
 

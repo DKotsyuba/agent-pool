@@ -16,10 +16,11 @@ compatibility with older distributions has not been verified.
 
 Provision explicit private paths and the required Bridge producer/audience grants
 using [config.example.toml](config.example.toml).
-Upgrade Pool before upgrading Run to 0.32. The Pool resident migrates the
+Upgrade Pool before upgrading Run. Chat pools require Run 0.33.0 or newer;
+legacy managed pools keep working with older Run. The Pool resident migrates the
 SQLite store to schema v18 on first open. Take a private, WAL-consistent
 pre-upgrade backup using SQLite’s backup API or a consistent offline snapshot.
-Pool 0.1.5 refuses v18. Restoring the pre-upgrade backup loses subsequent
+Pool 0.1.5 and older refuse v18. Restoring the pre-upgrade backup loses subsequent
 admissions and release credentials. Protect v18 database files, WAL files,
 dumps and backups as credential-bearing data.
 
@@ -158,7 +159,7 @@ never delete that data or change a running service.
 
 ## Pool chat v1
 
-On Linux, provision `[owner_ingress]` and point the resident's `run_socket` at
+Chat pools require Run 0.33.0 or newer. On Linux, provision `[owner_ingress]` and point the resident's `run_socket` at
 Run's operator socket. Start the owner frontend with
 `agent-pool mcp --owner-socket /run/agent-pool/owner.sock --server-uid 1003`.
 Use the actual resident UID. Every allowlisted owner can manage any chat pool
