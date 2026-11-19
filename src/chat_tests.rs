@@ -380,7 +380,9 @@ async fn complete_with_address(
         "member_id":batch.jobs[1].member_id,"body":"direct text","agent_id":agent(2),"seat_id":batch.jobs[2].member_id,
         "pool_id":"foreign","request_key":"forged","author":agent(2)}),
     );
-    assert!(ok(&call(dm.clone()).await));
+    let receipt = call(dm.clone()).await;
+    assert!(ok(&receipt));
+    assert!(reply_text(&receipt).contains("\ndirect_message\nBody: "));
     assert!(ok(&call(dm).await));
     let visible = call(get_history(1)).await;
     assert!(reply_text(&visible).contains("direct text"));
@@ -1499,6 +1501,70 @@ async fn chat_invalid_spec_settles_refused() -> Result<(), Box<dyn std::error::E
         view.roster
             .iter()
             .all(|seat| seat.admitted == "refused" && seat.agent_id.is_none())
+    );
+    Ok(())
+}
+
+/// Keeps one text line per pool and seat through the owner tool presentation.
+#[tokio::test]
+async fn chat_owner_text_separates_pool_and_seat_rows() -> Result<(), Box<dyn std::error::Error>> {
+    let (_root, config, store) = fixture()?;
+    let templates = renderer()?;
+    let call = |tool: &str, arguments| {
+        let request = OwnerRequest {
+            tool: tool.into(),
+            arguments,
+        };
+        let config = &config;
+        let store = &store;
+        async move {
+            let reply = owner_call(request, config, store).await?;
+            let rendered = present(Ok(reply), templates);
+            serde_json::to_value(rendered).map_err(|_| Fault::Internal)
+        }
+    };
+    let launch = call("pool_start", input(None)).await?;
+    let launch_text = reply_text(&json!({"result":launch})).to_owned();
+    let rows: Vec<_> = launch_text
+        .lines()
+        .filter(|row| row.starts_with("Seat "))
+        .collect();
+    assert_eq!(rows.len(), 3, "{launch_text}");
+    assert!(
+        rows.iter().all(|row| row.ends_with("joined=false")),
+        "{launch_text}"
+    );
+    assert!(
+        launch_text
+            .lines()
+            .any(|line| line.starts_with("The resident reconciles"))
+    );
+
+    let mut second = input(None);
+    second["request_key"] = json!("second-start");
+    second["name"] = json!("Second pool");
+    call("pool_start", second).await?;
+    let list = json!({"result": call("pool_list", json!({})).await?});
+    let list_text = reply_text(&list);
+    assert_eq!(
+        list_text.lines().filter(|line| line.ends_with("\"Mixed profiles\"") || line.ends_with("\"Second pool\"")).count(),
+        2,
+        "{list_text}"
+    );
+
+    let pid = launch_text
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .ok_or("pool id")?;
+    let view = json!({"result": call("pool_get", json!({"pool_id":pid})).await?});
+    let text = reply_text(&view);
+    assert_eq!(
+        text.lines()
+            .filter(|line| line.contains("admission=pending") && line.contains("joined=false"))
+            .count(),
+        3,
+        "{text}"
     );
     Ok(())
 }

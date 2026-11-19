@@ -8,7 +8,7 @@ Confirmed={{ active }} pending={{ pending }}; leader excluded. Section={{ sectio
 Name: {{ member.name|quote }}; role: {{ member.role|quote }}
 Task: {{ member.task|quote }}
 {% endfor %}
-{% for delivery in deliveries %}Operation {{ delivery.operation_id }} {{ delivery.operation }} state={{ delivery.state }}{% if delivery.member_id %} member={{ delivery.member_id }}{% endif %}{% if delivery.attention is defined and delivery.attention %} attention={{ delivery.attention }}{% endif %}{% if delivery.attention_subject is defined and delivery.attention_subject %} attention_subject={{ delivery.attention_subject }}{% endif %}
+{% for delivery in deliveries %}Operation {{ delivery.operation_id }} {{ delivery.operation }} state={{ delivery.state }}{% if delivery.member_id %} member={{ delivery.member_id }}{% endif %}{% if delivery.attention is defined and delivery.attention %} attention={{ delivery.attention }}{% endif %}{% if delivery.attention_subject is defined and delivery.attention_subject %} attention_subject={{ delivery.attention_subject }}{% endif +%}
 {% if delivery.pin_recovery is defined and delivery.pin_recovery %}
 Run store={{ delivery.pin_recovery.store_id }} pin={{ delivery.pin_recovery.pin_id }} original_batch={{ delivery.pin_recovery.request_key|quote }}
 {% endif %}
@@ -26,7 +26,7 @@ Run rejected the advertised release parameters. Check the Run API and request po
 {% endfor %}
 {% if section == 'criteria' and pool.acceptance is defined %}{% for criterion in pool.acceptance %}Criterion {{ criterion.id }}: {{ criterion.text|quote }}
 {% endfor %}{% endif %}
-{% for event in events %}Event {{ event.event_id }} revision={{ event.revision }} {{ event.kind }} author={{ event.author.kind }}{% if event.author.kind == 'member' %}:{{ event.author.member_id }}{% endif %}{% if event.recipient %} recipient={{ event.recipient }}{% endif %}{% if event.part_index is defined %} message={{ event.message_event_id }} part={{ event.part_index }}/{{ event.part_count }}{% endif %}
+{% for event in events %}Event {{ event.event_id }} revision={{ event.revision }} {{ event.kind }} author={{ event.author.kind }}{% if event.author.kind == 'member' %}:{{ event.author.member_id }}{% endif %}{% if event.recipient %} recipient={{ event.recipient }}{% endif %}{% if event.part_index is defined %} message={{ event.message_event_id }} part={{ event.part_index }}/{{ event.part_count }}{% endif +%}
 Body: {{ event.body|quote }}
 {% endfor %}
 {% if pool.proposal %}Proposal {{ pool.proposal.proposal_id }} state={{ pool.proposal.state }} roster_key={{ pool.proposal.roster_key }}
@@ -34,7 +34,7 @@ Body: {{ event.body|quote }}
 Criteria: {{ pool.proposal.criteria|quote }}
 {% if pool.proposal.snapshot_bytes is defined %}Snapshot length={{ pool.proposal.snapshot_bytes }} bytes; read pool_get section=content field=snapshot.
 {% endif %}
-Voters:{% for voter in pool.proposal.voters %} {{ voter }}{% endfor %}
+Voters:{% for voter in pool.proposal.voters %} {{ voter }}{% endfor +%}
 {% endif %}{% for voter in pool.proposal.votes %}Vote {{ voter }}: {{ pool.proposal.votes[voter].choice }}
 {% if pool.proposal.votes[voter].validity is defined %}Validity={{ pool.proposal.votes[voter].validity }}; current Run author proof is unavailable.
 {% endif %}
