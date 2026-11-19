@@ -3,7 +3,7 @@ use crate::{
     config::{Config, private_file, private_parent, private_socket},
     domain::{Actor, Binding, Command, Effect, Fault, PinOwner, Reply, Work},
     integrations::{self, Assertion, EXCHANGE_TIMEOUT, MAX_FRAME},
-    store::{Admitted, Store},
+    store::{Admitted, PIN_RELEASE_TOKEN_UNAVAILABLE, Store},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -858,6 +858,7 @@ pub(crate) mod enrollment_dispatch {
                     &self.config,
                     &release.pin_id,
                     &release.expected_store_id,
+                    None,
                     None,
                 )
                 .await
@@ -3907,11 +3908,11 @@ async fn effect(
                 Some(PinOwner::Batch { request_key }) => Some(request_key.as_str()),
                 _ => None,
             };
-            let Some(route) = route else {
-                return settle(store, effect.effect_id, "unknown").await;
-            };
-            let Some(expected) = route.store_id.as_deref() else {
-                return settle(store, effect.effect_id, "unknown").await;
+            let Some((route, expected)) = route
+                .as_ref()
+                .and_then(|route| route.store_id.as_deref().map(|expected| (route, expected)))
+            else {
+                return settle(store, effect.effect_id, PIN_RELEASE_TOKEN_UNAVAILABLE).await;
             };
             let configured = configured_run_route(config);
             if !configured.is_ok_and(|configured| {
@@ -3923,10 +3924,28 @@ async fn effect(
             }
             match integrations::run_store_identity(config).await {
                 Ok(current) if current == expected => {
-                    match integrations::release_history_pin(config, pin_id, expected, owner_key)
-                        .await
+                    let store_id = expected.to_owned();
+                    let pin = pin_id.clone();
+                    let token =
+                        stored(store, move |store| store.pin_release_token(&store_id, &pin))
+                            .await?;
+                    if token.is_none() && owner_key.is_none() {
+                        return settle(store, effect.effect_id, PIN_RELEASE_TOKEN_UNAVAILABLE)
+                            .await;
+                    }
+                    match integrations::release_history_pin(
+                        config,
+                        pin_id,
+                        expected,
+                        owner_key,
+                        token.as_ref(),
+                    )
+                    .await
                     {
                         Ok(()) => "accepted",
+                        Err(failure) if failure.code == PIN_RELEASE_TOKEN_UNAVAILABLE => {
+                            PIN_RELEASE_TOKEN_UNAVAILABLE
+                        }
                         Err(failure) if integrations::pin_release_refused(&failure) => "refused",
                         Err(_) => "unknown",
                     }
@@ -4091,6 +4110,7 @@ async fn record_replacement(
         return Err(Fault::Unavailable);
     }
     let admission = admissions.pop().ok_or(Fault::Unavailable)?;
+    let release_token = admission.release_token;
     let value = (
         admission.agent_id,
         admission.sequence,
@@ -4101,7 +4121,13 @@ async fn record_replacement(
     let token = token.to_owned();
     let expected = expected_store.to_owned();
     stored(store, move |store| {
-        store.record_replacement_admission(&id, &token, &expected, &value)
+        store.record_replacement_admission_with_token(
+            &id,
+            &token,
+            &expected,
+            &value,
+            release_token.as_ref(),
+        )
     })
     .await
 }
@@ -4115,6 +4141,9 @@ async fn record_batch(
     admissions: Vec<integrations::BatchAdmission>,
 ) -> Result<Admitted, Fault> {
     let id = effect_id.to_owned();
+    let release_token = admissions
+        .first()
+        .and_then(|entry| entry.release_token.clone());
     let expected = expected_store_id.map(str::to_owned);
     let values: Vec<_> = admissions
         .into_iter()
@@ -4128,7 +4157,12 @@ async fn record_batch(
         })
         .collect();
     stored(store, move |store| {
-        store.record_batch_admission(&id, expected.as_deref(), &values)
+        store.record_batch_admission_with_token(
+            &id,
+            expected.as_deref(),
+            &values,
+            release_token.as_ref(),
+        )
     })
     .await
 }
@@ -6928,8 +6962,13 @@ mod tests {
         batch_key: String,
     }
 
+    const PIN_RELEASE_CANARY: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
     /// Builds the closed pool, its fenced admission and the first claimed release intent.
-    async fn release_fixture() -> Result<ReleaseFixture, Box<dyn std::error::Error>> {
+    async fn release_fixture(
+        replayed: Option<bool>,
+    ) -> Result<ReleaseFixture, Box<dyn std::error::Error>> {
         use crate::domain::{Change, Create, ReleaseHistory, RunRoute, StartBatch, StartMember};
         use serde_json::json;
         let directory =
@@ -7006,20 +7045,63 @@ mod tests {
             peer_uid: None,
             store_id: None,
         };
-        store.freeze_run_route(&admission.effect_id, &route, false)?;
         let store_identity = format!("store_{}", "1".repeat(32));
-        store.record_run_store_id(&admission.effect_id, &store_identity)?;
-        let pin = format!("pin_{}", uuid::Uuid::new_v4().simple());
-        store.record_batch_admission(
-            &admission.effect_id,
-            Some(&store_identity),
-            &[(
-                "ag-20261107-010101-0000000003".into(),
-                1,
-                format!("ex1_{}", "a".repeat(64)),
-                Some(pin.clone()),
-            )],
-        )?;
+        let pin = "pin_8f0b861ae9654576adbbc2a583d5811f".to_owned();
+        let agent = "ag-20261107-010101-0000000003";
+        let reference = format!("ex1_{}", "c".repeat(64));
+        if let Some(replayed) = replayed {
+            let admission = if replayed {
+                store.freeze_run_route(&admission.effect_id, &route, false)?;
+                store.record_run_store_id(&admission.effect_id, &store_identity)?;
+                drop(store);
+                store = Store::open(&config.database_path)?;
+                store
+                    .pending_unknown()?
+                    .into_iter()
+                    .find(|item| item.effect_id == admission.effect_id)
+                    .ok_or("admission pending after restart")?
+            } else {
+                admission
+            };
+            let shared = Arc::new(Mutex::new(store));
+            let mut reply = json!({"replayed":replayed,"receipt":{
+                "version":1,"store_id":store_identity,"request_id":batch_key,
+                "jobs":[{"index":0,"agent_id":agent,"sequence":1,"execution_ref":reference,"pin_id":pin}]
+            }});
+            if !replayed {
+                reply["release_token"] = json!(PIN_RELEASE_CANARY);
+            }
+            let (outcome, socket) = tokio::time::timeout(Duration::from_secs(20), async {
+                tokio::join!(
+                    effect(&shared, &config, admission, replayed),
+                    async {
+                        for (method, result) in [
+                            ("capabilities", json!({"schema_version":1,"product":"agent-run","store_id":store_identity})),
+                            ("start_batch", reply),
+                        ] {
+                            let (mut stream, request) = receive_run_request(&listener).await?;
+                            assert_eq!(request["method"], method);
+                            let mut bytes = serde_json::to_vec(&json!({"jsonrpc":"2.0","id":request["id"],"result":result}))?;
+                            bytes.push(b'\n');
+                            stream.write_all(&bytes).await?;
+                        }
+                        Ok::<_, Box<dyn std::error::Error>>(())
+                    },
+                )
+            }).await?;
+            outcome?;
+            socket?;
+            drop(shared);
+            store = Store::open(&config.database_path)?;
+        } else {
+            store.freeze_run_route(&admission.effect_id, &route, false)?;
+            store.record_run_store_id(&admission.effect_id, &store_identity)?;
+            store.record_batch_admission(
+                &admission.effect_id,
+                Some(&store_identity),
+                &[(agent.into(), 1, reference, Some(pin.clone()))],
+            )?;
+        }
         let member_id = started.created_ids[0].clone();
         // The after-close rule: an open pool never records a release intent.
         assert!(matches!(
@@ -7185,11 +7267,148 @@ mod tests {
         )
     }
 
+    /// One read through both public presentation paths with no private credential data.
+    fn release_views(
+        fixture: &ReleaseFixture,
+    ) -> Result<(String, String), Box<dyn std::error::Error>> {
+        use serde_json::json;
+        let mut store = fixture.store.lock().map_err(|_| "store lock")?;
+        let observer = store.observe(&serde_json::from_value(json!({
+            "schema_version":1,"operation":"get","params":{"pool_id":fixture.pool_id,"section":"deliveries"}
+        }))?)?;
+        let tool = crate::tools::present(
+            store.execute(
+                &fixture.owner,
+                &Command::Get(serde_json::from_value(
+                    json!({"pool_id":fixture.pool_id,"section":"deliveries"}),
+                )?),
+            ),
+            &crate::response::Templates::new(&crate::tools::templates())?,
+        );
+        Ok((
+            serde_json::to_string(&observer)?,
+            serde_json::to_string(&tool)?,
+        ))
+    }
+
+    /// A socket-issued token survives reopening and releases the pin with its exact store fence.
+    #[tokio::test]
+    async fn pin_release_token_is_durable_and_private() -> Result<(), Box<dyn std::error::Error>> {
+        use serde_json::json;
+        let fixture = release_fixture(Some(false)).await?;
+        let token = fixture
+            .store
+            .lock()
+            .map_err(|_| "store lock")?
+            .pin_release_token(&fixture.store_identity, &fixture.pin)?
+            .ok_or("missing persisted token")?;
+        assert!(token.as_str() == PIN_RELEASE_CANARY);
+        assert!(!format!("{token:?}").contains(PIN_RELEASE_CANARY));
+        let (observer, tool) = release_views(&fixture)?;
+        for view in [observer, tool] {
+            assert!(view.contains(&fixture.release_id));
+            assert!(!view.contains(PIN_RELEASE_CANARY));
+        }
+        let capabilities = || {
+            RunScript::Result(
+                json!({"schema_version":1,"product":"agent-run","store_id":fixture.store_identity}),
+            )
+        };
+        let error = RunScript::Error(
+            json!({"code":-32000,"message":PIN_RELEASE_CANARY,"data":{"code":"RequestConflict","message":PIN_RELEASE_CANARY}}),
+        );
+        let old_params = RunScript::Error(json!({"code":-32602,"message":"expected request_id"}));
+        let params = json!({"pin_id":fixture.pin,"release_token":PIN_RELEASE_CANARY,"expected_store_id":fixture.store_identity});
+        let requests = scripted_release(
+            &fixture,
+            fixture.release.clone(),
+            false,
+            vec![capabilities(), old_params, error],
+        )
+        .await?;
+        assert!(requests[1]["params"] == params);
+        assert_eq!(
+            requests[2]["params"],
+            json!({"pin_id":fixture.pin,"request_id":fixture.batch_key,"expected_store_id":fixture.store_identity})
+        );
+        assert_eq!(
+            effect_state(&fixture.store, &fixture.release_id)?,
+            "refused"
+        );
+        let (next_id, next) = request_release(
+            &fixture.store,
+            &fixture.owner,
+            &fixture.pool_id,
+            &fixture.member_id,
+            "after-refusal",
+        )
+        .await?;
+        let requests = scripted_release(
+            &fixture,
+            next,
+            false,
+            vec![
+                capabilities(),
+                RunScript::Result(
+                    json!({"pin_id":fixture.pin,"status":"released","already_released":true}),
+                ),
+            ],
+        )
+        .await?;
+        assert!(requests[1]["params"] == params);
+        assert_eq!(effect_state(&fixture.store, &next_id)?, "accepted");
+        assert!(
+            fixture
+                .store
+                .lock()
+                .map_err(|_| "store lock")?
+                .pin_release_token(&fixture.store_identity, &fixture.pin)?
+                .is_none()
+        );
+        let mut guard = fixture.store.lock().map_err(|_| "store lock")?;
+        let leaked: bool = guard.test_db().query_row(
+            "SELECT EXISTS(SELECT 1 FROM effects WHERE instr(data,?1)>0) OR EXISTS(SELECT 1 FROM members WHERE instr(data,?1)>0)",
+            [PIN_RELEASE_CANARY], |row| row.get(0),
+        )?;
+        assert!(!leaked);
+        drop(guard);
+        let (observer, tool) = release_views(&fixture)?;
+        assert!(!observer.contains(PIN_RELEASE_CANARY));
+        assert!(!tool.contains(PIN_RELEASE_CANARY));
+        Ok(())
+    }
+
+    /// An admitted replay without a token becomes terminal on a token-only Run server.
+    #[tokio::test]
+    async fn pin_release_without_token_requires_owner() -> Result<(), Box<dyn std::error::Error>> {
+        use serde_json::json;
+        let fixture = release_fixture(Some(true)).await?;
+        let requests = scripted_release(&fixture, fixture.release.clone(), false, vec![
+            RunScript::Result(json!({"schema_version":1,"product":"agent-run","store_id":fixture.store_identity})),
+            RunScript::Error(json!({"code":-32602,"message":"missing release_token"})),
+        ]).await?;
+        assert!(requests[1]["params"].get("release_token").is_none());
+        assert_eq!(
+            effect_state(&fixture.store, &fixture.release_id)?,
+            PIN_RELEASE_TOKEN_UNAVAILABLE
+        );
+        assert!(
+            !stored(&fixture.store, |store| store.pending_unknown())
+                .await?
+                .iter()
+                .any(|item| item.effect_id == fixture.release_id)
+        );
+        let (observer, tool) = release_views(&fixture)?;
+        assert!(observer.contains(PIN_RELEASE_TOKEN_UNAVAILABLE));
+        assert!(tool.contains("history-pins release-offline"));
+        Ok(())
+    }
+
     /// A closed pool can record release intent, but cannot send it to an unverified Run store.
     #[tokio::test]
     async fn pin_release_waits_for_run_store_identity() -> Result<(), Box<dyn std::error::Error>> {
         use serde_json::json;
-        let fixture = release_fixture().await?;
+        let fixture = release_fixture(None).await?;
         let (pin, store_identity, release_id) = (
             fixture.pin.clone(),
             fixture.store_identity.clone(),
@@ -7252,7 +7471,7 @@ mod tests {
     #[tokio::test]
     async fn pin_release_maps_run_032_errors() -> Result<(), Box<dyn std::error::Error>> {
         use serde_json::json;
-        let fixture = release_fixture().await?;
+        let fixture = release_fixture(None).await?;
         let store_identity = fixture.store_identity.clone();
         let capabilities = || {
             RunScript::Result(
@@ -7393,7 +7612,7 @@ mod tests {
     async fn pin_release_falls_back_on_old_run_and_rederives_legacy_owner()
     -> Result<(), Box<dyn std::error::Error>> {
         use serde_json::json;
-        let fixture = release_fixture().await?;
+        let fixture = release_fixture(None).await?;
         let mut legacy = fixture.release.clone();
         let Work::ReleasePin { owner, .. } = &mut legacy.work else {
             return Err("release work".into());

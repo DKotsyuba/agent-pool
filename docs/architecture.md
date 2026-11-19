@@ -11,9 +11,9 @@ its EOF never starts, stops or replaces the resident.
 - `domain.rs` defines strict flat commands, safe public views and private outbox work.
 - `store.rs` owns the single SQLite writer and synchronous transactions. A process
   lifetime file lock excludes a second writer. WAL, full synchronization, foreign
-  keys and schema version 16 are explicit. Future schema versions refuse to open.
-  Schema v1–v15 upgrades transactionally to v16 before use; older binaries must
-  refuse v16 because they cannot preserve newer durable state. The v5 replacement
+  keys and schema version 17 are explicit. Future schema versions refuse to open.
+  Schema v1–v16 upgrades transactionally to v17 before use. Schema v17 adds the
+  private Run pin credential table. The v5 replacement
   and stable-slot migration and v6 inventory revision fence remain in that upgrade.
   v16 records every non-current incarnation as `removed`; every open then settles
   closed pools' never-published deliveries (see "Closed pools").
@@ -116,8 +116,8 @@ values plus per-member binding resolvers are committed together in Pool. Missing
 malformed or duplicate references or pins leave admission unknown. Pins have no
 automatic expiry. After pool closure the owner may record an explicit release
 intent per member. Pool sends it only through the original fenced endpoint after
-a matching store-ID preflight, with `expected_store_id` checked by Run. Unknown
-or legacy origins remain on hold; an uncertain response is retried by the same pin.
+a matching store-ID preflight, with `expected_store_id` checked by Run. An
+uncertain response is retried with the same pin and release credential.
 A release permits later pruning and cannot be undone.
 A receipt's pin ID does not prove the pin is still active. The execution reference
 is an identifier, not an authorization or current-attempt proof. A restored or
@@ -172,12 +172,17 @@ freezes the pin and its Run ownership proof, both taken from immutable records:
 for a public `start_batch` admission (batch start or replacement) the exact batch
 request key of the accepted origin, and for a managed enrollment the enrollment
 row and its request key. Intents recorded before this proof existed re-derive it
-from the same records. No schema change is needed.
+from the same records.
 
-Run 0.32 releases a pin only for its admitting key. A public pin goes to the
-original verified Run store over the operator socket as `history_pins_release
-{pin_id, request_id, expected_store_id}`; when Run answers method-not-found (Run
-before 0.32) Pool falls back to the combined `history_pins {"action":"release"}`.
+Run 0.32 returns a public batch release token only on the original socket
+admission acknowledgement. Pool stores it privately by Run store and pin in
+the same transaction as the admission. Receipt lookup and replay can recover
+the pin but cannot recover the token. Pool releases it over the original verified
+socket with `history_pins_release {pin_id, release_token, expected_store_id}`.
+The request-key form and the older combined method remain compatibility paths
+for older Run servers. On current Run, legacy pins and recovered admissions
+with missing tokens settle as `pin_release_token_unavailable`. The owner gets
+Run’s offline release guidance in deliveries, and Pool stops automatic retries.
 A managed pin goes over the authenticated attempt channel as
 `_managed_pin_release_v1` when `_attempt_capabilities_v1` lists
 `managed_pin_release_v1`; otherwise only the old combined socket method is tried,
@@ -186,12 +191,12 @@ store also stays unknown.
 
 A confirmed release (`already_released` false or true) settles `accepted`.
 `RequestConflict` or `ValidationError` on the socket, or `intent_conflict` on the
-wire, settles `refused`: Run will not release for this key, for example while
+wire, settles `refused`: Run declines the release, for example while
 a lineage hold protects the pin. A refused intent no longer blocks a new owner
 request, so the owner can retry after the hold is released. `PinNotFound`,
 `StoreIdentityMismatch`, `pin_not_found`, `route_mismatch`,
 `recovery_required`, `unsupported_version`, transport loss and malformed
-replies stay `unknown`, and Pool retries the same pin and key. Pool never lists
+replies stay `unknown`, and Pool retries the same pin and credential. Pool never lists
 pins, so `history_pins_list` is not used.
 
 `pool_get section=deliveries` exposes safe per-operation states without private

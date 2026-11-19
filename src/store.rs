@@ -1,5 +1,5 @@
 //! Single-writer SQLite state machine. Transactions commit business state and delivery intents together.
-use crate::domain::*;
+use crate::{domain::*, integrations::PinReleaseToken};
 use fs2::FileExt;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Serialize, de::DeserializeOwned};
@@ -1325,9 +1325,10 @@ impl Store {
                 if !mappings && get.section == Section::Deliveries {
                     for delivery in &mut view.deliveries {
                         (delivery.attention, delivery.attention_subject) =
-                            crate::managed_egress::owner_attention(
+                            delivery_owner_attention(
                                 &self.db,
                                 &delivery.operation_id,
+                                &delivery.state,
                             )?;
                     }
                 }
@@ -1475,6 +1476,9 @@ PRAGMA user_version=5;")?;
         if version < 16 {
             db.execute("UPDATE members SET data=json_set(data,'$.member.state','removed') WHERE current=0 AND json_extract(data,'$.member.state')!='removed'",[])?;
             db.execute_batch("PRAGMA user_version=16;")?;
+        }
+        if version < 17 {
+            db.execute_batch("CREATE TABLE IF NOT EXISTS run_pin_release_tokens(store_id TEXT NOT NULL,pin_id TEXT NOT NULL,token TEXT NOT NULL,PRIMARY KEY(store_id,pin_id)); PRAGMA user_version=17;")?;
         }
         if version < crate::completion::SCHEMA_VERSION {
             db.execute_batch("COMMIT;")?;
@@ -1662,6 +1666,24 @@ PRAGMA user_version=5;")?;
             pin_id,
         )?
         .1)
+    }
+    /// Reads the private credential for the release effect’s frozen store and pin.
+    pub(crate) fn pin_release_token(
+        &self,
+        store_id: &str,
+        pin: &str,
+    ) -> Result<Option<PinReleaseToken>, Fault> {
+        let value: Option<String> = self
+            .db
+            .query_row(
+                "SELECT token FROM run_pin_release_tokens WHERE store_id=?1 AND pin_id=?2",
+                params![store_id, pin],
+                |row| row.get(0),
+            )
+            .optional()?;
+        value
+            .map(|token| PinReleaseToken::try_from(token).map_err(|_| Fault::Internal))
+            .transpose()
     }
     /// Returns the retained exact membership of an effect, including removal and immediate Run receipt.
     /// This private view lets reconciliation inspect admitted work without starting a removed agent.
@@ -1993,7 +2015,16 @@ PRAGMA user_version=5;")?;
         state: &str,
         token: Option<&str>,
     ) -> Result<(), Fault> {
-        if !["unknown", "custody", "accepted", "refused", "cancelled"].contains(&state) {
+        if ![
+            "unknown",
+            "custody",
+            "accepted",
+            "refused",
+            "cancelled",
+            PIN_RELEASE_TOKEN_UNAVAILABLE,
+        ]
+        .contains(&state)
+        {
             return Err(Fault::Invalid);
         }
         let tx = self
@@ -2003,6 +2034,10 @@ PRAGMA user_version=5;")?;
         if effect.state == RECONCILIATION_NEEDED {
             // A retained late receipt is terminal; no later settlement overwrites it.
             return Ok(());
+        }
+        if state == PIN_RELEASE_TOKEN_UNAVAILABLE && !matches!(effect.work, Work::ReleasePin { .. })
+        {
+            return Err(Fault::Invalid);
         }
         let single_batch = effect.is_single_batch()?;
         let replacement_can_refuse = if let Work::Replace {
@@ -2029,7 +2064,14 @@ PRAGMA user_version=5;")?;
             }
             false
         };
-        if ["accepted", "refused", "cancelled"].contains(&effect.state.as_str()) {
+        if [
+            "accepted",
+            "refused",
+            "cancelled",
+            PIN_RELEASE_TOKEN_UNAVAILABLE,
+        ]
+        .contains(&effect.state.as_str())
+        {
             return if effect.state == state
                 || (effect.state == "accepted"
                     && (state == "unknown"
@@ -2083,6 +2125,18 @@ PRAGMA user_version=5;")?;
             (Work::Replace { .. }, "refused") if !replacement_can_refuse => "unknown",
             _ => state,
         };
+        if state == "accepted"
+            && let Work::ReleasePin {
+                pin_id,
+                route: Some(route),
+                ..
+            } = &effect.work
+        {
+            tx.execute(
+                "DELETE FROM run_pin_release_tokens WHERE store_id=?1 AND pin_id=?2",
+                params![route.store_id, pin_id],
+            )?;
+        }
         effect.state = state.into();
         tx.execute(
             "UPDATE effects SET state=?2,data=?3 WHERE id=?1",
@@ -2132,7 +2186,7 @@ PRAGMA user_version=5;")?;
                     } else if matches!(effect.work, Work::StartBatch { .. }) {
                         "Run batch admission refused; no member was admitted by this request."
                     } else if matches!(effect.work, Work::ReleasePin { .. }) && state == "unknown" {
-                        "History release outcome unknown; Pool retries the same pin and owner key."
+                        "History release outcome unknown; Pool retries the same pin and release credential."
                     } else if matches!(effect.work, Work::ReleasePin { .. }) {
                         "History release refused by Run; the pin stays retained. Request it again after any lineage hold is released."
                     } else if state == "unknown" {
@@ -2197,14 +2251,25 @@ PRAGMA user_version=5;")?;
         tx.commit()?;
         Ok(Admitted::Installed)
     }
-    /// Records every batch admission and queues binding reconciliation in one Pool transaction.
-    /// Exact replay never creates a second resolver; inconsistent receipts fail closed.
-    /// After pool completion the receipt is retained, not installed (`ReconciliationNeeded`).
+    #[cfg(test)]
+    /// Records a receipt without a bearer credential, as with a receipt lookup.
     pub fn record_batch_admission(
         &mut self,
         effect_id: &str,
         receipt_store_id: Option<&str>,
         admissions: &[(String, u64, String, Option<String>)],
+    ) -> Result<Admitted, Fault> {
+        self.record_batch_admission_with_token(effect_id, receipt_store_id, admissions, None)
+    }
+    /// Records every batch admission and queues binding reconciliation in one Pool transaction.
+    /// Exact replay never creates a second resolver; inconsistent receipts fail closed.
+    /// After pool completion the receipt is retained, not installed (`ReconciliationNeeded`).
+    pub(crate) fn record_batch_admission_with_token(
+        &mut self,
+        effect_id: &str,
+        receipt_store_id: Option<&str>,
+        admissions: &[(String, u64, String, Option<String>)],
+        release_token: Option<&PinReleaseToken>,
     ) -> Result<Admitted, Fault> {
         let tx = self
             .db
@@ -2247,7 +2312,11 @@ PRAGMA user_version=5;")?;
                 return Err(Fault::Invalid);
             }
             let receipt = admission_receipt("start_batch", receipt_store_id, admissions);
-            return completed_commit(tx, |tx| completed_admission(tx, &e, &receipt));
+            return completed_commit(tx, |tx| {
+                let outcome = completed_admission(tx, &e, &receipt)?;
+                save_pin_release_tokens(tx, receipt_store_id, admissions, release_token)?;
+                Ok(outcome)
+            });
         }
         let mut seen = BTreeSet::new();
         let mut seen_refs = BTreeSet::new();
@@ -2312,6 +2381,9 @@ PRAGMA user_version=5;")?;
             save_binding(&tx, &binding, current)?;
             queue(&tx, &e.pool_id, Some(&job.member_id), Work::ResolveRun)?;
         }
+        if e.state != "accepted" {
+            save_pin_release_tokens(&tx, receipt_store_id, admissions, release_token)?;
+        }
         tx.execute(
             "UPDATE effects SET state='accepted' WHERE id=?1",
             [effect_id],
@@ -2319,15 +2391,33 @@ PRAGMA user_version=5;")?;
         tx.commit()?;
         Ok(Admitted::Installed)
     }
-    /// Atomically installs a replacement only after the exact conditioned Run receipt is verified.
-    /// A crash before this commit leaves the old roster frozen for receipt reconciliation.
-    /// After pool completion the receipt is retained, not installed (`ReconciliationNeeded`).
+    #[cfg(test)]
+    /// Records a replacement receipt recovered without a bearer credential.
     pub(crate) fn record_replacement_admission(
         &mut self,
         effect_id: &str,
         token: &str,
         expected_store: &str,
         admission: &(String, u64, String, Option<String>),
+    ) -> Result<Admitted, Fault> {
+        self.record_replacement_admission_with_token(
+            effect_id,
+            token,
+            expected_store,
+            admission,
+            None,
+        )
+    }
+    /// Atomically installs a replacement only after the exact conditioned Run receipt is verified.
+    /// A crash before this commit leaves the old roster frozen for receipt reconciliation.
+    /// After pool completion the receipt is retained, not installed (`ReconciliationNeeded`).
+    pub(crate) fn record_replacement_admission_with_token(
+        &mut self,
+        effect_id: &str,
+        token: &str,
+        expected_store: &str,
+        admission: &(String, u64, String, Option<String>),
+        release_token: Option<&PinReleaseToken>,
     ) -> Result<Admitted, Fault> {
         let tx = self
             .db
@@ -2388,7 +2478,16 @@ PRAGMA user_version=5;")?;
                 Some(expected_store),
                 std::slice::from_ref(admission),
             );
-            return completed_commit(tx, |tx| completed_admission(tx, &effect, &receipt));
+            return completed_commit(tx, |tx| {
+                let outcome = completed_admission(tx, &effect, &receipt)?;
+                save_pin_release_tokens(
+                    tx,
+                    Some(expected_store),
+                    std::slice::from_ref(admission),
+                    release_token,
+                )?;
+                Ok(outcome)
+            });
         }
         if effect.state != "inflight" {
             return Err(Fault::Conflict);
@@ -2432,6 +2531,12 @@ PRAGMA user_version=5;")?;
         installed.run_pin_id = Some(pin.to_owned());
         installed.run_store_id = Some(expected_store.to_owned());
         save_binding(&tx, &installed, true)?;
+        save_pin_release_tokens(
+            &tx,
+            Some(expected_store),
+            std::slice::from_ref(admission),
+            release_token,
+        )?;
         tx.execute(
             "INSERT INTO member_slots(member,slot) VALUES(?1,?2)",
             params![installed.member.member_id, slot],
@@ -4161,7 +4266,7 @@ fn view(
                     Work::ReleasePin { .. } => "release_pin",
                 };
                 let (attention, attention_subject) = if owner {
-                    crate::managed_egress::owner_attention(db, &id)?
+                    delivery_owner_attention(db, &id, &state)?
                 } else {
                     (None, None)
                 };
@@ -4680,6 +4785,45 @@ fn validate_replacement_source(db: &Connection, effect: &Effect) -> Result<(), F
     validate_original_spec(job.original_spec.as_ref())?;
     if job.original_spec.is_none() {
         return Err(Fault::Unavailable);
+    }
+    Ok(())
+}
+/// Terminal release state requiring recovery by the Run database owner.
+pub(crate) const PIN_RELEASE_TOKEN_UNAVAILABLE: &str = "pin_release_token_unavailable";
+
+/// Projects only the safe owner recovery class for unavailable release credentials.
+fn delivery_owner_attention(
+    db: &Connection,
+    id: &str,
+    state: &str,
+) -> Result<(Option<String>, Option<String>), Fault> {
+    if state == PIN_RELEASE_TOKEN_UNAVAILABLE {
+        return Ok((Some(PIN_RELEASE_TOKEN_UNAVAILABLE.into()), None));
+    }
+    crate::managed_egress::owner_attention(db, id)
+}
+
+/// Stores a verified public batch credential with each pin in the admission transaction.
+fn save_pin_release_tokens(
+    db: &Connection,
+    store: Option<&str>,
+    admissions: &[(String, u64, String, Option<String>)],
+    token: Option<&PinReleaseToken>,
+) -> Result<(), Fault> {
+    let Some(token) = token else { return Ok(()) };
+    let store = store.ok_or(Fault::Conflict)?;
+    store_id(store)?;
+    for (agent, _, _, pin) in admissions {
+        let pin = pin
+            .as_deref()
+            .filter(|pin| token.matches_pin(agent, pin))
+            .ok_or(Fault::Conflict)?;
+        if db.execute(
+            "INSERT INTO run_pin_release_tokens(store_id,pin_id,token) VALUES(?1,?2,?3) ON CONFLICT(store_id,pin_id) DO UPDATE SET token=excluded.token WHERE token=excluded.token",
+            params![store, pin, token.as_str()],
+        )? != 1 {
+            return Err(Fault::Conflict);
+        }
     }
     Ok(())
 }

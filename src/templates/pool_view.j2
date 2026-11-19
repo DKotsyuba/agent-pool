@@ -9,6 +9,9 @@ Name: {{ member.name|quote }}; role: {{ member.role|quote }}
 Task: {{ member.task|quote }}
 {% endfor %}
 {% for delivery in deliveries %}Operation {{ delivery.operation_id }} {{ delivery.operation }} state={{ delivery.state }}{% if delivery.member_id %} member={{ delivery.member_id }}{% endif %}{% if delivery.attention is defined and delivery.attention %} attention={{ delivery.attention }}{% endif %}{% if delivery.attention_subject is defined and delivery.attention_subject %} attention_subject={{ delivery.attention_subject }}{% endif %}
+{% if delivery.attention is defined and delivery.attention == "pin_release_token_unavailable" %}
+The Run database owner must verify the original public batch receipt, stop the broker, service manager and recorded workers, then use agent-run --home HOME history-pins release-offline --expected-store-id STORE_ID --pin-id PIN_ID --request-id ORIGINAL_BATCH_ID. Keep the pin active if the original receipt cannot be verified.
+{% endif %}
 {% endfor %}
 {% if section == 'criteria' and pool.acceptance is defined %}{% for criterion in pool.acceptance %}Criterion {{ criterion.id }}: {{ criterion.text|quote }}
 {% endfor %}{% endif %}
