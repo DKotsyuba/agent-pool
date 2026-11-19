@@ -3573,7 +3573,9 @@ pub async fn serve(config_path: &Path) -> Result<(), Fault> {
         .inspect_err(|_| eprintln!("resident: startup refused at the resident socket"))?;
     let (observer_listener, _observer_guard, observer_uids) = match &config.observer_socket {
         Some(settings) => {
-            let (listener, guard) = crate::observer_socket::listener(&config, settings).await?;
+            let (listener, guard) = crate::observer_socket::listener(&config, settings)
+                .await
+                .inspect_err(|_| eprintln!("resident: startup refused at the observer socket"))?;
             (Some(listener), Some(guard), settings.allowed_uids.clone())
         }
         None => (None, None, Vec::new()),
@@ -4347,7 +4349,7 @@ async fn resolve_run(
     Ok("unknown")
 }
 
-/// Persists one effect result; storage failure stops the worker rather than claiming delivery.
+/// Persists one effect result, returning a fault when settlement cannot be recorded.
 async fn settle(store: &SharedStore, effect_id: String, state: &'static str) -> Result<(), Fault> {
     stored(store, move |store| store.settle_effect(&effect_id, state)).await
 }
@@ -4643,7 +4645,27 @@ async fn recover_namespace_retirement(config: &Config, store: &SharedStore) -> R
     Ok(())
 }
 
-/// Unknown delivery uses status only; unknown Run admission retries the same frozen admission key.
+/// Defers a conflicting or stale item without replaying a possible send as new work.
+/// Returns whether the effect was skipped. Storage faults abort the worker.
+async fn finish_dispatch(
+    store: &SharedStore,
+    id: &str,
+    outcome: Result<(), Fault>,
+) -> Result<bool, Fault> {
+    match outcome {
+        Ok(()) => Ok(false),
+        Err(fault @ (Fault::Conflict | Fault::Stale)) => {
+            eprintln!("resident: effect {id} skipped: {fault}");
+            let id = id.to_owned();
+            stored(store, move |store| store.defer_effect(&id)).await?;
+            Ok(true)
+        }
+        Err(fault) => Err(fault),
+    }
+}
+
+/// Runs each outbox tick, deferring item conflicts while propagating store failures.
+/// Unknown delivery uses status only; unknown Run admission uses its original key.
 async fn work(
     config: Config,
     store: SharedStore,
@@ -4714,6 +4736,7 @@ async fn work(
         if let Some(driver) = completion.as_mut() {
             driver.tick(&store, &stopped).await?;
         }
+        let mut skipped = HashSet::new();
         for _ in 0..32 {
             if *stopped.borrow() {
                 return Ok(());
@@ -4734,14 +4757,23 @@ async fn work(
             let Some(next) = next else {
                 break;
             };
-            dispatch_effect(&store, &config, next, false, &activity).await?;
+            let id = next.effect_id.clone();
+            let outcome = dispatch_effect(&store, &config, next, false, &activity).await;
+            if finish_dispatch(&store, &id, outcome).await? {
+                skipped.insert(id);
+            }
         }
         let pending = stored(&store, |store| store.pending_unknown()).await?;
         for pending in pending {
             if *stopped.borrow() {
                 return Ok(());
             }
-            dispatch_effect(&store, &config, pending, true, &activity).await?;
+            if skipped.contains(&pending.effect_id) {
+                continue;
+            }
+            let id = pending.effect_id.clone();
+            let outcome = dispatch_effect(&store, &config, pending, true, &activity).await;
+            finish_dispatch(&store, &id, outcome).await?;
         }
         // One separate batch per tick, with concurrent two-second Run lookups
         // and one short Bridge exchange per item (no provider work under a Store lock).
@@ -4750,7 +4782,11 @@ async fn work(
         for notice in due {
             let store = Arc::clone(&store);
             let config = config.clone();
-            notices.spawn(async move { effect(&store, &config, notice, false).await });
+            notices.spawn(async move {
+                let id = notice.effect_id.clone();
+                let outcome = effect(&store, &config, notice, false).await;
+                finish_dispatch(&store, &id, outcome).await
+            });
         }
         while let Some(result) = notices.join_next().await {
             result.map_err(|_| Fault::Internal)??;
@@ -12795,6 +12831,63 @@ mod tests {
         assert_eq!(outcome, Err(Fault::Internal));
         let outcome = stored(&store, |_store| Ok(())).await;
         assert_eq!(outcome, Err(Fault::Internal));
+        Ok(())
+    }
+
+    /// A settlement conflict leaves later work runnable, while a SQLite failure ends the worker.
+    #[tokio::test]
+    async fn outbox_worker_survives_settlement_conflict_and_exits_on_sqlite_fault()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = replacement_fixture()?;
+        let pool_id = fixture.pool_id;
+        stored(&fixture.store, move |store| {
+            let db = store.test_db();
+            for id in [
+                "conflicting-retire",
+                "next-retire",
+                "fatal-retire",
+                "unreached-retire",
+            ] {
+                let effect = Effect {
+                    effect_id: id.into(),
+                    pool_id: pool_id.clone(),
+                    member_id: None,
+                    work: Work::Retire {
+                        scope: "fixture".into(),
+                    },
+                    state: "queued".into(),
+                };
+                let data = serde_json::to_string(&effect).map_err(|_| Fault::Internal)?;
+                db.execute(
+                    "INSERT INTO effects(id,pool,state,data) VALUES(?1,?2,'queued',?3)",
+                    rusqlite::params![id, pool_id, data],
+                )?;
+            }
+            db.execute_batch(
+                "CREATE TEMP TRIGGER conflicting_retire AFTER UPDATE OF state ON effects
+                 WHEN NEW.id='conflicting-retire' AND NEW.state='inflight'
+                 BEGIN UPDATE effects SET state='refused' WHERE id=NEW.id; END;
+                 CREATE TEMP TRIGGER fatal_retire BEFORE UPDATE OF state ON effects
+                 WHEN NEW.id='fatal-retire' AND NEW.state='unknown'
+                 BEGIN SELECT RAISE(ABORT,'fixture settlement failure'); END;",
+            )?;
+            Ok(())
+        })
+        .await?;
+        let (_stop, stopped) = watch::channel(false);
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            fixture_work(fixture.config, Arc::clone(&fixture.store), stopped),
+        )
+        .await?;
+        assert_eq!(result, Err(Fault::Internal));
+        assert_eq!(
+            effect_state(&fixture.store, "conflicting-retire")?,
+            "refused"
+        );
+        assert_eq!(effect_state(&fixture.store, "next-retire")?, "unknown");
+        assert_eq!(effect_state(&fixture.store, "fatal-retire")?, "inflight");
+        assert_eq!(effect_state(&fixture.store, "unreached-retire")?, "queued");
         Ok(())
     }
 

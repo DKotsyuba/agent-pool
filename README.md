@@ -53,6 +53,9 @@ agent-pool serve --config /absolute/private/agent-pool/config.toml
 agent-pool mcp --config /absolute/private/agent-pool/config.toml
 ```
 
+Pool 0.2.3 recovers stale resident sockets on startup. Systemd units no longer
+require `ExecStartPre=rm -f pool.sock`.
+
 The second command belongs in the actual native host's MCP configuration so it
 receives protected original call metadata. Arbitrary shell invocations cannot
 invent a caller identity. The resident survives MCP frontend EOF. `get_status`,
