@@ -1,4 +1,4 @@
-{% if view == "overview" %}
+{% if view == "overview" or view == "members" %}{% if view == "overview" %}
 Pool {{ pool_id }} revision={{ revision }} {{ state }}
 {{ name|quote }} | Goal {{ purpose }}
 {% if latest_admission %}
@@ -8,14 +8,19 @@ Latest batch admission={{ latest_admission }}
 Structured acceptance. Read pool_get section=criteria.
 {% endif %}
 Seats {{ seat_count }} | ready={{ ready }} blocked={{ blocked }}
-{% for s in roster %}
+{% else %}
+Pool {{ pool_id }} revision={{ revision }} | members more={{ more }} next={{ next }}
+{% endif %}{% for s in roster %}
 {{ s.seat_id }} | {{ s.profile|quote }} | admission={{ s.admitted }}{% if s.retired %} retired=true{% endif %} joined={{ s.joined }} process={{ s.process }}{% if s.notice_undeliverable %} notice_undeliverable=true{% endif %}{% if s.agent_id %} run={{ s.agent_id }} sequence={{ s.sequence }}{% endif %} | {{ s.assignment }}
-{% endfor %}
+{% endfor %}{% if view == "overview" %}
+{% if omitted_retired %}+{{ omitted_retired }} more retired seats ({{ omitted_undeliverable }} undeliverable), see section=members.
+{% endif %}
 {% if proposal %}
 Proposal {{ proposal.id }} {{ proposal.state }} roster_key={{ proposal.roster_key }}
 {% endif %}
 {% if completion %}
 Completion {{ completion }}
+{% endif %}
 {% endif %}
 {% elif view == "history" %}
 Pool {{ pool_id }} revision={{ revision }} | history more={{ more }} next={{ next }}

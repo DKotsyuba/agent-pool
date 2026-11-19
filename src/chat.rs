@@ -189,6 +189,8 @@ pub(crate) struct Overview {
     pub state: &'static str,
     pub roster: Vec<SeatRow>,
     pub seat_count: usize,
+    pub omitted_retired: i64,
+    pub omitted_undeliverable: i64,
     pub ready: usize,
     pub blocked: usize,
     pub completion: Option<String>,
@@ -253,6 +255,13 @@ pub(crate) enum ChatReply {
     #[serde(skip)]
     Existing(Reply),
     Overview(Overview),
+    Members {
+        pool_id: String,
+        revision: u64,
+        roster: Vec<SeatRow>,
+        more: bool,
+        next: i64,
+    },
     History {
         pool_id: String,
         revision: u64,
@@ -537,7 +546,11 @@ async fn process_state(config: &Config, reply: &mut ChatReply) {
     let ChatReply::Overview(overview) = reply else {
         return;
     };
-    if !overview.roster.iter().any(|seat| seat.agent_id.is_some()) {
+    if !overview
+        .roster
+        .iter()
+        .any(|seat| !seat.retired && seat.agent_id.is_some())
+    {
         return;
     }
     let Ok(run_store) = integrations::run_store_identity(config).await else {
@@ -545,7 +558,8 @@ async fn process_state(config: &Config, reply: &mut ChatReply) {
     };
     let mut observations = tokio::task::JoinSet::new();
     for (index, seat) in overview.roster.iter().enumerate() {
-        if let Some(agent) = &seat.agent_id
+        if !seat.retired
+            && let Some(agent) = &seat.agent_id
             && seat.run_store_id.as_deref() == Some(&run_store)
         {
             let (agent, config) = (agent.clone(), config.clone());

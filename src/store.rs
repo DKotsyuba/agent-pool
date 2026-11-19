@@ -2109,6 +2109,10 @@ PRAGMA user_version=5;")?;
             }
             false
         };
+        // Close can cancel a claimed chat notice while its Run lookup is in flight.
+        if effect.state == "cancelled" && chat::is_notice(&tx, effect_id)? {
+            return Ok(());
+        }
         if [
             "accepted",
             "refused",
@@ -3219,6 +3223,7 @@ fn execute_authorized(
             p.closed = true;
             if chat_actor.is_some() {
                 chat::close_batches(db, pid)?;
+                chat::cancel_unsent_notices(db, pid)?;
             }
             stale(&mut p);
             closed_members = roster.clone();
@@ -4373,17 +4378,36 @@ fn view(
             let mut stmt = db.prepare(
                 "SELECT e.sequence,e.id,coalesce(e.member,n.member),e.state,e.data FROM effects e
                 LEFT JOIN chat_notice_targets n ON n.effect=e.id
-                WHERE e.pool=?1 AND e.sequence>?2 ORDER BY e.sequence LIMIT 21",
+                LEFT JOIN events journal ON journal.id=n.event
+                WHERE e.pool=?1 AND e.sequence>?2
+                    AND (n.effect IS NULL OR ?3
+                        OR (json_extract(journal.data,'$.recipient') IS NULL
+                            AND json_extract(journal.data,'$.kind')!='owner_message')
+                        OR json_extract(journal.data,'$.recipient')=?4
+                        OR json_extract(journal.data,'$.author.member_id')=?4)
+                ORDER BY e.sequence LIMIT 21",
             )?;
-            let rows = stmt.query_map(params![p.pool_id, sql_after], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, Option<String>>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, String>(4)?,
-                ))
-            })?;
+            let seat = match audience {
+                HistoryAudience::Member(id) => Some(id),
+                _ => None,
+            };
+            let rows = stmt.query_map(
+                params![
+                    p.pool_id,
+                    sql_after,
+                    matches!(audience, HistoryAudience::Full),
+                    seat
+                ],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                    ))
+                },
+            )?;
             for row in rows {
                 let (sequence, id, member_id, state, data) = row?;
                 let sequence = u64::try_from(sequence).map_err(|_| Fault::Internal)?;

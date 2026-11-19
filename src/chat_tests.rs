@@ -568,6 +568,36 @@ async fn complete_with_address(
         assert!(events.iter().any(|e| e["kind"] == "direct_message"));
         assert!(events.iter().any(|e| e["kind"] == "message_part"));
     }
+    let dm_effect = stored(&store, |store| {
+        Ok(store.test_db().query_row(
+            "SELECT n.effect FROM chat_notice_targets n JOIN events e ON e.id=n.event
+             WHERE json_extract(e.data,'$.kind')='direct_message'",
+            [],
+            |r| r.get::<_, String>(0),
+        )?)
+    })
+    .await?;
+    for owner in [false, true] {
+        let data = observe(
+            "get",
+            json!({"pool_id":batch.pool_id,"section":"deliveries"}),
+            owner,
+        )
+        .await?;
+        let rows = data["data"]["view"]["deliveries"]
+            .as_array()
+            .ok_or("deliveries")?;
+        let direct = rows.iter().find(|row| row["operation_id"] == dm_effect);
+        if owner {
+            assert_eq!(
+                direct.ok_or("owner direct delivery")?["member_id"],
+                batch.jobs[1].member_id
+            );
+        } else {
+            assert!(direct.is_none());
+            assert!(!rows.is_empty(), "public deliveries remain visible");
+        }
+    }
     let observer = crate::observer::Request {
         schema_version: 1,
         operation: crate::observer::Operation::CompletionGet(completion::GetRequest {
@@ -956,6 +986,15 @@ async fn chat_close_orders_with_first_send() -> Result<(), Box<dyn std::error::E
             state::begin_notice_send(store, second)?,
             state::NoticeSend::Cancel
         );
+        store.settle_effect(second, state::NOTICE_UNDELIVERABLE)?;
+        let due = state::due_notices(store, 4)?;
+        assert_eq!(due.len(), 3);
+        for notice in due {
+            assert!(matches!(
+                state::notice(store, &notice.effect_id)?,
+                state::Notice::Unresolved { closing: true, .. }
+            ));
+        }
         let ChatReply::Overview(overview) =
             state::owner_call(store, "pool_get", json!({"pool_id":pool_id}))?
         else {
@@ -964,6 +1003,170 @@ async fn chat_close_orders_with_first_send() -> Result<(), Box<dyn std::error::E
         assert_eq!(overview.seat_count, 0);
         assert_eq!(overview.roster.len(), 3);
         assert!(overview.roster.iter().all(|row| row.retired));
+        Ok(())
+    })
+    .await?;
+    Ok(())
+}
+
+/// Due retries keep their position ahead of a steady stream of new posts.
+#[tokio::test]
+async fn chat_retry_is_not_starved_by_new_posts() -> Result<(), Box<dyn std::error::Error>> {
+    let (_root, _config, store) = fixture()?;
+    let batch = reserve(&store, None).await?;
+    install(&store, &batch).await?;
+    stored(&store, move |store| {
+        let pid = batch.pool_id;
+        for revision in 1..=5 {
+            state::owner_call(
+                store,
+                "pool_post",
+                json!({"pool_id":pid,"expected_revision":revision,
+                "request_key":format!("post-{revision}"),"body":"message"}),
+            )?;
+            if revision == 1 {
+                continue;
+            }
+            let db = store.test_db();
+            let retry: String = db.query_row(
+                "SELECT effect FROM chat_notice_targets ORDER BY event,effect LIMIT 1",
+                [],
+                |r| r.get(0),
+            )?;
+            db.execute(
+                "UPDATE chat_notice_targets SET next_resolve_ms=1 WHERE effect=?1",
+                [&retry],
+            )?;
+            let claim = state::due_notices(store, 1)?.pop().ok_or(Fault::Internal)?;
+            assert_eq!(claim.effect_id, retry);
+            state::defer_notice(store, &retry)?;
+        }
+        Ok(())
+    })
+    .await?;
+    Ok(())
+}
+
+/// A retired managed seat stays absent from the owner chat read and triggers no Run RPC.
+#[tokio::test]
+async fn chat_owner_managed_overview_does_not_read_retired_seats()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_root, config, store) = fixture()?;
+    let pid = stored(&store, |store| {
+        let actor = crate::domain::Actor::verified("legacy owner".into(), "legacy", "owner")?;
+        let Reply::Receipt(created) = store.execute(
+            &actor,
+            &Command::Create(Create {
+                request_key: "managed".into(),
+                name: "Managed".into(),
+                purpose: "Persistent pool".into(),
+                acceptance: None,
+            }),
+        )?
+        else {
+            return Err(Fault::Internal);
+        };
+        let pid = created.pool_id;
+        let command = command(
+            "pool_add",
+            json!({"pool_id":pid,"expected_revision":1,
+            "request_key":"managed-seat","address":"test/codex/route/managed",
+            "name":"Seat","role":"review","task":"Review"}),
+        )?;
+        let Reply::Receipt(added) = store.execute(&actor, &command)? else {
+            return Err(Fault::Internal);
+        };
+        let seat = added.created_id.ok_or(Fault::Internal)?;
+        let db = store.test_db();
+        let (mut binding, _) = crate::store::binding_any(db, &seat)?;
+        binding.run_id = Some(agent(0));
+        binding.run_store_id = Some(RUN_STORE.into());
+        binding.run_sequence = Some(1);
+        crate::store::save_binding(db, &binding, false)?;
+        Ok(pid)
+    })
+    .await?;
+    let run_path = config.run_socket.as_ref().ok_or("Run socket")?;
+    let run = UnixListener::bind(run_path)?;
+    fs::set_permissions(run_path, fs::Permissions::from_mode(0o600))?;
+    let read = OwnerRequest {
+        tool: "pool_get".into(),
+        arguments: json!({"pool_id":pid}),
+    };
+    let ChatReply::Overview(overview) = owner_call(read, &config, &store).await? else {
+        return Err("overview".into());
+    };
+    assert!(overview.roster.is_empty());
+    assert_eq!(overview.omitted_retired, 0);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(20), run.accept())
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
+/// The overview caps its retired block and the members cursor exposes every failure.
+#[tokio::test]
+async fn chat_owner_pages_retired_seats_and_failures() -> Result<(), Box<dyn std::error::Error>> {
+    let (_root, _config, store) = fixture()?;
+    let mut args = input(None);
+    args["members"] = json!(vec![spec("review"); 8]);
+    let batch = stored(&store, move |store| state::start(store, parse(args)?)).await?;
+    install(&store, &batch).await?;
+    let templates = renderer()?;
+    stored(&store, move |store| {
+        let pid = batch.pool_id;
+        state::owner_call(
+            store,
+            "pool_post",
+            json!({"pool_id":pid,"expected_revision":1,
+            "request_key":"post-before-close","body":"Test"}),
+        )?;
+        for notice in state::due_notices(store, 8)? {
+            store.settle_effect(&notice.effect_id, state::NOTICE_UNDELIVERABLE)?;
+        }
+        state::owner_call(
+            store,
+            "pool_close",
+            json!({"pool_id":pid,"expected_revision":2,"request_key":"close"}),
+        )?;
+        let overview = state::owner_call(store, "pool_get", json!({"pool_id":pid}))?;
+        let ChatReply::Overview(view) = &overview else {
+            return Err(Fault::Internal);
+        };
+        assert_eq!(view.roster.len(), 5);
+        assert_eq!((view.omitted_retired, view.omitted_undeliverable), (3, 3));
+        let text = serde_json::to_string(&present(Ok(overview), templates))
+            .map_err(|_| Fault::Internal)?;
+        assert!(text.contains("+3 more retired seats (3 undeliverable), see section=members."));
+        let mut ids = std::collections::BTreeSet::new();
+        for (after, size, more) in [("0", 5, true), ("5", 3, false)] {
+            let reply = state::owner_call(
+                store,
+                "pool_get",
+                json!({"pool_id":pid,"section":"members","after":after}),
+            )?;
+            let ChatReply::Members {
+                roster,
+                more: has_more,
+                next,
+                ..
+            } = &reply
+            else {
+                return Err(Fault::Internal);
+            };
+            assert_eq!((roster.len(), *has_more), (size, more));
+            assert_eq!(*next, if more { 5 } else { 8 });
+            for seat in roster {
+                assert!(seat.retired && seat.notice_undeliverable);
+                assert!(ids.insert(seat.seat_id.clone()));
+            }
+            let text = serde_json::to_string(&present(Ok(reply), templates))
+                .map_err(|_| Fault::Internal)?;
+            assert!(text.contains("retired=true") && text.contains("notice_undeliverable=true"));
+        }
+        assert_eq!(ids.len(), 8);
         Ok(())
     })
     .await?;
