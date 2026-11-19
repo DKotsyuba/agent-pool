@@ -11,8 +11,8 @@ its EOF never starts, stops or replaces the resident.
 - `domain.rs` defines strict flat commands, safe public views and private outbox work.
 - `store.rs` owns the single SQLite writer and synchronous transactions. A process
   lifetime file lock excludes a second writer. WAL, full synchronization, foreign
-  keys and schema version 18 are explicit. Future schema versions refuse to open.
-  Schema v1–v17 upgrades transactionally to v18 before use. Schema v17 adds the
+  keys and schema version 19 are explicit. Future schema versions refuse to open.
+  Schema v1–v18 upgrades transactionally to v19 before use. Schema v17 adds the
   private Run pin credential table. The v5 replacement
   and stable-slot migration and v6 inventory revision fence remain in that upgrade.
   v16 records every non-current incarnation as `removed`; every open then settles
@@ -1166,9 +1166,13 @@ sending an owner command. Allowed owners share authority over chat pools.
 Legacy managed pools continue using their existing mutation route.
 
 Start commits the pool, ordered seats and exact Run batch in one SQLite
-transaction. The resident processes one pending batch at a time. For open pools it pins Run's store identity and retries start_batch with the original request ID and jobs.
-For closed pools it reads receipts only. Confirmed absence settles the batch as
-not launched, and an admitted receipt is installed on retired seats.
+transaction. The resident processes one pending batch at a time. For open pools
+it pins Run's store identity and retries start_batch with the original request
+ID and jobs. For closed pools it reads receipts only. A miss keeps possible
+sends pending and backs off the next lookup, starting at 5 seconds and capping
+at 10 minutes. After 15 minutes the overview labels admission as launch
+unconfirmed. Late receipts are installed on retired seats. Only never-sent
+batches settle as not launched at close.
 Ordered receipt rows install Run lineage IDs atomically. A seat may join once
 its admission is recorded. Replacement requires a pool revision, retires the
 old seat at reservation and invalidates the open proposal. It reports the prior

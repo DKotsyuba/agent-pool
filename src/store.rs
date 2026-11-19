@@ -1538,6 +1538,9 @@ PRAGMA user_version=5;")?;
         if version < 18 {
             chat::migrate(&db)?;
         }
+        if version < 19 {
+            chat::migrate_closed_reconciliation(&db)?;
+        }
         if version < crate::completion::SCHEMA_VERSION {
             db.execute_batch("COMMIT;")?;
         }
@@ -3208,7 +3211,7 @@ fn execute_authorized(
         Command::Close(_) => {
             p.closed = true;
             if chat_actor.is_some() {
-                chat::cancel_unsubmitted(db, pid)?;
+                chat::close_batches(db, pid)?;
             }
             stale(&mut p);
             closed_members = roster.clone();

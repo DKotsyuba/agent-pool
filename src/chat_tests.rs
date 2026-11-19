@@ -625,7 +625,7 @@ async fn chat_migrates_v17_without_changing_old_pool() -> Result<(), Box<dyn std
         upgraded
             .test_db()
             .query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))?,
-        18
+        19
     );
     let ChatReply::Overview(old) =
         state::owner_call(&mut upgraded, "pool_get", json!({"pool_id":pid}))?
@@ -639,19 +639,27 @@ async fn chat_migrates_v17_without_changing_old_pool() -> Result<(), Box<dyn std
     Ok(())
 }
 
-/// A closed batch uses receipt lookup only and exposes its terminal admission fate.
+/// Absence is provisional, including after backoff and the overview grace window.
 #[tokio::test]
-async fn chat_closed_batch_settles_from_receipt() -> Result<(), Box<dyn std::error::Error>> {
-    for found in [false, true] {
-        let (_root, config, store) = fixture()?;
-        let socket = config.run_socket.as_ref().ok_or("fixture Run socket")?;
-        let listener = UnixListener::bind(socket)?;
-        fs::set_permissions(socket, fs::Permissions::from_mode(0o600))?;
-        let batch = reserve(&store, None).await?;
-        let id = batch.id.clone();
-        stored(&store, move |store| state::fence(store, &id, RUN_STORE)).await?;
-        owner_call(OwnerRequest { tool:"pool_close".into(), arguments:json!({"pool_id":batch.pool_id,"expected_revision":1,"request_key":"close"}) },&config,&store).await?;
-        let mock = tokio::spawn(async move {
+async fn chat_closed_batch_records_late_receipt() -> Result<(), Box<dyn std::error::Error>> {
+    let (_root, config, store) = fixture()?;
+    let socket = config.run_socket.as_ref().ok_or("fixture Run socket")?;
+    let listener = UnixListener::bind(socket)?;
+    fs::set_permissions(socket, fs::Permissions::from_mode(0o600))?;
+    let batch = reserve(&store, None).await?;
+    let id = batch.id.clone();
+    stored(&store, move |store| state::fence(store, &id, RUN_STORE)).await?;
+    owner_call(
+        OwnerRequest {
+            tool: "pool_close".into(),
+            arguments: json!({"pool_id":batch.pool_id,"expected_revision":1,"request_key":"close"}),
+        },
+        &config,
+        &store,
+    )
+    .await?;
+    let mock = tokio::spawn(async move {
+        for found in [false, true] {
             let (mut stream, _) = listener.accept().await?;
             let request: Value =
                 serde_json::from_slice(&integrations::read_frame(&mut stream).await?)?;
@@ -666,32 +674,83 @@ async fn chat_closed_batch_settles_from_receipt() -> Result<(), Box<dyn std::err
                 &json!({"jsonrpc":"2.0","id":request["id"],"result":result}),
             )
             .await?;
-            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
-        });
-        reconcile(&config, &store, &mut String::new()).await?;
-        mock.await?.map_err(|error| error.to_string())?;
-        let expected = if found { "admitted" } else { "not_launched" };
-        let pool_id = batch.pool_id.clone();
-        let ChatReply::Overview(view) = stored(&store, move |store| {
-            state::owner_call(store, "pool_get", json!({"pool_id":pool_id}))
-        })
-        .await?
+        }
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+    });
+    reconcile(&config, &store, &mut String::new()).await?;
+    let id = batch.id.clone();
+    let pool_id = batch.pool_id.clone();
+    stored(&store, move |store| {
+        assert!(state::next_batch(store, "")?.is_none());
+        let (status, delay, next): (String, i64, i64) = store.test_db().query_row(
+            "SELECT state,receipt_delay_ms,next_receipt_ms FROM chat_batches WHERE id=?1",
+            [&id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(status, "pending");
+        assert_eq!(delay, 10_000);
+        assert!(next > i64::try_from(crate::observer::now()?).map_err(|_| Fault::Internal)?);
+        // Advance the persisted schedule without sleeping through the grace period.
+        store.test_db().execute(
+            "UPDATE chat_batches SET closed_at_ms=0,next_receipt_ms=0 WHERE id=?1",
+            [&id],
+        )?;
+        let ChatReply::Overview(view) =
+            state::owner_call(store, "pool_get", json!({"pool_id":pool_id}))?
         else {
-            return Err("overview".into());
+            return Err(Fault::Internal);
         };
-        assert_eq!(view.latest_admission.as_deref(), Some(expected));
-        let ChatReply::Launch { state, seats, .. } =
-            stored(&store, move |store| state::launch_read(store, &batch)).await?
-        else {
-            return Err("launch".into());
+        assert_eq!(
+            view.latest_admission.as_deref(),
+            Some("launch unconfirmed (closed pool)")
+        );
+        Ok(())
+    })
+    .await?;
+    reconcile(&config, &store, &mut String::new()).await?;
+    mock.await?.map_err(|error| error.to_string())?;
+    let ChatReply::Launch { state, seats, .. } =
+        stored(&store, move |store| state::launch_read(store, &batch)).await?
+    else {
+        return Err("launch".into());
+    };
+    assert_eq!(state, "admitted");
+    for (index, seat) in seats.iter().enumerate() {
+        assert!(!seat.current);
+        assert_eq!(seat.agent_id.as_deref(), Some(agent(index).as_str()));
+    }
+    Ok(())
+}
+
+/// Close settles a batch that never reached a possible-send decision.
+#[tokio::test]
+async fn chat_closed_never_sent_batch_settles_immediately() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (_root, config, store) = fixture()?;
+    let batch = reserve(&store, None).await?;
+    owner_call(
+        OwnerRequest {
+            tool: "pool_close".into(),
+            arguments: json!({"pool_id":batch.pool_id,"expected_revision":1,"request_key":"close"}),
+        },
+        &config,
+        &store,
+    )
+    .await?;
+    stored(&store, move |store| {
+        assert!(state::next_batch(store, "")?.is_none());
+        let ChatReply::Launch { state, seats, .. } = state::launch_read(store, &batch)? else {
+            return Err(Fault::Internal);
         };
-        assert_eq!(state, expected);
+        assert_eq!(state, "not_launched");
         assert!(
             seats
                 .iter()
-                .all(|seat| !seat.current && seat.agent_id.is_some() == found)
+                .all(|seat| !seat.current && seat.agent_id.is_none())
         );
-    }
+        Ok(())
+    })
+    .await?;
     Ok(())
 }
 
@@ -736,5 +795,45 @@ async fn chat_invalid_spec_settles_refused() -> Result<(), Box<dyn std::error::E
             .iter()
             .all(|seat| seat.admitted == "refused" && seat.agent_id.is_none())
     );
+    Ok(())
+}
+
+/// Upgrade reopens a v18 closed batch incorrectly finalized on an absent receipt.
+#[tokio::test]
+async fn chat_migration_recovers_closed_receipt_miss() -> Result<(), Box<dyn std::error::Error>> {
+    let (_root, config, store) = fixture()?;
+    let batch = reserve(&store, None).await?;
+    let id = batch.id.clone();
+    stored(&store, move |store| state::fence(store, &id, RUN_STORE)).await?;
+    owner_call(
+        OwnerRequest {
+            tool: "pool_close".into(),
+            arguments: json!({"pool_id":batch.pool_id,"expected_revision":1,"request_key":"close"}),
+        },
+        &config,
+        &store,
+    )
+    .await?;
+    let id = batch.id.clone();
+    stored(&store, move |store| {
+        store.test_db().execute(
+            "UPDATE chat_batches SET state='not_launched' WHERE id=?1",
+            [id],
+        )?;
+        store.test_db().execute_batch(
+            "ALTER TABLE chat_batches DROP COLUMN closed_at_ms;
+          ALTER TABLE chat_batches DROP COLUMN next_receipt_ms;
+          ALTER TABLE chat_batches DROP COLUMN receipt_delay_ms;
+          PRAGMA user_version=18;",
+        )?;
+        Ok(())
+    })
+    .await?;
+    drop(store);
+    let upgraded = crate::store::Store::open(&config.database_path)?;
+    let pending = state::next_batch(&upgraded, "")?.ok_or("closed batch must be recoverable")?;
+    assert_eq!(pending.id, batch.id);
+    assert!(pending.closed);
+    assert_eq!(pending.run_store.as_deref(), Some(RUN_STORE));
     Ok(())
 }

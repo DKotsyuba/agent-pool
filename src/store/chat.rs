@@ -421,9 +421,9 @@ pub(crate) fn admitted(
     Ok(())
 }
 
-/// Cancels a batch that has not been fenced or submitted to Run.
-pub(super) fn cancel_unsubmitted(db: &Connection, pool: &str) -> Result<(), Fault> {
-    db.execute("UPDATE chat_batches SET state='not_launched' WHERE pool=?1 AND state='pending' AND run_store IS NULL", [pool])?;
+/// Settles never-sent work and timestamps possible sends for receipt-only recovery.
+pub(super) fn close_batches(db: &Connection, pool: &str) -> Result<(), Fault> {
+    db.execute("UPDATE chat_batches SET state=CASE WHEN run_store IS NULL THEN 'not_launched' ELSE state END, closed_at_ms=?2 WHERE pool=?1 AND state='pending'",params![pool,receipt_clock()?])?;
     Ok(())
 }
 
@@ -771,8 +771,10 @@ pub(crate) fn get(db: &Connection, input: GetPool, seat: Option<&str>) -> Result
     Ok(ChatReply::Overview(Overview {
         latest_admission: db
             .query_row(
-                "SELECT state FROM chat_batches WHERE pool=?1 ORDER BY rowid DESC LIMIT 1",
-                [&input.pool_id],
+                "SELECT CASE WHEN state='pending' AND closed_at_ms<=?2-900000
+                    THEN 'launch unconfirmed (closed pool)' ELSE state END
+                  FROM chat_batches WHERE pool=?1 ORDER BY rowid DESC LIMIT 1",
+                params![input.pool_id, receipt_clock()?],
                 |row| row.get(0),
             )
             .optional()?,
@@ -922,8 +924,8 @@ pub(crate) fn next_batch(store: &Store, after: &str) -> Result<Option<ChatBatch>
     let id: Option<String> = store
         .db
         .query_row(
-            "SELECT id FROM chat_batches WHERE state='pending' ORDER BY id<=?1,id LIMIT 1",
-            [after],
+            "SELECT id FROM chat_batches WHERE state='pending' AND next_receipt_ms<=?2 ORDER BY id<=?1,id LIMIT 1",
+            params![after,receipt_clock()?],
             |row| row.get(0),
         )
         .optional()?;
@@ -975,4 +977,46 @@ pub(super) fn project_seat(
         joined: binding.member.state == MemberState::Active,
     });
     Ok(())
+}
+
+/// Persists receipt retry timing and reopens batches previously settled from a miss.
+pub(super) fn migrate_closed_reconciliation(db: &Connection) -> Result<(), Fault> {
+    let installed: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('chat_batches') WHERE name='closed_at_ms')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !installed {
+        db.execute_batch(
+            "
+            ALTER TABLE chat_batches ADD COLUMN closed_at_ms INTEGER;
+            ALTER TABLE chat_batches ADD COLUMN next_receipt_ms INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE chat_batches ADD COLUMN receipt_delay_ms INTEGER NOT NULL DEFAULT 5000;
+        ",
+        )?;
+    }
+    db.execute(
+        "UPDATE chat_batches SET state='pending',closed_at_ms=COALESCE(closed_at_ms,?1)
+         WHERE run_store IS NOT NULL AND state IN ('pending','not_launched')
+           AND pool IN (SELECT id FROM pools WHERE json_extract(data,'$.closed'))",
+        [receipt_clock()?],
+    )?;
+    db.execute_batch("PRAGMA user_version=19;")?;
+    Ok(())
+}
+
+/// Delays the next receipt lookup after a miss or an unavailable Run endpoint.
+pub(crate) fn defer_receipt(store: &mut Store, id: &str) -> Result<(), Fault> {
+    store.db.execute(
+        "UPDATE chat_batches SET next_receipt_ms=?2+receipt_delay_ms,
+            receipt_delay_ms=min(600000,2*receipt_delay_ms)
+         WHERE id=?1 AND state='pending' AND closed_at_ms IS NOT NULL",
+        params![id, receipt_clock()?],
+    )?;
+    Ok(())
+}
+
+/// SQLite stores receipt timestamps as signed millisecond integers.
+fn receipt_clock() -> Result<i64, Fault> {
+    i64::try_from(crate::observer::now()?).map_err(|_| Fault::Unavailable)
 }
