@@ -3656,14 +3656,13 @@ pub async fn serve(config_path: &Path) -> Result<(), Fault> {
 
 /// Executes/reconciles one persisted effect and records its truthful terminal or unknown state.
 /// Provider awaits happen outside SQLite transactions; frozen parameters precede any publish write.
-async fn effect(
+pub(crate) async fn effect(
     store: &SharedStore,
     config: &Config,
     effect: Effect,
     reconcile: bool,
 ) -> Result<(), Fault> {
     let mut effect = effect;
-    let mut reconcile = reconcile;
     let single_batch = effect.is_single_batch()?;
     let state = match &effect.work {
         Work::Deliver { .. } => {
@@ -3677,6 +3676,7 @@ async fn effect(
             let id = effect.effect_id.clone();
             use crate::store::chat::Notice;
             let notice = stored(store, move |store| crate::store::chat::notice(store, &id)).await?;
+            let reconcile = reconcile && !matches!(notice, Notice::Unresolved { .. });
             match notice {
                 Notice::Legacy => (),
                 Notice::Cancelled => return settle(store, effect.effect_id, "cancelled").await,
@@ -3690,16 +3690,33 @@ async fn effect(
                         .unwrap_or("unknown");
                     return settle(store, effect.effect_id, result).await;
                 }
-                Notice::Unresolved(binding) => {
-                    // No persisted publication means this notice has never been sent.
-                    reconcile = false;
+                Notice::Undeliverable => {
+                    return settle(
+                        store,
+                        effect.effect_id,
+                        crate::store::chat::NOTICE_UNDELIVERABLE,
+                    )
+                    .await;
+                }
+                Notice::Unresolved { binding, closing } => {
                     let Ok(Some(address)) = tokio::time::timeout(
                         std::time::Duration::from_secs(2),
                         crate::chat::notice_address(config, &binding),
                     )
                     .await
                     else {
-                        return settle(store, effect.effect_id, "cancelled").await;
+                        if closing {
+                            return settle(
+                                store,
+                                effect.effect_id,
+                                crate::store::chat::NOTICE_UNDELIVERABLE,
+                            )
+                            .await;
+                        }
+                        return stored(store, move |store| {
+                            crate::store::chat::defer_notice(store, &effect.effect_id)
+                        })
+                        .await;
                     };
                     if let Work::Deliver {
                         address: target, ..
@@ -7551,7 +7568,7 @@ mod tests {
             )?;
             guard
                 .test_db()
-                .execute_batch("DROP TABLE run_pin_release_tokens; PRAGMA user_version=16;")?;
+                .execute_batch("DROP TABLE chat_notice_targets; DROP TABLE run_pin_release_tokens; PRAGMA user_version=16;")?;
         }
         drop(fixture.store);
         fixture.store = Arc::new(Mutex::new(Store::open(&fixture.config.database_path)?));

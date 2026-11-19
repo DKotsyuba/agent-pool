@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.2.1
+
+### Fixed
+
+- Chat member notices use Bridge for public messages, direct messages, vote requests, owner posts, completion and closure. Pool retries unresolved member addresses with bounded backoff and records `notice_undeliverable` for owners and observers when resolution fails. Notices are best effort and history remains durable.
+
+### Changed
+
+- Store schema v19 persists notice retry schedules and event/seat uniqueness. Before upgrade, take a private WAL-consistent backup. Pool 0.2.0 refuses a v19 store.
+
 ## 0.2.0
 
 Feature release, 2026-11-19. Qualification fields are unchanged from 0.1.0: `x86_64-unknown-linux-gnu` on the host `dobi`; this release ships that target only.

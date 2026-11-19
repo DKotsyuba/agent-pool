@@ -206,6 +206,7 @@ pub(crate) struct SeatRow {
     pub sequence: Option<u64>,
     pub agent_id: Option<String>,
     pub admitted: String,
+    pub notice_undeliverable: bool,
     pub joined: bool,
     pub process: String,
 }

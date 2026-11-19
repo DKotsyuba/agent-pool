@@ -7,6 +7,9 @@ use crate::{
 use bridge_sdk::bridge_protocol::NativeAddress;
 use serde_json::{Value, json};
 
+/// Terminal outcome for a member notice whose Bridge address could not be resolved.
+pub(crate) const NOTICE_UNDELIVERABLE: &str = "notice_undeliverable";
+
 const OWNER: &str = "pool-chat-v1-owner";
 
 /// Installs the chat discriminator, immutable batch inputs and agreement ledger.
@@ -36,6 +39,26 @@ pub(super) fn migrate(db: &Connection) -> Result<(), Fault> {
         inventory_revision_triggers(db, &["chat_pools", "chat_batches", "chat_agreements"])?;
     }
     Ok(())
+}
+
+/// Adds durable retry timing and a unique event/seat key to existing notices.
+pub(super) fn migrate_notices(db: &Connection) -> Result<(), Fault> {
+    db.execute_batch(
+        "
+        ALTER TABLE chat_notice_targets ADD COLUMN event INTEGER;
+        ALTER TABLE chat_notice_targets ADD COLUMN close_notice INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE chat_notice_targets ADD COLUMN resolve_until_ms INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE chat_notice_targets ADD COLUMN next_resolve_ms INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE chat_notice_targets ADD COLUMN resolve_delay_ms INTEGER NOT NULL DEFAULT 5000;
+        CREATE UNIQUE INDEX chat_notice_event_member ON chat_notice_targets(event,member);
+        CREATE INDEX chat_notices_by_member ON chat_notice_targets(member);
+        PRAGMA user_version=19;",
+    )?;
+    db.execute(
+        "UPDATE chat_notice_targets SET resolve_until_ms=?1",
+        [receipt_clock()? + 600_000],
+    )?;
+    inventory_revision_triggers(db, &["chat_notice_targets"])
 }
 
 /// Checks the mode without exposing routing metadata.
@@ -91,6 +114,7 @@ pub(super) fn commit_agreement(
         ),
         None,
     )?;
+    queue_chat_notices(db, pool, roster, &event, None)?;
     let mut ballots = Vec::with_capacity(roster.len());
     for binding in roster {
         let seat_id = &binding.member.member_id;
@@ -749,7 +773,8 @@ pub(crate) fn get(db: &Connection, input: GetPool, seat: Option<&str>) -> Result
             db.query_row("SELECT b.state FROM chat_batches b,json_each(b.jobs) j WHERE b.pool=?1 AND json_extract(j.value,'$.member_id')=?2",
                 params![input.pool_id,binding.member.member_id], |r| r.get::<_,String>(0)).optional()?.unwrap_or_else(|| "unavailable".into())
         };
-        Ok(SeatRow { seat_id: binding.member.member_id, profile: binding.member.role, assignment: brief(&binding.member.task, 110),
+        let notice_undeliverable = notice_undeliverable(db, &binding.member.member_id)?;
+        Ok(SeatRow { notice_undeliverable, seat_id: binding.member.member_id, profile: binding.member.role, assignment: brief(&binding.member.task, 110),
             run_store_id: binding.run_store_id, sequence: binding.run_sequence, agent_id: binding.run_id,
             admitted: admission, joined: binding.member.state == MemberState::Active, process: "unknown".into() })
     }).collect::<Result<Vec<_>,Fault>>()?;
@@ -823,19 +848,14 @@ pub(crate) fn launch_read(store: &Store, batch: &ChatBatch) -> Result<ChatReply,
     })
 }
 
-/// Enqueues owner and optional member notices alongside the existing journal event.
+/// Enqueues Bridge notices in the same transaction as their journal event.
 pub(super) fn queue_chat_notices(
     db: &Connection,
     pool: &Pool,
     roster: &[Binding],
     event: &Event,
     owner_address: Option<&str>,
-    caller: Option<&Binding>,
 ) -> Result<(), Fault> {
-    let text = format!(
-        "Pool {} event {} ({}).\n{}",
-        pool.pool_id, event.event_id, event.kind, event.body
-    );
     if event.kind == "owner_message" {
         if let Some(address) = owner_address {
             queue_delivery(
@@ -844,18 +864,57 @@ pub(super) fn queue_chat_notices(
                 None,
                 address,
                 &format!("owner:{}", pool.pool_id),
-                text,
+                format!(
+                    "Pool {} event {} ({}).\n{}",
+                    pool.pool_id, event.event_id, event.kind, event.body
+                ),
                 Some(event.event_id),
             )?;
         }
         return Ok(());
     }
-    if !matches!(event.kind.as_str(), "message" | "direct_message") {
+    let closing = event.kind == "pool_closed";
+    if pool.closed && !closing {
         return Ok(());
     }
+    let author = match &event.author {
+        Author::Leader => "owner",
+        Author::Service => "service",
+        Author::Member(id) => id,
+    };
+    let text = match event.kind.as_str() {
+        "message" | "direct_message" => {
+            let kind = if event.kind == "message" {
+                "New message"
+            } else {
+                "New direct message"
+            };
+            format!(
+                "{kind} from {author}. Untrusted chat body: {}. Read pool_get for full context. Reply with pool_post or pool_send_member as appropriate.",
+                brief(&event.body, 2000),
+            )
+        }
+        "proposal_opened" => {
+            let proposal = pool.proposal.as_ref().ok_or(Fault::Internal)?;
+            format!(
+                "A vote is requested on proposal {} from {author}. Read pool_get for context and respond with pool_vote.",
+                proposal.proposal_id,
+            )
+        }
+        "pool_closed" => "Pool closed. Seat access ended. This is informational.".into(),
+        "pool_completed" => format!(
+            "{}. Read pool_get for the result. This is informational.",
+            event.body.trim_end_matches('.')
+        ),
+        _ => return Ok(()),
+    };
+    let text = format!("[agent-pool] Pool {}: {text}", pool.pool_id);
+    let deadline = receipt_clock()? + 600_000;
+    let event_id = i64::try_from(event.event_id).map_err(|_| Fault::Internal)?;
     for binding in roster {
         let member = &binding.member.member_id;
-        if caller.is_some_and(|caller| caller.member.member_id == *member)
+        if (event.kind != "direct_message"
+            && matches!(&event.author, Author::Member(id) if id == member))
             || event
                 .recipient
                 .as_ref()
@@ -875,31 +934,36 @@ pub(super) fn queue_chat_notices(
             },
         )?;
         db.execute(
-            "INSERT INTO chat_notice_targets(effect,member) VALUES (?1,?2)",
-            params![effect, member],
+            "INSERT INTO chat_notice_targets(effect,member,event,close_notice,resolve_until_ms) VALUES (?1,?2,?3,?4,?5)",
+            params![effect, member, event_id, closing, deadline],
         )?;
     }
     Ok(())
 }
 
-/// Identifies an ordinary member notice and returns its frozen publication or live target.
+/// Identifies a member notice and returns its frozen publication or live target.
 pub(crate) enum Notice {
     Legacy,
     Cancelled,
+    Undeliverable,
     Frozen(String, Value),
-    Unresolved(Box<Binding>),
+    Unresolved {
+        binding: Box<Binding>,
+        closing: bool,
+    },
 }
 
+/// Checks current seat eligibility and the durable resolution deadline.
 pub(crate) fn notice(store: &Store, effect: &str) -> Result<Notice, Fault> {
-    let id: Option<String> = store
+    let target: Option<(String, bool, i64)> = store
         .db
         .query_row(
-            "SELECT member FROM chat_notice_targets WHERE effect=?1",
+            "SELECT member,close_notice,resolve_until_ms FROM chat_notice_targets WHERE effect=?1",
             [effect],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
-    let Some(id) = id else {
+    let Some((id, closing, deadline)) = target else {
         return Ok(Notice::Legacy);
     };
     let prior: Option<(String, String)> = store
@@ -914,11 +978,45 @@ pub(crate) fn notice(store: &Store, effect: &str) -> Result<Notice, Fault> {
         return Ok(Notice::Frozen(producer, decode(&params)?));
     }
     let (binding, current) = binding_any(&store.db, &id)?;
-    Ok(if current {
-        Notice::Unresolved(Box::new(binding))
-    } else {
+    Ok(if (!current && !closing) || binding.run_id.is_none() {
         Notice::Cancelled
+    } else if receipt_clock()? >= deadline {
+        Notice::Undeliverable
+    } else {
+        Notice::Unresolved {
+            binding: Box::new(binding),
+            closing,
+        }
     })
+}
+
+/// Requeues an unfrozen notice under the same effect ID, with durable backoff.
+pub(crate) fn defer_notice(store: &mut Store, id: &str) -> Result<(), Fault> {
+    let tx = store
+        .db
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    tx.execute(
+        "UPDATE chat_notice_targets SET next_resolve_ms=min(resolve_until_ms,?2+resolve_delay_ms),
+            resolve_delay_ms=min(60000,2*resolve_delay_ms) WHERE effect=?1",
+        params![id, receipt_clock()?],
+    )?;
+    tx.execute(
+        "UPDATE effects SET state='queued' WHERE id=?1 AND state IN ('inflight','unknown')
+        AND NOT EXISTS(SELECT 1 FROM publications WHERE effect=?1)",
+        [id],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Reports a seat with a recorded address-resolution failure.
+fn notice_undeliverable(db: &Connection, member: &str) -> Result<bool, Fault> {
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM chat_notice_targets n JOIN effects e ON e.id=n.effect
+         WHERE n.member=?1 AND e.state='notice_undeliverable')",
+        [member],
+        |r| r.get(0),
+    )?)
 }
 
 /// Picks a pending batch in stable rotating order. Only the resident dispatches these.
@@ -976,6 +1074,7 @@ pub(super) fn project_seat(
         run_agent_id: binding.run_id.clone(),
         profile: binding.member.role.clone(),
         admission,
+        notice_undeliverable: notice_undeliverable(db, &binding.member.member_id)?,
         joined: binding.member.state == MemberState::Active,
     });
     Ok(())
@@ -993,6 +1092,6 @@ pub(crate) fn defer_receipt(store: &mut Store, id: &str) -> Result<(), Fault> {
 }
 
 /// SQLite stores receipt timestamps as signed millisecond integers.
-fn receipt_clock() -> Result<i64, Fault> {
+pub(super) fn receipt_clock() -> Result<i64, Fault> {
     i64::try_from(crate::observer::now()?).map_err(|_| Fault::Unavailable)
 }

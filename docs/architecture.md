@@ -1186,12 +1186,26 @@ Run checks the calling attempt. Pool derives author and replay identity from
 the relay. A retired seat cannot read or write even on an exact retry, and
 closing a pool revokes all seats. Direct history is restricted to the sender,
 recipient and authorized owners. Owner messages are visible to their sender and
-authorized owners. Notices use the existing durable outbox. Member notices use
-Run's current native destination when available, and the optional initiating
-Bridge address routes owner notices. Delivery is best effort.
+authorized owners. The durable outbox publishes member notices through Bridge.
+A public message reaches current admitted seats other than its author, a direct
+message reaches only its recipient, and a proposal requests votes from current
+admitted peers. Owner posts reach all current admitted seats. Completion and
+closure send informational notices. The optional initiating Bridge address
+continues to route member-to-owner messages and agreement notices.
+
+Before freezing a member publication, Pool resolves the latest Run execution
+through `agent_integration` against the seat's recorded Run store. Unresolved
+addresses retry after 5 seconds, doubling to 60 seconds, within a ten-minute
+window. A close notice gets one lookup for each seat current at closure. Retired
+seats and ordinary notices for closed pools are skipped before publication.
+Unresolved notices settle as `notice_undeliverable`, exposed as a historical
+per-seat fact in the owner overview and observer. The journal remains readable
+by authorized callers throughout. Bridge custody or an observed address alone
+does not prove a new turn began.
 
 Schema v18 adds chat pool metadata, durable batch intents, notice target mappings
-and the immutable agreement ledger. All current seats must join, and every seat
+and the immutable agreement ledger. Schema v19 adds durable retry timing and
+one notice intent per event and seat. All current seats must join, and every seat
 must cast a ready vote on the same proposal and unchanged roster. The qualifying
 vote writes the agreement, vote event references and completion event in the same
 transaction. A completion notice is queued when the initiating address is known.

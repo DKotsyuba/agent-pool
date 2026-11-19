@@ -846,6 +846,9 @@ pub struct ChatSeat {
     pub profile: String,
     /// Pending, admitted, refused, or unknown.
     pub admission: String,
+    /// Whether any notice to this seat expired without a Bridge address.
+    #[serde(default)]
+    pub notice_undeliverable: bool,
     /// Whether this seat joined.
     pub joined: bool,
 }
