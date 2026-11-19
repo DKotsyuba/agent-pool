@@ -1459,7 +1459,7 @@ impl Store {
                     }
                     std::thread::sleep(SETTLE_POLL.min(remaining));
                 }
-                Err(_) => return Err(Fault::Unavailable),
+                Err(_) => return Err(Fault::Conflict),
             }
         }
         let file = OpenOptions::new()
@@ -1704,14 +1704,6 @@ PRAGMA user_version=5;")?;
         tx.commit()?;
         Ok(Some(effect))
     }
-    /// Releases a failed dispatch claim for reconciliation while preserving any newer outcome.
-    pub(crate) fn defer_effect(&mut self, effect_id: &str) -> Result<(), Fault> {
-        self.db.execute(
-            "UPDATE effects SET state='unknown' WHERE id=?1 AND state='inflight'",
-            [effect_id],
-        )?;
-        Ok(())
-    }
     /// Returns at most 32 uncertain effects for status reconciliation, never automatic new IDs.
     pub fn pending_unknown(&mut self) -> Result<Vec<Effect>, Fault> {
         let mut stmt=self.db.prepare("SELECT sequence,data,state FROM effects e WHERE state IN ('unknown','custody') AND sequence>?1 AND json_extract(e.data,'$.work.address') IS NOT 'pool-chat-unresolved' ORDER BY sequence LIMIT 32")?;
@@ -1944,6 +1936,8 @@ PRAGMA user_version=5;")?;
     }
 
     /// Freezes one proven Run tip before any conditioned replacement admission can be sent.
+    /// A lost claim preserves the current owner. A conflicting sample under the same claim
+    /// defers to the already frozen condition and original request key.
     pub(crate) fn freeze_replacement_condition(
         &mut self,
         effect_id: &str,
@@ -1955,7 +1949,7 @@ PRAGMA user_version=5;")?;
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut effect = effect(&tx, effect_id)?;
         if effect.state != "inflight" {
-            return Err(Fault::Conflict);
+            return Err(Fault::DispatchConflict);
         }
         validate_replacement_source(&tx, &effect)?;
         let Work::Replace {
@@ -1971,7 +1965,7 @@ PRAGMA user_version=5;")?;
             return Err(Fault::Invalid);
         };
         if claim.as_deref() != Some(token) || send_first.is_some() {
-            return Err(Fault::Conflict);
+            return Err(Fault::DispatchConflict);
         }
         let store = route.store_id.as_deref().ok_or(Fault::Unavailable)?;
         crate::run_status::validate_request(store, std::slice::from_ref(next))
@@ -1984,7 +1978,16 @@ PRAGMA user_version=5;")?;
             return Err(Fault::Conflict);
         }
         match condition {
-            Some(previous) if previous != next => return Err(Fault::Conflict),
+            Some(previous) if previous != next => {
+                // Another tip was frozen under this claim. Recover with that
+                // condition and the original key on the next outbox pass.
+                tx.execute(
+                    "UPDATE effects SET state='unknown' WHERE id=?1",
+                    [effect_id],
+                )?;
+                tx.commit()?;
+                return Err(Fault::DispatchConflict);
+            }
             Some(_) => return Ok(()),
             None if *submitted => return Err(Fault::Conflict),
             None => *condition = Some(next.clone()),
@@ -2129,12 +2132,11 @@ PRAGMA user_version=5;")?;
             ..
         } = &mut effect.work
         {
-            if effect.state != "inflight"
-                || token.is_none()
-                || claim.as_deref() != token
-                || matches!(state, "accepted" | "custody")
-            {
+            if token.is_none() || matches!(state, "accepted" | "custody") {
                 return Err(Fault::Conflict);
+            }
+            if effect.state != "inflight" || claim.as_deref() != token {
+                return Err(Fault::DispatchConflict);
             }
             let first = *send_first == Some(true) || (!*submitted && send_first.is_none());
             *claim = None;
@@ -2169,7 +2171,7 @@ PRAGMA user_version=5;")?;
             {
                 Ok(())
             } else {
-                Err(Fault::Conflict)
+                Err(Fault::DispatchConflict)
             };
         }
         let unsubmitted = match &effect.work {
@@ -8844,7 +8846,7 @@ mod tests {
         );
         assert!(matches!(
             store.settle_replacement(&effect_id, "wrong-claim", "refused"),
-            Err(Fault::Conflict)
+            Err(Fault::DispatchConflict)
         ));
         drop(store);
         let mut store = Store::open(&directory.path().join("pool.sqlite")).unwrap();
@@ -9649,7 +9651,7 @@ mod tests {
         let events = count(&s, "events");
         assert!(matches!(
             s.settle_effect(&effect.effect_id, "unknown"),
-            Err(Fault::Conflict)
+            Err(Fault::DispatchConflict)
         ));
         assert_eq!(count(&s, "events"), events);
         assert_eq!(
@@ -9658,7 +9660,7 @@ mod tests {
         );
         assert!(matches!(
             s.settle_effect(&effect.effect_id, "accepted"),
-            Err(Fault::Conflict)
+            Err(Fault::DispatchConflict)
         ));
         assert!(!batch_pending(&s.db, &p).unwrap());
         assert!(
@@ -10493,7 +10495,7 @@ mod tests {
         let events = count(&s, "events");
         assert!(matches!(
             s.settle_effect(&effect.effect_id, "unknown"),
-            Err(Fault::Conflict)
+            Err(Fault::DispatchConflict)
         ));
         assert_eq!(count(&s, "events"), events);
         assert_eq!(
@@ -10502,7 +10504,7 @@ mod tests {
         );
         assert!(matches!(
             s.settle_effect(&effect.effect_id, "refused"),
-            Err(Fault::Conflict)
+            Err(Fault::DispatchConflict)
         ));
         let route = RunRoute {
             socket: "/fixture/run.sock".into(),
