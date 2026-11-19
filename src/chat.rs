@@ -498,13 +498,9 @@ pub(crate) async fn reconcile(
     let rows = if batch.closed {
         match integrations::batch_receipt(config, &batch.id, &batch.jobs, false, fence).await {
             Ok(Some(rows)) => rows,
-            Ok(None) => {
-                return stored(store, move |store| {
-                    state::settle_batch(store, &batch.id, "not_launched")
-                })
-                .await;
+            Ok(None) | Err(_) => {
+                return stored(store, move |store| state::defer_receipt(store, &batch.id)).await;
             }
-            Err(_) => return Ok(()),
         }
     } else {
         match integrations::start_batch(config, &batch.id, &batch.jobs, false, fence).await {

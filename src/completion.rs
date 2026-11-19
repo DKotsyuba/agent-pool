@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 /// Current Pool schema step; steps 12-14 belong to the completion ledger.
-pub(crate) const SCHEMA_VERSION: i64 = 18;
+pub(crate) const SCHEMA_VERSION: i64 = 19;
 /// Version of the frozen record body and its canonical integrity preimage.
 pub(crate) const RECORD_VERSION: u32 = 1;
 /// Published integrity algorithm label: SHA-256 over domain, NUL and canonical C.

@@ -17,10 +17,10 @@ compatibility with older distributions has not been verified.
 Provision explicit private paths and the required Bridge producer/audience grants
 using [config.example.toml](config.example.toml).
 Upgrade Pool before upgrading Run to 0.32. The Pool resident migrates the
-SQLite store to schema v18 on first open. Take a private, WAL-consistent
+SQLite store to schema v19 on first open. Take a private, WAL-consistent
 pre-upgrade backup using SQLite’s backup API or a consistent offline snapshot.
-Pool 0.1.5 refuses v18. Restoring the pre-upgrade backup loses subsequent
-admissions and release credentials. Protect v18 database files, WAL files,
+Pool 0.1.5 refuses v19. Restoring the pre-upgrade backup loses subsequent
+admissions and release credentials. Protect v19 database files, WAL files,
 dumps and backups as credential-bearing data.
 
 Run uses a private same-user socket by default. On Linux, an explicit different
