@@ -3386,6 +3386,22 @@ async fn verify_managed_join(
     Ok(target)
 }
 
+/// Probes a pre-existing resident socket while this process holds the exclusive store lease.
+/// The lease proves no cooperating resident serves the path, so an accepted connection can
+/// only be the still-open listener of a predecessor in teardown (or a foreign listener):
+/// retry for one second before reporting it live. Other outcomes return at once.
+pub(crate) async fn probe_listener(path: &Path) -> std::io::Result<UnixStream> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        match UnixStream::connect(path).await {
+            Ok(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(crate::store::SETTLE_POLL).await;
+            }
+            result => return result,
+        }
+    }
+}
+
 /// Binds one protected resident endpoint, refusing a live or nonprivate pre-existing path.
 /// A stale private socket is removed only after connection refusal and exclusive store ownership.
 async fn listener(config: &Config) -> Result<(UnixListener, SocketGuard), Fault> {
@@ -3393,8 +3409,7 @@ async fn listener(config: &Config) -> Result<(UnixListener, SocketGuard), Fault>
     match fs::symlink_metadata(&config.socket_path) {
         Ok(_) => {
             private_socket(&config.socket_path, config.expected_uid)?;
-            match tokio::time::timeout(EXCHANGE_TIMEOUT, UnixStream::connect(&config.socket_path))
-                .await
+            match tokio::time::timeout(EXCHANGE_TIMEOUT, probe_listener(&config.socket_path)).await
             {
                 Ok(Err(error)) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
                     fs::remove_file(&config.socket_path).map_err(|_| Fault::Unavailable)?
@@ -3536,9 +3551,12 @@ pub async fn serve(config_path: &Path) -> Result<(), Fault> {
         }
     }
     let database_path = config.database_path.clone();
-    let mut opened = tokio::task::spawn_blocking(move || Store::open(&database_path))
+    let mut opened = tokio::task::spawn_blocking(move || Store::open_resident(&database_path))
         .await
-        .map_err(|_| Fault::Internal)??;
+        .map_err(|_| Fault::Internal)?
+        .inspect_err(|_| {
+            eprintln!("resident: startup refused at the store writer lease or schema")
+        })?;
     if config
         .managed_run_transport
         .as_ref()
@@ -3550,7 +3568,9 @@ pub async fn serve(config_path: &Path) -> Result<(), Fault> {
         ));
     }
     let store = Arc::new(Mutex::new(opened));
-    let (listener, _guard) = listener(&config).await?;
+    let (listener, _guard) = listener(&config)
+        .await
+        .inspect_err(|_| eprintln!("resident: startup refused at the resident socket"))?;
     let (observer_listener, _observer_guard, observer_uids) = match &config.observer_socket {
         Some(settings) => {
             let (listener, guard) = crate::observer_socket::listener(&config, settings).await?;
@@ -3591,6 +3611,8 @@ pub async fn serve(config_path: &Path) -> Result<(), Fault> {
             _ = terminate.recv() => break Ok(()),
             result = &mut worker => {
                 worker_finished = true;
+                // Startup faults name their stage; this one came from the outbox worker.
+                eprintln!("resident: outbox worker ended");
                 break result.map_err(|_| Fault::Internal).and_then(|result| result);
             }
             result = connections.join_next(), if !connections.is_empty() => {

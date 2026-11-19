@@ -13,6 +13,11 @@ use std::{
     time::Duration,
 };
 
+/// How long a starting resident waits for the writer lease of a terminated predecessor.
+pub(crate) const PREDECESSOR_SETTLE: Duration = Duration::from_secs(3);
+/// Pause between two attempts while a predecessor's lease or listener is still held.
+pub(crate) const SETTLE_POLL: Duration = Duration::from_millis(20);
+
 /// Resident-owned connection and exclusive lifetime lease; never held across network operations.
 pub struct Store {
     /// SQLite connection; callers serialize access with the resident's short-lived mutex.
@@ -1412,6 +1417,17 @@ impl Store {
     /// Opens one private database, takes a nonblocking writer lease and migrates to the current schema.
     /// The existing parent must be a real 0700 directory; future schemas and second writers refuse.
     pub fn open(path: &Path) -> Result<Self, Fault> {
+        Self::open_settled(path, Duration::ZERO)
+    }
+    /// Opens the store for a starting resident, waiting at most [`PREDECESSOR_SETTLE`] for the
+    /// writer lease of a terminated predecessor. A resident ended by SIGKILL or the
+    /// out-of-memory killer keeps its flock until the kernel has torn down its last thread;
+    /// a live second writer still refuses with `Conflict` after the bound.
+    pub fn open_resident(path: &Path) -> Result<Self, Fault> {
+        Self::open_settled(path, PREDECESSOR_SETTLE)
+    }
+    /// Shared open path; `wait` bounds only the retries of a held writer lease.
+    fn open_settled(path: &Path, wait: Duration) -> Result<Self, Fault> {
         let parent = path.parent().ok_or(Fault::Invalid)?;
         let meta = std::fs::symlink_metadata(parent).map_err(|_| Fault::Unavailable)?;
         if !meta.is_dir() || meta.permissions().mode() & 0o777 != 0o700 {
@@ -1432,7 +1448,13 @@ impl Store {
             .mode(0o600)
             .open(path.with_extension("lock"))
             .map_err(|_| Fault::Unavailable)?;
-        lease.try_lock_exclusive().map_err(|_| Fault::Conflict)?;
+        let deadline = std::time::Instant::now() + wait;
+        while lease.try_lock_exclusive().is_err() {
+            if std::time::Instant::now() >= deadline {
+                return Err(Fault::Conflict);
+            }
+            std::thread::sleep(SETTLE_POLL);
+        }
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -10658,6 +10680,28 @@ mod tests {
         let before = std::fs::read(&path).unwrap();
         assert!(matches!(Store::open(&path), Err(Fault::Conflict)));
         assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+    /// A starting resident outwaits a terminated predecessor's lease; a live writer still refuses.
+    #[test]
+    fn resident_open_waits_for_a_releasing_writer_lease() {
+        let (d, held) = fixture();
+        let path = d.path().join("pool.sqlite");
+        assert!(matches!(Store::open(&path), Err(Fault::Conflict)));
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(held);
+        });
+        let started = std::time::Instant::now();
+        let reopened = Store::open_resident(&path).unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        release.join().unwrap();
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            Store::open_settled(&path, Duration::from_millis(100)),
+            Err(Fault::Conflict)
+        ));
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        drop(reopened);
     }
     /// V1–v5 data and their original receipts survive all semantic-schema upgrades.
     #[test]
