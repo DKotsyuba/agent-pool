@@ -315,6 +315,7 @@ fn inventory_snapshot_inner(
         if pool.pool_id != pool_id {
             return Err(Fault::Internal);
         }
+        let facts = chat::pool_facts(&tx, &pool_id)?;
         pool.proposal = None;
         pool.acceptance = None;
         project_purpose(&mut pool);
@@ -329,6 +330,7 @@ fn inventory_snapshot_inner(
                 if binding.run_id.is_some() {
                     binding.member.runtime = "unknown".into();
                 }
+                chat::project_seat(&tx, &facts, &mut binding)?;
                 Ok(binding.member)
             })
             .collect::<Result<Vec<_>, Fault>>()?;
@@ -336,6 +338,7 @@ fn inventory_snapshot_inner(
             return Err(Fault::Unavailable);
         }
         pools.push(InventoryRow {
+            facts,
             pool,
             leader_id,
             roster,
@@ -1174,20 +1177,22 @@ impl Store {
         &self,
         request: &crate::observer::Request,
     ) -> Result<crate::observer::Data, Fault> {
-        self.observe_projection(request, true)
+        self.observe_projection(request, true, true)
     }
     /// Projects the group observer's allowed reads without private pin recovery inputs.
     pub(crate) fn observe_group(
         &self,
         request: &crate::observer::Request,
+        owner_history: bool,
     ) -> Result<crate::observer::Data, Fault> {
-        self.observe_projection(request, false)
+        self.observe_projection(request, false, owner_history)
     }
     /// Shares section pagination while keeping owner-only fields behind the chosen ingress.
     fn observe_projection(
         &self,
         request: &crate::observer::Request,
         owner_projection: bool,
+        owner_history: bool,
     ) -> Result<crate::observer::Data, Fault> {
         use crate::observer::{Data, Detail, Envelope, Operation, Page, PoolPage, PoolRow};
         request.validate()?;
@@ -1269,7 +1274,11 @@ impl Store {
                         pool.proposal = None;
                         pool.acceptance = None;
                         project_purpose(&mut pool);
-                        Ok(PoolRow { pool, leader_id })
+                        Ok(PoolRow {
+                            facts: chat::pool_facts(&self.db, &pool.pool_id)?,
+                            pool,
+                            leader_id,
+                        })
                     })
                     .collect::<Result<Vec<_>, Fault>>()?;
                 let more = pools.len() > 10;
@@ -1285,8 +1294,15 @@ impl Store {
                 Ok(Data::Pools(PoolPage { pools, page }))
             }
             Operation::Get(args) => {
+                let facts = chat::pool_facts(&self.db, &args.pool_id)?;
+                let audience =
+                    if !owner_history && matches!(facts.kind, crate::observer::PoolKind::Chat) {
+                        HistoryAudience::Public
+                    } else {
+                        HistoryAudience::Full
+                    };
                 if args.direction.is_some() {
-                    return observe_history(&self.db, args);
+                    return observe_history(&self.db, args, facts, audience);
                 }
                 let (pool, leader_id) = pool(&self.db, &args.pool_id)?;
                 if args
@@ -1323,6 +1339,7 @@ impl Store {
                         rows.into_iter().map(|(_, proposal)| proposal).collect();
                     let page = Page::new(Some(next.to_string()), more, decisions.len())?;
                     return Ok(Data::Detail(Box::new(Detail {
+                        facts,
                         section: args.section.clone(),
                         view: None,
                         leader_id,
@@ -1335,18 +1352,23 @@ impl Store {
                 let get = args.projection()?;
                 let mappings =
                     owner_projection && (args.include_bindings || get.section == Section::Binding);
-                let reply = view(
-                    &self.db,
-                    pool,
-                    bindings(&self.db, &args.pool_id)?,
-                    &get,
-                    mappings,
-                )?;
+                let mut roster = bindings(&self.db, &args.pool_id)?;
+                for binding in &mut roster {
+                    chat::project_seat(&self.db, &facts, binding)?;
+                }
+                let reply = view(&self.db, pool, roster, &get, mappings, audience)?;
                 let (mut view, private) = match reply {
                     Reply::View(view) => (view, None),
                     Reply::OwnerView { view, bindings } => (view, Some(bindings)),
                     _ => return Err(Fault::Internal),
                 };
+                if get.section == Section::Binding
+                    && let Some(member) = view.members.first_mut()
+                {
+                    let (mut binding, _) = binding_any(&self.db, &member.member_id)?;
+                    chat::project_seat(&self.db, &facts, &mut binding)?;
+                    member.chat_seat = binding.member.chat_seat;
+                }
                 if !mappings && get.section == Section::Deliveries {
                     for delivery in &mut view.deliveries {
                         (delivery.attention, delivery.attention_subject) =
@@ -1375,6 +1397,7 @@ impl Store {
                 };
                 let page = Page::new(Some(view.next_after.to_string()), view.has_more, returned)?;
                 Ok(Data::Detail(Box::new(Detail {
+                    facts,
                     section: args.section.clone(),
                     view: Some(view),
                     leader_id,
@@ -2746,11 +2769,71 @@ PRAGMA user_version=5;")?;
     }
 }
 
-/// Reads an opt-in history page and its upper boundary in one SQLite read transaction.
-/// The append-only event boundary excludes later writes without claiming a pool-wide snapshot.
+/// Visibility applied before page limits so a private event cannot hide a later public row.
+#[derive(Clone, Copy)]
+enum HistoryAudience<'a> {
+    Full,
+    Public,
+    Member(&'a str),
+}
+
+fn event_page(
+    db: &Connection,
+    pool: &str,
+    boundary: Option<i64>,
+    watermark: i64,
+    reverse: bool,
+    audience: HistoryAudience<'_>,
+) -> Result<(Vec<Event>, bool), Fault> {
+    let (cut, order) = if reverse {
+        ("(?2 IS NULL OR id<?2)", "DESC")
+    } else {
+        ("id>?2", "ASC")
+    };
+    let sql = format!("SELECT id,data FROM events WHERE pool=?1 AND {cut} AND id<=?3 AND
+        (?4 OR (json_extract(data,'$.recipient') IS NULL AND json_extract(data,'$.kind')!='owner_message'
+         AND NOT EXISTS(SELECT 1 FROM events first WHERE first.id=CAST(json_extract(events.data,'$.message_event_id') AS INTEGER)
+                        AND json_extract(first.data,'$.kind')='owner_message'))
+         OR json_extract(data,'$.recipient')=?5 OR json_extract(data,'$.author.member_id')=?5)
+        ORDER BY id {order} LIMIT 4");
+    let full = matches!(audience, HistoryAudience::Full);
+    let seat = match audience {
+        HistoryAudience::Member(id) => Some(id),
+        _ => None,
+    };
+    let mut stmt = db.prepare(&sql)?;
+    let rows = stmt.query_map(params![pool, boundary, watermark, full, seat], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut events = Vec::new();
+    let mut bytes = 0;
+    let mut more = false;
+    for row in rows {
+        let (id, raw) = row?;
+        bytes += raw.len();
+        if events.len() == 3 || bytes > 10_000 {
+            if events.is_empty() {
+                return Err(Fault::Unavailable);
+            }
+            more = true;
+            break;
+        }
+        let mut event: Event = decode(&raw)?;
+        event.event_id = u64::try_from(id).map_err(|_| Fault::Internal)?;
+        events.push(event);
+    }
+    if reverse {
+        events.reverse();
+    }
+    Ok((events, more))
+}
+
+/// Reads an opt-in history page and its upper boundary in one transaction.
 fn observe_history(
     db: &Connection,
     args: &crate::observer::Get,
+    facts: crate::observer::PoolFacts,
+    audience: HistoryAudience<'_>,
 ) -> Result<crate::observer::Data, Fault> {
     use crate::observer::{Data, Detail, HistoryDirection, Page};
 
@@ -2801,45 +2884,12 @@ fn observe_history(
         return Err(Fault::Stale);
     }
     let direction = args.direction.ok_or(Fault::Invalid)?;
-    let query = match direction {
-        HistoryDirection::Forward => {
-            "SELECT id,data FROM events WHERE pool=?1 AND id>?2 AND id<=?3 ORDER BY id ASC LIMIT 4"
-        }
-        HistoryDirection::Backward => {
-            "SELECT id,data FROM events WHERE pool=?1 AND (?2 IS NULL OR id<?2) AND id<=?3 ORDER BY id DESC LIMIT 4"
-        }
-    };
-    let boundary = match direction {
-        HistoryDirection::Forward => Some(after),
-        HistoryDirection::Backward => before,
-    };
-    let mut events = Vec::new();
-    let mut budget = 0usize;
-    let mut more = false;
-    {
-        let mut stmt = tx.prepare(query)?;
-        let rows = stmt.query_map(params![args.pool_id, boundary, watermark], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })?;
-        for row in rows {
-            let (id, data) = row?;
-            if events.len() == 3 || budget + data.len() > 10_000 {
-                if events.is_empty() {
-                    return Err(Fault::Unavailable);
-                }
-                more = true;
-                break;
-            }
-            let id = u64::try_from(id).map_err(|_| Fault::Internal)?;
-            let mut event: Event = decode(&data)?;
-            event.event_id = id;
-            event.event_id_exact = Some(id.to_string());
-            budget += data.len();
-            events.push(event);
-        }
-    }
-    if direction == HistoryDirection::Backward {
-        events.reverse();
+    let reverse = direction == HistoryDirection::Backward;
+    let boundary = if reverse { before } else { Some(after) };
+    let (mut events, more) =
+        event_page(&tx, &args.pool_id, boundary, watermark, reverse, audience)?;
+    for event in &mut events {
+        event.event_id_exact = Some(event.event_id.to_string());
     }
     let cursor = match direction {
         HistoryDirection::Forward => events.last().map_or(args.after, |event| event.event_id),
@@ -2869,6 +2919,7 @@ fn observe_history(
     };
     let page = Page::new(Some(cursor.to_string()), more, view.events.len())?;
     let detail = Detail {
+        facts,
         section: args.section.clone(),
         view: Some(Box::new(view)),
         leader_id,
@@ -3052,7 +3103,7 @@ fn execute_authorized(
         {
             return Err(Fault::Stale);
         }
-        return view(db, p, roster, g, is_owner);
+        return view(db, p, roster, g, is_owner, HistoryAudience::Full);
     }
     let c = command.change().ok_or(Fault::Invalid)?;
     authorize(command, is_owner, caller.as_ref())?;
@@ -4137,7 +4188,14 @@ pub(crate) fn managed_read_projection(
             {
                 return Err(Fault::Stale);
             }
-            view(db, pool, bindings(db, &get.pool_id)?, get, false)
+            view(
+                db,
+                pool,
+                bindings(db, &get.pool_id)?,
+                get,
+                false,
+                HistoryAudience::Full,
+            )
         }
         Command::Get(_) => Err(Fault::Unavailable),
         _ => Err(Fault::Invalid),
@@ -4150,6 +4208,7 @@ fn view(
     mut roster: Vec<Binding>,
     g: &Get,
     owner: bool,
+    audience: HistoryAudience<'_>,
 ) -> Result<Reply, Fault> {
     let sql_after = i64::try_from(g.after).map_err(|_| Fault::Invalid)?;
     for binding in &mut roster {
@@ -4227,12 +4286,6 @@ fn view(
         }
         Section::History => {
             p.proposal = None;
-            let mut budget = 0;
-            let sql = if g.reverse {
-                "SELECT id,data FROM events WHERE pool=?1 AND (?2 IS NULL OR id<?2) ORDER BY id DESC LIMIT 4"
-            } else {
-                "SELECT id,data FROM events WHERE pool=?1 AND id>?2 ORDER BY id LIMIT 4"
-            };
             let boundary = if g.reverse {
                 g.before
                     .as_deref()
@@ -4242,30 +4295,12 @@ fn view(
             } else {
                 Some(sql_after)
             };
-            let mut stmt = db.prepare(sql)?;
-            let rows = stmt.query_map(params![p.pool_id, boundary], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-            })?;
-            for row in rows {
-                let (n, s) = row?;
-                let n = u64::try_from(n).map_err(|_| Fault::Internal)?;
-                if events.len() == 3 || budget + s.len() > 10000 {
-                    if events.is_empty() {
-                        return Err(Fault::Unavailable);
-                    }
-                    more = true;
-                    break;
-                }
-                let mut e: Event = decode(&s)?;
-                e.event_id = n;
-                budget += s.len();
-                next = n;
-                events.push(e);
-            }
+            (events, more) = event_page(db, &p.pool_id, boundary, i64::MAX, g.reverse, audience)?;
             if g.reverse {
-                events.reverse();
                 next = events.first().map_or(0, |event| event.event_id);
                 next_before = Some(next.to_string());
+            } else {
+                next = events.last().map_or(g.after, |event| event.event_id);
             }
         }
         Section::Proposal => {
@@ -4464,6 +4499,7 @@ pub(crate) fn save_binding(db: &Connection, b: &Binding, current: bool) -> Resul
 fn new_binding(p: &Pool, name: &str, role: &str, task: &str, address: Option<String>) -> Binding {
     Binding {
         member: Member {
+            chat_seat: None,
             member_id: id(),
             name: name.into(),
             role: role.into(),

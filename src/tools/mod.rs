@@ -48,7 +48,7 @@ pub(crate) fn chat_definitions(names: &[&str], member: bool) -> Vec<Value> {
                 schema["properties"]["members"] = json!({"type":"array","minItems":1,"maxItems":crate::domain::MAX_MEMBERS,"items":seat});
                 schema["properties"]["owner_address"] = json!({"type":"string","description":"Optional initiating Bridge address for notices."});
                 schema["required"] = json!(["request_key","name","purpose","members"]);
-                tool = json!({"name":name,"description":"Create a shared chat and start ordinary Run agents. Retry uncertain admission with the same request_key and intent.","inputSchema":schema});
+                tool = json!({"name":name,"description":"Create a shared chat and start ordinary Run agents. Read pool_get for Run admission while the resident reconciles receipts.","inputSchema":schema});
             }
             "pool_get" => {
                 tool["description"] = json!("Read a compact overview or select history, members, proposal, votes, criteria or content. Use the exact next cursor for the selected section.");

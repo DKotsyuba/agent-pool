@@ -486,9 +486,32 @@ pub struct Identity {
     /// Unix milliseconds when the resident built this answer.
     pub observed_at_unix_ms: u64,
 }
+/// Public Pool mode and optional durable completion.
+#[derive(Default, Serialize, Deserialize)]
+pub struct PoolFacts {
+    /// Chat or managed mode.
+    #[serde(default)]
+    pub kind: PoolKind,
+    /// Immutable record identifier, when completed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_id: Option<String>,
+}
+/// Observer pool discriminator.
+#[derive(Default, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PoolKind {
+    /// Ordinary Run chat.
+    Chat,
+    /// Legacy managed pool.
+    #[default]
+    Managed,
+}
 /// Stable leader identity remains outside all roster counts and rows.
 #[derive(Serialize, Deserialize)]
 pub struct PoolRow {
+    /// Observer-safe mode and completion identity.
+    #[serde(flatten)]
+    pub facts: PoolFacts,
     /// Existing metadata; proposal body is retrieved separately.
     pub pool: domain::Pool,
     /// Native tuple digest already retained as leader identity; no native address.
@@ -538,6 +561,9 @@ pub struct InventoryTotals {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InventoryRow {
+    /// Observer-safe mode and completion identity.
+    #[serde(flatten)]
+    pub facts: PoolFacts,
     /// Metadata with proposal and criteria omitted and long purpose previewed.
     pub pool: domain::Pool,
     /// Stable owner identity, distinct from the roster.
@@ -569,6 +595,9 @@ pub struct InventorySnapshot {
 /// One independent section; execution, voting, acceptance and delivery retain their own states.
 #[derive(Serialize, Deserialize)]
 pub struct Detail {
+    /// Observer-safe mode and completion identity.
+    #[serde(flatten)]
+    pub facts: PoolFacts,
     /// Exact requested section, including decisions.
     pub section: String,
     /// Existing typed section; absent only for archive enumeration.

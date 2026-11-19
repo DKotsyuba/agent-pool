@@ -106,7 +106,7 @@ pub(crate) fn admit_owner(
 }
 
 /// True only when the kernel reports a peer UID on the allowlist.
-fn admitted(stream: &UnixStream, allowed: &[u32]) -> bool {
+pub(crate) fn admitted(stream: &UnixStream, allowed: &[u32]) -> bool {
     stream
         .peer_cred()
         .is_ok_and(|credentials| allowed.contains(&credentials.uid()))
@@ -125,14 +125,17 @@ fn refuse(stream: UnixStream, code: Fault) {
 }
 
 /// Decodes, authorizes and answers one request; every failure is a typed error envelope.
-pub(crate) async fn answer(bytes: &[u8], store: &SharedStore) -> Envelope {
+pub(crate) async fn answer(bytes: &[u8], store: &SharedStore, owner_history: bool) -> Envelope {
     let request = serde_json::from_slice::<Request>(bytes);
     let kind = request.as_ref().map_or("error", Request::kind);
     let result = async {
         let request = request.map_err(|_| Fault::Invalid)?;
         request.validate()?;
         permitted(&request)?;
-        let mut data = stored(store, move |store| store.observe_group(&request)).await?;
+        let mut data = stored(store, move |store| {
+            store.observe_group(&request, owner_history)
+        })
+        .await?;
         if let Data::Identity(identity) = &mut data {
             identity
                 .capabilities
@@ -149,7 +152,11 @@ pub(crate) async fn answer(bytes: &[u8], store: &SharedStore) -> Envelope {
 }
 
 /// Serves one admitted connection: one bounded request line, one envelope line, then close.
-pub(crate) async fn connection(mut stream: UnixStream, store: SharedStore) -> Result<(), Fault> {
+pub(crate) async fn connection(
+    mut stream: UnixStream,
+    store: SharedStore,
+    owner_history: bool,
+) -> Result<(), Fault> {
     let read = tokio::time::timeout(
         EXCHANGE_TIMEOUT,
         integrations::read_frame_limited(&mut stream, MAX_REQUEST),
@@ -157,7 +164,7 @@ pub(crate) async fn connection(mut stream: UnixStream, store: SharedStore) -> Re
     .await
     .map_err(|_| Fault::Unavailable)?;
     let envelope = match read {
-        Ok(bytes) => answer(&bytes, &store).await,
+        Ok(bytes) => answer(&bytes, &store, owner_history).await,
         Err(Fault::Invalid) => Envelope::failure("error", Fault::Invalid),
         Err(error) => return Err(error),
     };
@@ -298,7 +305,7 @@ mod tests {
     ) -> Result<Value, Box<dyn std::error::Error>> {
         let (server, mut client) = UnixStream::pair()?;
         let (served, reply) = tokio::time::timeout(Duration::from_secs(15), async {
-            tokio::join!(connection(server, Arc::clone(store)), async {
+            tokio::join!(connection(server, Arc::clone(store), false), async {
                 client.write_all(&bytes).await?;
                 let mut reply = Vec::new();
                 client.read_to_end(&mut reply).await?;
@@ -608,7 +615,9 @@ mod tests {
                     async {
                         let (stream, _) = bound.accept().await.map_err(|_| Fault::Unavailable)?;
                         match admit(stream, &allowed, &permits) {
-                            Some((stream, _permit)) => connection(stream, Arc::clone(&store)).await,
+                            Some((stream, _permit)) => {
+                                connection(stream, Arc::clone(&store), false).await
+                            }
                             None => Ok(()),
                         }
                     },
@@ -667,7 +676,7 @@ mod tests {
             let (server, client) = UnixStream::pair()?;
             let (served, envelope) = tokio::time::timeout(Duration::from_secs(15), async {
                 tokio::join!(
-                    connection(server, Arc::clone(&store)),
+                    connection(server, Arc::clone(&store), false),
                     observer::exchange(client, bytes, &expected)
                 )
             })

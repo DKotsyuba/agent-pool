@@ -141,7 +141,6 @@ pub(crate) struct ChatBatch {
     pub old_agent_id: Option<String>,
     pub run_store: Option<String>,
     pub state: String,
-    pub closed: bool,
 }
 
 fn batch_by_key(
@@ -171,13 +170,12 @@ fn batch_by_id(db: &Connection, id: &str) -> Result<ChatBatch, Fault> {
     )?;
     Ok(ChatBatch {
         id: id.into(),
-        pool_id: pool_id.clone(),
+        pool_id,
         request_key,
         jobs: decode(&jobs)?,
         old_agent_id,
         run_store,
         state,
-        closed: pool(db, &pool_id)?.0.closed,
     })
 }
 
@@ -421,13 +419,13 @@ pub(crate) fn admitted(
     Ok(())
 }
 
-/// Records only a definitive Run refusal.
 /// Cancels a batch that has not been fenced or submitted to Run.
 pub(super) fn cancel_unsubmitted(db: &Connection, pool: &str) -> Result<(), Fault> {
     db.execute("UPDATE chat_batches SET state='cancelled' WHERE pool=?1 AND state='pending' AND run_store IS NULL", [pool])?;
     Ok(())
 }
 
+/// Records only a definitive Run refusal.
 pub(crate) fn refused(store: &mut Store, id: &str) -> Result<(), Fault> {
     store.db.execute(
         "UPDATE chat_batches SET state='refused' WHERE id=?1 AND state='pending'",
@@ -652,26 +650,18 @@ pub(crate) fn get(db: &Connection, input: GetPool, seat: Option<&str>) -> Result
                 .ok_or(Fault::Invalid)?,
             None => 0,
         };
-        let mut stmt = db.prepare("SELECT id,data FROM events WHERE pool=?1 AND id>?2 AND
-            (?3 IS NULL OR ((json_extract(data,'$.recipient') IS NULL AND json_extract(data,'$.kind')!='owner_message'
-             AND NOT EXISTS(SELECT 1 FROM events first WHERE first.id=CAST(json_extract(events.data,'$.message_event_id') AS INTEGER) AND json_extract(first.data,'$.kind')='owner_message'))
-             OR json_extract(data,'$.recipient')=?3 OR json_extract(data,'$.author.member_id')=?3))
-             ORDER BY id LIMIT 4")?;
-        let mut events = Vec::new();
-        let mut bytes = 0;
-        let mut more = false;
-        for row in stmt.query_map(params![input.pool_id, after, seat], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-        })? {
-            let (id, raw) = row?;
-            let event: Event = decode(&raw)?;
-            bytes += encode(&event.body)?.len();
-            if events.len() == 3 || bytes > 12000 {
-                more = true;
-                break;
-            }
-            events.push(ChatEvent {
-                id: id.to_string(),
+        let (page, more) = event_page(
+            db,
+            &input.pool_id,
+            Some(after),
+            i64::MAX,
+            false,
+            seat.map_or(HistoryAudience::Full, HistoryAudience::Member),
+        )?;
+        let events: Vec<_> = page
+            .into_iter()
+            .map(|event| ChatEvent {
+                id: event.event_id.to_string(),
                 kind: event.kind,
                 author: match event.author {
                     Author::Leader => "owner".into(),
@@ -683,8 +673,8 @@ pub(crate) fn get(db: &Connection, input: GetPool, seat: Option<&str>) -> Result
                 message_event_id: event.message_event_id,
                 part_index: event.part_index,
                 part_count: event.part_count,
-            });
-        }
+            })
+            .collect();
         let next = events
             .last()
             .map_or_else(|| after.to_string(), |event| event.id.clone());
@@ -726,7 +716,7 @@ pub(crate) fn get(db: &Connection, input: GetPool, seat: Option<&str>) -> Result
             expected_revision: input.expected_revision,
         };
         Command::Get(query.clone()).validate()?;
-        let mut reply = view(db, pool, roster, &query, false)?;
+        let mut reply = view(db, pool, roster, &query, false, HistoryAudience::Full)?;
         if enabled(db, &query.pool_id)?
             && let Reply::View(ref mut view) = reply
             && let Some(proposal) = &mut view.pool.proposal
@@ -918,7 +908,62 @@ pub(crate) fn notice(store: &Store, effect: &str) -> Result<Notice, Fault> {
     })
 }
 
-/// Reloads a batch under the dispatch permit before making a Run call.
-pub(crate) fn load_batch(store: &Store, batch: &str) -> Result<ChatBatch, Fault> {
-    batch_by_id(&store.db, batch)
+/// Picks a pending batch in stable rotating order. Only the resident dispatches these.
+pub(crate) fn next_batch(store: &Store, after: &str) -> Result<Option<ChatBatch>, Fault> {
+    let id: Option<String> = store
+        .db
+        .query_row(
+            "SELECT id FROM chat_batches WHERE state='pending' ORDER BY id<=?1,id LIMIT 1",
+            [after],
+            |row| row.get(0),
+        )
+        .optional()?;
+    id.map(|id| batch_by_id(&store.db, &id)).transpose()
+}
+
+/// Exposes only the mode and durable result identity to the observer.
+pub(super) fn pool_facts(db: &Connection, pool: &str) -> Result<crate::observer::PoolFacts, Fault> {
+    use crate::observer::{PoolFacts, PoolKind};
+    let kind = if enabled(db, pool)? {
+        PoolKind::Chat
+    } else {
+        PoolKind::Managed
+    };
+    let completion_id = db.query_row(
+        "SELECT id FROM chat_agreements WHERE pool=?1 UNION ALL SELECT completion_id FROM completion_records WHERE pool=?1",
+        [pool], |row| row.get(0)
+    ).optional()?;
+    Ok(PoolFacts {
+        kind,
+        completion_id,
+    })
+}
+
+/// Adds ordinary chat seat facts without exposing the private binding.
+pub(super) fn project_seat(
+    db: &Connection,
+    facts: &crate::observer::PoolFacts,
+    binding: &mut Binding,
+) -> Result<(), Fault> {
+    if !matches!(facts.kind, crate::observer::PoolKind::Chat) {
+        return Ok(());
+    }
+    let admission = if binding.run_id.is_some() {
+        "admitted".into()
+    } else {
+        db.query_row(
+            "SELECT CASE WHEN b.state='pending' AND b.run_store IS NULL THEN 'pending'
+                         WHEN b.state='refused' THEN 'refused' ELSE 'unknown' END
+             FROM chat_batches b,json_each(b.jobs) j WHERE b.pool=?1 AND json_extract(j.value,'$.member_id')=?2",
+            params![binding.pool_id, binding.member.member_id], |row| row.get::<_,String>(0)
+        ).optional()?.unwrap_or_else(|| "unknown".into())
+    };
+    binding.member.chat_seat = Some(ChatSeat {
+        seat_id: binding.member.member_id.clone(),
+        run_agent_id: binding.run_id.clone(),
+        profile: binding.member.role.clone(),
+        admission,
+        joined: binding.member.state == MemberState::Active,
+    });
+    Ok(())
 }

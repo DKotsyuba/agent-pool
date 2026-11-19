@@ -313,9 +313,9 @@ fn present(result: Result<ChatReply, Fault>, templates: &Templates) -> CallToolR
     match result {
         Ok(ChatReply::Existing(reply)) => crate::tools::present(Ok(reply), templates),
         Ok(reply) => {
-            let is_error = matches!(&reply, ChatReply::Launch { state, .. } if state != "admitted");
+            let is_error = matches!(&reply, ChatReply::Launch { state, .. } if matches!(state.as_str(), "refused" | "cancelled"));
             let text = templates.render("chat", &reply).unwrap_or_else(|_| match &reply {
-                ChatReply::Launch { pool_id, revision, state, request_key, old_agent_id, .. } => format!("Pool {pool_id} revision={revision} admission={state}. Repeat only request_key={request_key} with identical intent. Prior Run ID: {old_agent_id:?}"),
+                ChatReply::Launch { pool_id, revision, state, request_key, old_agent_id, .. } => format!("Pool {pool_id} revision={revision} admission={state}. Request key {request_key}. Read pool_get for current admission. Prior Run ID: {old_agent_id:?}"),
                 _ => "READ COMPLETED; presentation degraded. Repeat the read with the same cursor.".into(),
             });
             text_reply(text, is_error)
@@ -396,7 +396,7 @@ pub(crate) async fn private_call(
                 return membership_refusal(id, "pool_closed", "This pool has been closed.");
             }
             Ok(Err(ChatError::AdmissionPending)) => {
-                return json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":"Seat admission is pending. Retry after Run admission is recorded."}});
+                return json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":"Seat admission is pending. Retry after Run admission is recorded.","data":{"kind":"admission_pending","retry_after_ms":1000}}});
             }
             Ok(Err(ChatError::Fault(_))) | Err(_) => {
                 return json!({"jsonrpc":"2.0","id":id,"error":{"code":-32603,"message":"Pool chat could not complete the relay."}});
@@ -449,7 +449,6 @@ async fn owner_call(
                 }
             })
             .await?;
-            let batch = admit_batch(config, store, batch).await?;
             stored(store, move |store| state::launch_read(store, &batch)).await?
         }
         _ => {
@@ -463,63 +462,54 @@ async fn owner_call(
     Ok(reply)
 }
 
-/// Reconciles with the original ordered job bytes, key and Run database fence.
-async fn admit_batch(
+/// Advances one batch per resident tick, rotating past unavailable Run work.
+pub(crate) async fn reconcile(
     config: &Config,
     store: &SharedStore,
-    mut batch: state::ChatBatch,
-) -> Result<state::ChatBatch, Fault> {
-    static SUBMIT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    let Ok(_guard) = SUBMIT.try_lock() else {
-        return Ok(batch);
+    cursor: &mut String,
+) -> Result<(), Fault> {
+    if config.run_socket.is_none() {
+        return Ok(());
+    }
+    let after = cursor.clone();
+    let Some(mut batch) = stored(store, move |store| state::next_batch(store, &after)).await?
+    else {
+        cursor.clear();
+        return Ok(());
     };
-    let id = batch.id.clone();
-    batch = stored(store, move |store| state::load_batch(store, &id)).await?;
-    if batch.state != "pending" {
-        return Ok(batch);
-    }
-    let previous_attempt = batch.run_store.is_some();
-    if !previous_attempt {
-        let Ok(run_store) = integrations::run_store_identity(config).await else {
-            return Ok(batch);
-        };
-        let id = batch.id.clone();
-        batch = stored(store, move |store| state::fence(store, &id, &run_store)).await?;
-    }
-    if batch.state != "pending" {
-        return Ok(batch);
-    }
-    let fence = batch.run_store.as_deref();
-    let looked_up = if previous_attempt {
-        match integrations::batch_receipt(config, &batch.id, &batch.jobs, false, fence).await {
-            Ok(rows) => rows,
-            Err(_) => return Ok(batch),
-        }
+    cursor.clone_from(&batch.id);
+    let run_store = if let Some(fence) = &batch.run_store {
+        fence.clone()
     } else {
-        None
+        let Ok(identity) = integrations::run_store_identity(config).await else {
+            return Ok(());
+        };
+        identity
     };
-    let result = match looked_up {
-        Some(rows) => Ok(rows),
-        None if batch.closed => return Ok(batch),
-        None => integrations::start_batch(config, &batch.id, &batch.jobs, false, fence).await,
+    let lookup =
+        integrations::batch_receipt(config, &batch.id, &batch.jobs, false, Some(&run_store)).await;
+    let rows = match lookup {
+        Ok(Some(rows)) if batch.run_store.is_some() => rows,
+        Ok(None) if batch.run_store.is_none() => {
+            // The store lock orders close against this durable possible-send decision.
+            let (id, identity) = (batch.id.clone(), run_store.clone());
+            batch = stored(store, move |store| state::fence(store, &id, &identity)).await?;
+            if batch.state != "pending" || batch.run_store.is_none() {
+                return Ok(());
+            }
+            match integrations::start_batch(config, &batch.id, &batch.jobs, false, Some(&run_store))
+                .await
+            {
+                Ok(rows) => rows,
+                Err(failure) if failure.known_unadmitted => {
+                    return stored(store, move |store| state::refused(store, &batch.id)).await;
+                }
+                Err(_) => return Ok(()),
+            }
+        }
+        _ => return Ok(()),
     };
-    match result {
-        Ok(rows) => {
-            stored(store, move |store| {
-                state::admitted(store, &batch, rows)?;
-                Ok(batch)
-            })
-            .await
-        }
-        Err(failure) if failure.known_unadmitted && !previous_attempt => {
-            stored(store, move |store| {
-                state::refused(store, &batch.id)?;
-                Ok(batch)
-            })
-            .await
-        }
-        Err(_) => Ok(batch),
-    }
+    stored(store, move |store| state::admitted(store, &batch, rows)).await
 }
 
 /// Adds best-effort Run process observations without making Pool reads depend on Run.

@@ -33,7 +33,7 @@ Pool {{ pool_id }} revision={{ revision }} admission={{ state }}
 Seat {{ s.id }} current={{ s.current }} joined={{ s.joined }}{% if s.agent_id %} run={{ s.agent_id }}{% endif %}
 {% endfor %}
 {% if state == "pending" %}
-Run admission may be uncertain. Repeat request_key={{ request_key }} with identical intent to reconcile.
+The resident reconciles Run admission. Read pool_get for current seat admission.
 {% endif %}
 {% if old_agent_id %}
 Prior Run ID {{ old_agent_id }}. Use Run if cancellation is needed.
