@@ -3,6 +3,7 @@
 #[cfg(all(test, target_os = "linux"))]
 static TEST_EXEC_HASH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+mod chat;
 mod completion;
 mod completion_key;
 mod completion_saga;
@@ -86,8 +87,14 @@ enum Commands {
     /// Run the stdio frontend; missing configuration still permits catalog and product identity.
     Mcp {
         /// Explicit private resident/Bridge configuration file; absent disables pool calls.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "owner_socket")]
         config: Option<PathBuf>,
+        /// Group owner ingress socket for ordinary Run chat.
+        #[arg(long, requires = "server_uid")]
+        owner_socket: Option<PathBuf>,
+        /// Required kernel UID of the owner ingress resident.
+        #[arg(long, requires = "owner_socket")]
+        server_uid: Option<u32>,
     },
     /// Own the persistent local pool store, socket and background delivery worker.
     Serve {
@@ -169,6 +176,8 @@ struct Handler {
     catalog: Vec<Tool>,
     /// Operator-supplied configuration path, never a caller identity source.
     config: Option<PathBuf>,
+    /// Optional owner ingress socket and pinned resident UID.
+    owner: Option<(PathBuf, u32)>,
     /// Admission bound for concurrent native assertion exchanges in this frontend.
     calls: Arc<tokio::sync::Semaphore>,
 }
@@ -184,6 +193,7 @@ impl Handler {
             templates: Arc::new(templates),
             catalog,
             config,
+            owner: None,
             calls: Arc::new(tokio::sync::Semaphore::new(32)),
         })
     }
@@ -191,6 +201,11 @@ impl Handler {
 impl ServerHandler for Handler {
     /// Reports protocol capabilities and instructions without claiming service or live qualification.
     fn get_info(&self) -> ServerConfig {
+        if self.owner.is_some() {
+            return ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+                .with_server_info(Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
+                .with_instructions("Use pool_start for ordinary Run agents working toward one shared result. Any authorized owner can inspect and manage chats. Repeat uncertain mutations with the identical request_key and intent.");
+        }
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
             .with_instructions("Use get_status for product identity. Pool calls require a current authenticated native invocation and configured resident. Durable admission is separate from external delivery and agent completion.")
@@ -225,7 +240,7 @@ impl ServerHandler for Handler {
         let original_meta = serde_json::to_value(&context.meta)
             .map_err(|_| McpError::new(ErrorCode::INVALID_PARAMS, "Invalid tool metadata", None))?;
         let args = serde_json::Value::Object(request.arguments.unwrap_or_default());
-        if request.name == "get_status" {
+        if self.owner.is_none() && request.name == "get_status" {
             return tools::call(&request.name, args, &self.identity, &self.templates)
                 .await
                 .map(Into::into)
@@ -241,6 +256,15 @@ impl ServerHandler for Handler {
         let Ok(_permit) = self.calls.try_acquire() else {
             return Ok(tools::present(Err(domain::Fault::Unavailable), &self.templates).into());
         };
+        if let Some((socket, uid)) = &self.owner {
+            return Ok(
+                match chat::frontend(socket, *uid, request.name.to_string(), args).await {
+                    Ok(reply) => reply,
+                    Err(fault) => tools::present(Err(fault), &self.templates),
+                }
+                .into(),
+            );
+        }
         let command = managed_codec::normalize_command(
             serde_json::json!({"name":request.name,"arguments":args}),
         )
@@ -421,8 +445,23 @@ async fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Commands::Mcp { config } => {
-            let h = match Handler::new(config) {
+        Commands::Mcp {
+            config,
+            owner_socket,
+            server_uid,
+        } => {
+            let h = match Handler::new(config).and_then(|mut handler| {
+                if let Some((path, uid)) = owner_socket.zip(server_uid) {
+                    if !path.is_absolute() || uid == u32::MAX || !cfg!(target_os = "linux") {
+                        return Err("invalid_owner_socket");
+                    }
+                    handler.catalog =
+                        serde_json::from_value(serde_json::Value::Array(chat::owner_tools()))
+                            .map_err(|_| "catalog_invalid")?;
+                    handler.owner = Some((path, uid));
+                }
+                Ok(handler)
+            }) {
                 Ok(h) => h,
                 Err(e) => {
                     eprintln!("startup: {e}");

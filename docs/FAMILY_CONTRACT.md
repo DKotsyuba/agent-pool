@@ -16,3 +16,16 @@
 12. Release publication, installation and agent notification are separate outcomes.
 13. A shell background process does not prove an agent was awakened.
 14. Unknown/skipped/unimplemented acceptance remains not_verified.
+
+### Pool chat v1
+
+The Linux owner ingress advertises exactly eight tools separately from the legacy
+managed catalog. The resident private socket hosts the Run-facing
+`chat_catalog_v1` and `member_call_v1` JSON-RPC methods. Both require
+`version: 1`. Membership refusals are JSON-RPC errors with code `-32000`
+and `data.kind` set to `not_member`, `seat_retired` or `pool_closed`. The
+inter-service wire contract is
+`contracts/pool-chat-v1.md` in the Agent MCP family checkout. The
+observer `completion_get` header data can also be an ordinary chat agreement
+with `version: 1`, `completion_id`, `pool_id`, `revision`, `event_id`,
+`proposal_id`, `roster_key`, `result`, and per-seat `ballots` references.

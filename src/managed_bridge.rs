@@ -799,6 +799,7 @@ mod tests {
             run_peer_uid: None,
             managed_run_reader: None,
             observer_socket: None,
+            owner_ingress: None,
             managed_run_transport: None,
         };
         let route = crate::managed_state::Route {

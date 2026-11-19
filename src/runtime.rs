@@ -2911,6 +2911,11 @@ async fn connection(
                 owner_observation(&bytes, &config, &store).await,
             )));
         }
+        if crate::chat::private_method(&value) {
+            let reply =
+                crate::chat::private_call(value, &config, &store, crate::chat::renderer()?).await;
+            return Ok(Err(Special::Managed(reply)));
+        }
         if value.get("method").is_some() {
             if bytes.len() >= MAX_FRAME {
                 return Ok(Err(Special::Managed(crate::managed_ingress::refused())));
@@ -3554,6 +3559,15 @@ pub async fn serve(config_path: &Path) -> Result<(), Fault> {
         None => (None, None, Vec::new()),
     };
     let observer_permits = Arc::new(Semaphore::new(crate::observer_socket::MAX_CONNECTIONS));
+    let chat_templates = crate::chat::renderer()?;
+    let (owner_listener, _owner_guard, owner_uids) = match &config.owner_ingress {
+        Some(settings) => {
+            let (listener, guard) = crate::observer_socket::listener(&config, settings).await?;
+            (Some(listener), Some(guard), settings.allowed_uids.clone())
+        }
+        None => (None, None, Vec::new()),
+    };
+    let owner_permits = Arc::new(Semaphore::new(crate::observer_socket::MAX_CONNECTIONS));
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|_| Fault::Unavailable)?;
     let (stop, stopped) = watch::channel(false);
@@ -3594,6 +3608,17 @@ pub async fn serve(config_path: &Path) -> Result<(), Fault> {
                 connections.spawn(async move { let _permit = permit; connection(stream, config, store, activity, waits, stopped).await });
             }
             accepted = async {
+                match &owner_listener {
+                    Some(listener) => listener.accept().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let (stream, _) = match accepted { Ok(value) => value, Err(_) => break Err(Fault::Unavailable) };
+                let Some((stream, permit)) = crate::observer_socket::admit_owner(stream, config.expected_uid, &owner_uids, &owner_permits) else { continue; };
+                let (config, store) = (config.clone(), Arc::clone(&store));
+                connections.spawn(async move { let _permit = permit; crate::chat::owner_connection(stream, config, store, chat_templates).await });
+            }
+            accepted = async {
                 match &observer_listener {
                     Some(listener) => listener.accept().await,
                     None => std::future::pending().await,
@@ -3608,6 +3633,7 @@ pub async fn serve(config_path: &Path) -> Result<(), Fault> {
     };
     drop(listener);
     drop(observer_listener);
+    drop(owner_listener);
     let _ = stop.send(true);
     let mut final_result = result;
     while let Some(outcome) = connections.join_next().await {
@@ -3635,6 +3661,8 @@ async fn effect(
     effect: Effect,
     reconcile: bool,
 ) -> Result<(), Fault> {
+    let mut effect = effect;
+    let mut reconcile = reconcile;
     let single_batch = effect.is_single_batch()?;
     let state = match &effect.work {
         Work::Deliver { .. } => {
@@ -3645,14 +3673,53 @@ async fn effect(
                     return settle(store, effect.effect_id, "unknown").await;
                 }
             }
+            let id = effect.effect_id.clone();
+            use crate::store::chat::Notice;
+            let notice = stored(store, move |store| crate::store::chat::notice(store, &id)).await?;
+            match notice {
+                Notice::Legacy => (),
+                Notice::Cancelled => return settle(store, effect.effect_id, "cancelled").await,
+                Notice::Frozen(producer, value) => {
+                    if producer != config.bridge_producer_id {
+                        return settle(store, effect.effect_id, "unknown").await;
+                    }
+                    let params = serde_json::from_value(value).map_err(|_| Fault::Internal)?;
+                    let result = integrations::deliver(config.clone(), producer, params, reconcile)
+                        .await
+                        .unwrap_or("unknown");
+                    return settle(store, effect.effect_id, result).await;
+                }
+                Notice::Unresolved(binding) => {
+                    // No persisted publication means this notice has never been sent.
+                    reconcile = false;
+                    let Ok(Some(address)) = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        crate::chat::notice_address(config, &binding),
+                    )
+                    .await
+                    else {
+                        return settle(store, effect.effect_id, "cancelled").await;
+                    };
+                    if let Work::Deliver {
+                        address: target, ..
+                    } = &mut effect.work
+                    {
+                        *target = address;
+                    }
+                }
+            }
             let params = integrations::publication(&effect)?;
             let value = serde_json::to_value(params).map_err(|_| Fault::Internal)?;
             let effect_id = effect.effect_id.clone();
             let producer = config.bridge_producer_id.clone();
-            let (producer, value) = stored(store, move |store| {
+            let (producer, value) = match stored(store, move |store| {
                 store.freeze_publication(&effect_id, &producer, &value)
             })
-            .await?;
+            .await
+            {
+                Err(Fault::Closed) => return settle(store, effect.effect_id, "cancelled").await,
+                result => result?,
+            };
             let params = serde_json::from_value(value).map_err(|_| Fault::Internal)?;
             integrations::deliver(config.clone(), producer, params, reconcile)
                 .await
@@ -4879,6 +4946,7 @@ mod tests {
             run_peer_uid: None,
             managed_run_reader: None,
             observer_socket: None,
+            owner_ingress: None,
             managed_run_transport: None,
         };
         let socket = config.run_socket.as_ref().ok_or("Run socket")?;
@@ -5780,6 +5848,7 @@ mod tests {
             run_peer_uid: None,
             managed_run_reader: None,
             observer_socket: None,
+            owner_ingress: None,
             managed_run_transport: None,
         };
         let socket = config.run_socket.as_ref().ok_or("missing socket")?;
@@ -5926,6 +5995,7 @@ mod tests {
             run_peer_uid: None,
             managed_run_reader: None,
             observer_socket: None,
+            owner_ingress: None,
             managed_run_transport: None,
         };
         let listener = UnixListener::bind(config.run_socket.as_ref().ok_or("Run socket")?)?;
@@ -6034,6 +6104,7 @@ mod tests {
             run_peer_uid: None,
             managed_run_reader: None,
             observer_socket: None,
+            owner_ingress: None,
             managed_run_transport: None,
         };
         let socket = config.run_socket.as_ref().ok_or("missing socket")?;
@@ -6327,6 +6398,7 @@ mod tests {
             run_peer_uid: None,
             managed_run_reader: None,
             observer_socket: None,
+            owner_ingress: None,
             managed_run_transport: None,
         };
         let socket = config.run_socket.as_ref().ok_or("missing socket")?;
@@ -6585,6 +6657,7 @@ mod tests {
             run_peer_uid: None,
             managed_run_reader: None,
             observer_socket: None,
+            owner_ingress: None,
             managed_run_transport: None,
         };
         let socket = config.run_socket.as_ref().ok_or("missing socket")?;
@@ -6709,6 +6782,7 @@ mod tests {
             run_peer_uid: None,
             managed_run_reader: None,
             observer_socket: None,
+            owner_ingress: None,
             managed_run_transport: None,
         };
         let socket = config.run_socket.as_ref().ok_or("fixture socket missing")?;
@@ -6993,6 +7067,7 @@ mod tests {
             run_peer_uid: None,
             managed_run_reader: None,
             observer_socket: None,
+            owner_ingress: None,
             managed_run_transport: None,
         };
         let listener = UnixListener::bind(config.run_socket.as_ref().ok_or("socket")?)?;
@@ -7932,6 +8007,7 @@ mod tests {
             run_peer_uid: None,
             managed_run_reader: None,
             observer_socket: None,
+            owner_ingress: None,
             managed_run_transport: None,
         };
         let mut initial = Store::open(&config.database_path)?;
@@ -8147,6 +8223,7 @@ mod tests {
             run_peer_uid: None,
             managed_run_reader: None,
             observer_socket: None,
+            owner_ingress: None,
             managed_run_transport: None,
         };
         let mut initial = Store::open(&config.database_path)?;
@@ -8658,6 +8735,7 @@ mod tests {
             run_peer_uid: None,
             managed_run_reader: None,
             observer_socket: None,
+            owner_ingress: None,
             managed_run_transport: None,
         };
         let mut initial = Store::open(&config.database_path)?;
@@ -8791,6 +8869,7 @@ mod tests {
                 run_route_id: "run-route".into(),
             }),
             observer_socket: None,
+            owner_ingress: None,
             managed_run_transport: None,
         };
         let initial = Store::open(&config.database_path)?;
@@ -11309,6 +11388,7 @@ mod tests {
             run_peer_uid: None,
             managed_run_reader: None,
             observer_socket: None,
+            owner_ingress: None,
             managed_run_transport: None,
         };
         let store = Arc::new(Mutex::new(initial));
@@ -12220,6 +12300,7 @@ mod tests {
             run_peer_uid: None,
             managed_run_reader: None,
             observer_socket: None,
+            owner_ingress: None,
             managed_run_transport: None,
         };
         let mut initial = Store::open(&config.database_path)?;
@@ -12328,6 +12409,7 @@ mod tests {
             run_peer_uid: None,
             managed_run_reader: None,
             observer_socket: None,
+            owner_ingress: None,
             managed_run_transport: None,
         };
         let socket = config.run_socket.as_ref().ok_or("missing Run socket")?;
@@ -12656,6 +12738,7 @@ mod tests {
             run_peer_uid: None,
             managed_run_reader: None,
             observer_socket: None,
+            owner_ingress: None,
             managed_run_transport: None,
         };
         let (stop, stopped) = watch::channel(false);

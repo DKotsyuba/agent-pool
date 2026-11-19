@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 /// Current Pool schema step; steps 12-14 belong to the completion ledger.
-pub(crate) const SCHEMA_VERSION: i64 = 17;
+pub(crate) const SCHEMA_VERSION: i64 = 18;
 /// Version of the frozen record body and its canonical integrity preimage.
 pub(crate) const RECORD_VERSION: u32 = 1;
 /// Published integrity algorithm label: SHA-256 over domain, NUL and canonical C.
@@ -326,7 +326,7 @@ pub(crate) fn completed(db: &Connection, pool_id: &str) -> Result<bool, Fault> {
 /// Retained pools with an intact committed record, read in the caller's snapshot.
 pub(crate) fn completed_count(db: &Connection) -> Result<i64, Fault> {
     Ok(db.query_row(
-        "SELECT count(*) FROM completion_records r JOIN pools p ON p.id=r.pool",
+        "SELECT (SELECT count(*) FROM completion_records) + (SELECT count(*) FROM chat_agreements)",
         [],
         |row| row.get(0),
     )?)
@@ -425,6 +425,7 @@ pub(crate) fn snapshot(db: &Connection, pool_id: &str) -> Result<Option<Candidat
     let pool: Pool = decoded(&data)?;
     if pool.pool_id != pool_id
         || completed(db, pool_id)?
+        || crate::store::chat::enabled(db, pool_id)?
         || crate::store::completion_admission_pending(db, pool_id)?
     {
         return Ok(None);
@@ -686,7 +687,7 @@ pub(crate) fn snapshot(db: &Connection, pool_id: &str) -> Result<Option<Candidat
 
 /// Pools that may become settlement candidates, after an exclusive rotating cursor.
 pub(crate) fn candidates(db: &Connection, after: &str, limit: u32) -> Result<Vec<String>, Fault> {
-    let mut stmt = db.prepare(&format!("SELECT p.id FROM pools p WHERE p.id>?1 AND json_extract(p.data,'$.proposal.state')='accepted' AND NOT EXISTS(SELECT 1 FROM completion_records r WHERE r.pool=p.id) AND NOT EXISTS(SELECT 1 FROM completion_sagas s WHERE s.pool=p.id AND s.stage!='released') AND (SELECT count(*) FROM completion_sagas s WHERE s.pool=p.id AND s.proposal=json_extract(p.data,'$.proposal.proposal_id') AND s.source_revision=json_extract(p.data,'$.revision'))<{MAX_ABORTED_ATTEMPTS} ORDER BY p.id LIMIT ?2"))?;
+    let mut stmt = db.prepare(&format!("SELECT p.id FROM pools p WHERE p.id>?1 AND json_extract(p.data,'$.proposal.state')='accepted' AND NOT EXISTS(SELECT 1 FROM chat_pools chat WHERE chat.pool=p.id) AND NOT EXISTS(SELECT 1 FROM completion_records r WHERE r.pool=p.id) AND NOT EXISTS(SELECT 1 FROM completion_sagas s WHERE s.pool=p.id AND s.stage!='released') AND (SELECT count(*) FROM completion_sagas s WHERE s.pool=p.id AND s.proposal=json_extract(p.data,'$.proposal.proposal_id') AND s.source_revision=json_extract(p.data,'$.revision'))<{MAX_ABORTED_ATTEMPTS} ORDER BY p.id LIMIT ?2"))?;
     Ok(stmt
         .query_map(params![after, limit], |r| r.get(0))?
         .collect::<Result<Vec<String>, _>>()?)

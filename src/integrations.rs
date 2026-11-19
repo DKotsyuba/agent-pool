@@ -1793,6 +1793,8 @@ fn validate_batch_receipt(
     reason = "Diagnostic observation is retained but cannot authorize membership"
 )]
 pub struct RunObservation {
+    /// Positive lineage sequence observed by Run.
+    pub sequence: u64,
     /// Canonical sampled address when Run reported an observation.
     pub address: Option<String>,
     /// Finite safe state; unknown or unsupported never implies completion.
@@ -1809,16 +1811,31 @@ pub async fn run_observe(
     agent_id: &str,
     sequence: u64,
 ) -> Result<RunObservation, Fault> {
+    observe_run(config, agent_id, Some(sequence)).await
+}
+
+/// Resolves an ordinary member's latest execution and validates its stable lineage.
+pub(crate) async fn observe_run(
+    config: &Config,
+    agent_id: &str,
+    sequence: Option<u64>,
+) -> Result<RunObservation, Fault> {
     let result = run_rpc(
         config,
         "agent_integration",
-        json!({"agent_id":agent_id,"sequence":sequence}),
+        match sequence {
+            Some(sequence) => json!({"agent_id":agent_id,"sequence":sequence}),
+            None => json!({"agent_id":agent_id}),
+        },
     )
     .await
     .map_err(|_| Fault::Unavailable)?;
     if result.get("schema_version").and_then(Value::as_u64) != Some(1)
         || result.pointer("/agent/agent_id").and_then(Value::as_str) != Some(agent_id)
-        || result.pointer("/agent/sequence").and_then(Value::as_u64) != Some(sequence)
+        || !result
+            .pointer("/agent/sequence")
+            .and_then(Value::as_u64)
+            .is_some_and(|actual| actual > 0 && sequence.is_none_or(|expected| expected == actual))
     {
         return Err(Fault::Unavailable);
     }
@@ -1891,7 +1908,15 @@ pub async fn run_observe(
         _ => "unknown",
     }
     .to_owned();
-    Ok(RunObservation { address, runtime })
+    let sequence = result
+        .pointer("/agent/sequence")
+        .and_then(Value::as_u64)
+        .ok_or(Fault::Unavailable)?;
+    Ok(RunObservation {
+        address,
+        runtime,
+        sequence,
+    })
 }
 
 /// Local fixtures exercise framing, correlation and trust fences; they do not certify a real harness.
@@ -2010,6 +2035,7 @@ mod tests {
             run_peer_uid: None,
             managed_run_reader: None,
             observer_socket: None,
+            owner_ingress: None,
             managed_run_transport: None,
         }
     }

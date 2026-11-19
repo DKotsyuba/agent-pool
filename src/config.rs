@@ -51,8 +51,10 @@ pub struct Config {
     pub managed_run_transport: Option<ManagedRunTransport>,
     /// Optional group-accessible read-only observer endpoint; absence binds nothing.
     pub observer_socket: Option<ObserverSocket>,
+    /// Optional group owner ingress for ordinary Run chats.
+    pub owner_ingress: Option<ObserverSocket>,
 }
-/// Linux-only read-only observer endpoint whose peers are authorized by kernel UID alone.
+/// Linux-only group socket whose peers are admitted by kernel UID alone.
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObserverSocket {
@@ -64,7 +66,7 @@ pub struct ObserverSocket {
     /// Socket mode, 0o660 (default) or 0o600.
     #[serde(default = "observer_socket_mode")]
     pub mode: u32,
-    /// Peer UIDs allowed to read; every other connection is refused before its request is read.
+    /// Allowlisted peer UIDs. Other connections are refused before their request is read.
     pub allowed_uids: Vec<u32>,
 }
 /// Group read/write without other access.
@@ -308,6 +310,17 @@ impl Config {
         }
         if let Some(observer) = &config.observer_socket {
             observer.validate(&config.socket_path)?;
+        }
+        if let Some(owner) = &config.owner_ingress {
+            owner.validate(&config.socket_path)?;
+            if owner.allowed_uids.contains(&config.expected_uid)
+                || config
+                    .observer_socket
+                    .as_ref()
+                    .is_some_and(|observer| observer.path == owner.path)
+            {
+                return Err(Fault::Invalid);
+            }
         }
         Ok(config)
     }

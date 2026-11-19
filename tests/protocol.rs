@@ -241,9 +241,18 @@ async fn protocol() {
 /// Exchange raw JSON-RPC in an isolated child. Notifications receive no reply.
 /// A 20-second deadline covers reads and EOF shutdown; cancellation kills the child.
 async fn raw_exchange(requests: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    raw_exchange_with_args(requests, &[]).await
+}
+
+/// Run a raw protocol exchange with the selected MCP frontend arguments.
+async fn raw_exchange_with_args(
+    requests: &[serde_json::Value],
+    args: &[&str],
+) -> Vec<serde_json::Value> {
     let root = tempfile::tempdir().unwrap();
     let mut child = tokio::process::Command::new(binary())
         .arg("mcp")
+        .args(args)
         .env_clear()
         .env("HOME", root.path())
         .current_dir(root.path())
@@ -1051,4 +1060,52 @@ async fn doctor_reports_owner_capacity_without_opening_database() {
         assert!(!output.stdout.windows(b"fixture-only-observer".len()).any(|bytes| bytes == b"fixture-only-observer"));
     }).await.expect("doctor fixture deadline");
     assert!(!path.join("must-not-open.db").exists());
+}
+
+/// Owner stdio discovery exposes the chat catalog without a resident or private config.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn chat_owner_stdio_catalog() {
+    let replies = raw_exchange_with_args(
+        &[modern_request("tools/list")],
+        &[
+            "--owner-socket",
+            "/fixture/owner.sock",
+            "--server-uid",
+            "1003",
+        ],
+    )
+    .await;
+    let tools = replies[0]["result"]["tools"].as_array().unwrap();
+    let names = tools
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        [
+            "pool_start",
+            "pool_list",
+            "pool_get",
+            "pool_post",
+            "pool_send_member",
+            "pool_replace",
+            "pool_close",
+            "pool_completion_get"
+        ]
+    );
+    let invalid = std::process::Command::new(binary())
+        .args([
+            "mcp",
+            "--owner-socket",
+            "/fixture/owner.sock",
+            "--server-uid",
+            "1003",
+            "--config",
+            "/fixture/private.toml",
+        ])
+        .output()
+        .unwrap();
+    assert!(!invalid.status.success());
+    assert!(invalid.stdout.is_empty());
 }
