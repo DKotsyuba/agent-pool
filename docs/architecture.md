@@ -409,8 +409,11 @@ deny group and other write and deny other access (for example 0750
 refuses a live socket or a non-socket entry at the path (`conflict`), removes a
 stale socket owned by `expected_uid` only after connection refusal, binds, sets
 the group and mode, and verifies owner, group, mode, inode and directory identity
-before serving. Any failure stops the resident; the endpoint is removed on exit
-only if it is still the bound inode.
+before serving. Each resident, observer and owner-ingress socket has a persistent
+`<socket>.lock` file. The resident holds its exclusive lock from before the probe
+through shutdown cleanup, so residents with separate stores cannot race to
+replace a shared endpoint. Any bind failure stops startup. On exit the resident
+removes the socket only if it is still the bound inode.
 
 Admission happens before any input is read. A peer UID outside the allowlist
 receives one line

@@ -62,6 +62,9 @@ pub enum Fault {
     Stale,
     /// A global role, membership, capacity, or idempotency invariant conflicts.
     Conflict,
+    /// Internal outbox signal. A dispatch lost a race and the store preserved recovery state.
+    #[serde(skip)]
+    DispatchConflict,
     /// The pool is closed and cannot be changed.
     Closed,
     /// The pool has a committed formal completion record and is final; it was
@@ -77,7 +80,11 @@ pub enum Fault {
 impl std::fmt::Display for Fault {
     /// Formats only the fixed safe code, never an underlying diagnostic.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
+        if *self == Self::DispatchConflict {
+            write!(f, "{:?}", Self::Conflict)
+        } else {
+            write!(f, "{self:?}")
+        }
     }
 }
 impl std::error::Error for Fault {}

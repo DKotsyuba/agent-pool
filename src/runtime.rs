@@ -8,8 +8,8 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
-    fs,
-    os::unix::fs::{MetadataExt, PermissionsExt},
+    fs::{self, File, OpenOptions},
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
@@ -95,6 +95,8 @@ pub(crate) struct SocketGuard {
     pub(crate) device: u64,
     /// Original inode for replacement-safe cleanup.
     pub(crate) inode: u64,
+    /// Held until inode-checked cleanup finishes. The lock path is never unlinked.
+    pub(crate) _lease: File,
 }
 impl Drop for SocketGuard {
     /// Best-effort endpoint cleanup; replacement files are preserved and data is never deleted.
@@ -2182,6 +2184,7 @@ mod managed_egress_dispatch {
                         })
                         .await;
                     }
+                    Err(Fault::Internal) => return Err(Fault::Internal),
                     Err(_) => return note(store, &lease, &id, "binding_unavailable").await,
                 };
                 let run = match RunPeer::from_config(config, &target.binding.pool_store_id) {
@@ -2227,8 +2230,8 @@ mod managed_egress_dispatch {
                 store.egress_pending_deferred(&key, now)
             })
             .await;
-            attempted?;
-            return deferred.map(|_| ());
+            deferred?;
+            return attempted;
         }
         if state == State::Publishing {
             note(store, &lease, &id, "outcome_unknown").await?;
@@ -2263,8 +2266,8 @@ mod managed_egress_dispatch {
             store.egress_closed_deferred(&key, now)
         })
         .await;
-        attempted?;
-        deferred.map(|_| ())
+        deferred?;
+        attempted
     }
 
     /// One pass over a frozen, known-unsent or uncertain effect. In a closed
@@ -3386,10 +3389,40 @@ async fn verify_managed_join(
     Ok(target)
 }
 
-/// Probes a pre-existing resident socket while this process holds the exclusive store lease.
-/// The lease proves no cooperating resident serves the path, so an accepted connection can
-/// only be the still-open listener of a predecessor in teardown (or a foreign listener):
-/// retry for one second before reporting it live. Other outcomes return at once.
+/// Locks one endpoint in its already validated directory before probing or binding.
+/// The persistent lock inode coordinates residents even when they use different stores.
+pub(crate) fn lock_endpoint(path: &Path, uid: u32) -> Result<File, Fault> {
+    let mut lock_path = path.as_os_str().to_owned();
+    lock_path.push(".lock");
+    let valid = |metadata: &fs::Metadata| {
+        metadata.is_file()
+            && metadata.uid() == uid
+            && metadata.mode() & 0o7777 == 0o600
+            && metadata.nlink() == 1
+    };
+    match fs::symlink_metadata(&lock_path) {
+        Ok(metadata) if valid(&metadata) => (),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        _ => return Err(Fault::Conflict),
+    }
+    let lease = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&lock_path)
+        .map_err(|_| Fault::Unavailable)?;
+    fs2::FileExt::try_lock_exclusive(&lease).map_err(|_| Fault::Conflict)?;
+    let opened = lease.metadata().map_err(|_| Fault::Unavailable)?;
+    let entry = fs::symlink_metadata(&lock_path).map_err(|_| Fault::Unavailable)?;
+    if !valid(&entry) || (entry.dev(), entry.ino()) != (opened.dev(), opened.ino()) {
+        return Err(Fault::Conflict);
+    }
+    Ok(lease)
+}
+
+/// Probes a pre-existing socket while holding its endpoint lease. An accepted
+/// connection is retried briefly to allow a predecessor's listener to close.
 pub(crate) async fn probe_listener(path: &Path) -> std::io::Result<UnixStream> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
     loop {
@@ -3403,9 +3436,10 @@ pub(crate) async fn probe_listener(path: &Path) -> std::io::Result<UnixStream> {
 }
 
 /// Binds one protected resident endpoint, refusing a live or nonprivate pre-existing path.
-/// A stale private socket is removed only after connection refusal and exclusive store ownership.
+/// A stale private socket is removed only after connection refusal under the endpoint lease.
 async fn listener(config: &Config) -> Result<(UnixListener, SocketGuard), Fault> {
     private_parent(&config.socket_path, config.expected_uid)?;
+    let lease = lock_endpoint(&config.socket_path, config.expected_uid)?;
     match fs::symlink_metadata(&config.socket_path) {
         Ok(_) => {
             private_socket(&config.socket_path, config.expected_uid)?;
@@ -3426,6 +3460,7 @@ async fn listener(config: &Config) -> Result<(UnixListener, SocketGuard), Fault>
         path: config.socket_path.clone(),
         device: metadata.dev(),
         inode: metadata.ino(),
+        _lease: lease,
     };
     fs::set_permissions(&config.socket_path, fs::Permissions::from_mode(0o600))
         .map_err(|_| Fault::Unavailable)?;
@@ -3584,7 +3619,11 @@ pub async fn serve(config_path: &Path) -> Result<(), Fault> {
     let chat_templates = crate::chat::renderer()?;
     let (owner_listener, _owner_guard, owner_uids) = match &config.owner_ingress {
         Some(settings) => {
-            let (listener, guard) = crate::observer_socket::listener(&config, settings).await?;
+            let (listener, guard) = crate::observer_socket::listener(&config, settings)
+                .await
+                .inspect_err(|_| {
+                    eprintln!("resident: startup refused at the owner ingress socket")
+                })?;
             (Some(listener), Some(guard), settings.allowed_uids.clone())
         }
         None => (None, None, Vec::new()),
@@ -4645,19 +4684,13 @@ async fn recover_namespace_retirement(config: &Config, store: &SharedStore) -> R
     Ok(())
 }
 
-/// Defers a conflicting or stale item without replaying a possible send as new work.
-/// Returns whether the effect was skipped. Storage faults abort the worker.
-async fn finish_dispatch(
-    store: &SharedStore,
-    id: &str,
-    outcome: Result<(), Fault>,
-) -> Result<bool, Fault> {
+/// Logs an explicitly classified race after the store has preserved recovery state.
+/// Returns whether the effect was skipped and propagates all other faults.
+fn finish_dispatch(id: &str, outcome: Result<(), Fault>) -> Result<bool, Fault> {
     match outcome {
         Ok(()) => Ok(false),
-        Err(fault @ (Fault::Conflict | Fault::Stale)) => {
+        Err(fault @ Fault::DispatchConflict) => {
             eprintln!("resident: effect {id} skipped: {fault}");
-            let id = id.to_owned();
-            stored(store, move |store| store.defer_effect(&id)).await?;
             Ok(true)
         }
         Err(fault) => Err(fault),
@@ -4759,7 +4792,7 @@ async fn work(
             };
             let id = next.effect_id.clone();
             let outcome = dispatch_effect(&store, &config, next, false, &activity).await;
-            if finish_dispatch(&store, &id, outcome).await? {
+            if finish_dispatch(&id, outcome)? {
                 skipped.insert(id);
             }
         }
@@ -4773,7 +4806,7 @@ async fn work(
             }
             let id = pending.effect_id.clone();
             let outcome = dispatch_effect(&store, &config, pending, true, &activity).await;
-            finish_dispatch(&store, &id, outcome).await?;
+            finish_dispatch(&id, outcome)?;
         }
         // One separate batch per tick, with concurrent two-second Run lookups
         // and one short Bridge exchange per item (no provider work under a Store lock).
@@ -4785,7 +4818,7 @@ async fn work(
             notices.spawn(async move {
                 let id = notice.effect_id.clone();
                 let outcome = effect(&store, &config, notice, false).await;
-                finish_dispatch(&store, &id, outcome).await
+                finish_dispatch(&id, outcome)
             });
         }
         while let Some(result) = notices.join_next().await {
@@ -12834,10 +12867,121 @@ mod tests {
         Ok(())
     }
 
+    /// Independent stores racing to replace a stale socket leave one live, reachable endpoint.
+    #[tokio::test]
+    async fn endpoint_lease_serializes_residents_with_distinct_stores()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = replacement_fixture()?;
+        let config = fixture.config;
+        let mut other = config.clone();
+        other.database_path = config.database_path.with_file_name("other.db");
+        let _other_store = Store::open(&other.database_path)?;
+        drop(std::os::unix::net::UnixListener::bind(&config.socket_path)?);
+        fs::set_permissions(&config.socket_path, fs::Permissions::from_mode(0o600))?;
+        let old_inode = fs::symlink_metadata(&config.socket_path)?.ino();
+        let lease = lock_endpoint(&config.socket_path, config.expected_uid)?;
+        assert!(matches!(listener(&other).await, Err(Fault::Conflict)));
+        assert_eq!(fs::symlink_metadata(&config.socket_path)?.ino(), old_inode);
+        drop(lease);
+        let (first, second) = tokio::join!(listener(&config), listener(&other));
+        let (bound, guard) = match (first, second) {
+            (Ok(pair), Err(Fault::Conflict)) | (Err(Fault::Conflict), Ok(pair)) => pair,
+            _ => return Err("expected one endpoint owner".into()),
+        };
+        let live = fs::symlink_metadata(&config.socket_path)?;
+        assert_eq!((live.dev(), live.ino()), (guard.device, guard.inode));
+        let _client = UnixStream::connect(&config.socket_path).await?;
+        tokio::time::timeout(Duration::from_secs(1), bound.accept()).await??;
+        drop((bound, guard));
+        let (_bound, _guard) = listener(&other).await?;
+        Ok(())
+    }
+
+    /// A concurrently frozen condition survives a failed dispatch and is used with the same key on the next tick.
+    #[tokio::test]
+    async fn outbox_worker_retries_inflight_conflict_with_frozen_key()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use serde_json::json;
+        let fixture = replacement_fixture()?;
+        let id = fixture.effect.effect_id.clone();
+        let Work::Replace { request_key, .. } = &fixture.effect.work else {
+            return Err("replacement intent".into());
+        };
+        let queued = id.clone();
+        stored(&fixture.store, move |store| {
+            store
+                .test_db()
+                .execute("UPDATE effects SET state='queued' WHERE id=?1", [&queued])?;
+            Ok(())
+        })
+        .await?;
+        let mut frozen: crate::run_status::Target = fixture.target.clone();
+        frozen.sequence += 1;
+        frozen.execution_ref = format!("ex1_{}", "c".repeat(64));
+        let (stop, stopped) = watch::channel(false);
+        let started = tokio::time::Instant::now();
+        let serve = async {
+            let capabilities =
+                json!({"schema_version":1,"product":"agent-run","store_id":fixture.store_id});
+            let (stream, request) = receive_run_request(&fixture.listener).await?;
+            assert_eq!(request["method"], "capabilities");
+            reply_to_run_request(stream, &request, capabilities.clone()).await?;
+            let (stream, request) = receive_run_request(&fixture.listener).await?;
+            assert_eq!(request["method"], "status");
+            let inflight = id.clone();
+            let competing = frozen.clone();
+            stored(&fixture.store, move |store| {
+                let claim: String = store.test_db().query_row(
+                    "SELECT json_extract(data,'$.work.claim') FROM effects WHERE id=?1 AND state='inflight'",
+                    [&inflight],
+                    |row| row.get(0),
+                )?;
+                store.freeze_replacement_condition(&inflight, &claim, &competing)
+            })
+            .await?;
+            reply_to_run_request(stream, &request, fixture.status.clone()).await?;
+            let (stream, request) = receive_run_request(&fixture.listener).await?;
+            assert!(started.elapsed() >= OBSERVATION_INTERVAL);
+            assert_eq!(request["method"], "capabilities");
+            reply_to_run_request(stream, &request, capabilities).await?;
+            let (stream, request) = receive_run_request(&fixture.listener).await?;
+            assert_eq!(request["method"], "batch_receipt");
+            assert_eq!(request["params"]["request_id"], *request_key);
+            assert_eq!(request["params"]["preconditions"], json!([frozen]));
+            reply_to_run_request(stream, &request, json!({"found":false})).await?;
+            let (stream, request) = receive_run_request(&fixture.listener).await?;
+            assert_eq!(request["method"], "start_batch");
+            assert_eq!(request["params"]["request_id"], *request_key);
+            assert_eq!(request["params"]["preconditions"], json!([frozen]));
+            drop(stream);
+            stop.send(true)?;
+            Ok::<_, Box<dyn std::error::Error>>(())
+        };
+        let (outcome, served) = tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::join!(
+                fixture_work(fixture.config.clone(), Arc::clone(&fixture.store), stopped),
+                serve
+            )
+        })
+        .await?;
+        outcome?;
+        served?;
+        assert_eq!(effect_state(&fixture.store, &id)?, "unknown");
+        Ok(())
+    }
+
     /// A settlement conflict leaves later work runnable, while a SQLite failure ends the worker.
     #[tokio::test]
     async fn outbox_worker_survives_settlement_conflict_and_exits_on_sqlite_fault()
     -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            finish_dispatch("integrity", Err(Fault::Conflict)),
+            Err(Fault::Conflict)
+        );
+        assert_eq!(
+            finish_dispatch("integrity", Err(Fault::Stale)),
+            Err(Fault::Stale)
+        );
         let fixture = replacement_fixture()?;
         let pool_id = fixture.pool_id;
         stored(&fixture.store, move |store| {

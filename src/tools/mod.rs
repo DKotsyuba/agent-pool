@@ -367,13 +367,13 @@ pub fn present(reply: Result<Reply, Fault>, templates: &Templates) -> CallToolRe
         Ok(Reply::Pending{pool_id,request_key})=>templates.render("pool_pending",&PendingView{pool_id,request_key}),
         Ok(Reply::List{pools,next_after,has_more})=>templates.render("pool_list",&ListView{pools,next_after,has_more:*has_more}),
         Ok(Reply::Enrollment(view))=>templates.render("pool_enrollment",view),
-        Err(code)=>templates.render("pool_error",&ErrorView{code:if *code==Fault::Completed{Fault::Closed}else{*code},recovery:match code{
+        Err(code)=>templates.render("pool_error",&ErrorView{code:match code{Fault::Completed=>Fault::Closed,Fault::DispatchConflict=>Fault::Conflict,_=>*code},recovery:match code{
             Fault::Stale=>"Read pool_get for current revision and proposal/roster identity before a new intent.",
             Fault::Unavailable=>"A previous write may have committed. Inspect pool_get or repeat only the identical request_key and intent.",
             Fault::RelaunchRequired=>"Relaunch the Pool resident after Bridge managed mode is enabled. Preserve the original request_key for recovery.",
             Fault::Unauthorized=>"Fresh native identity is required; no pool command was authorized.",
             Fault::Forbidden=>"The current authenticated caller cannot perform this action.",
-            Fault::Conflict=>"A role, membership or idempotency conflict prevents this intent.",
+            Fault::Conflict | Fault::DispatchConflict=>"A role, membership or idempotency conflict prevents this intent.",
             Fault::Closed=>"This pool was explicitly closed; global leader status remains.",
             Fault::Completed=>"This pool is completed: a formal completion record is committed and final (it was not explicitly closed). Reads, messages, explicit close and history release remain.",
             Fault::Invalid=>"Check documented fields, UTF-8 byte limits and exact identifiers.",

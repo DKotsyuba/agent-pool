@@ -9,7 +9,8 @@ Fix release, 2026-11-19.
 ### Fixed
 
 - On restart, the resident waits briefly for its predecessor to release the writer lease and the listening socket. Startup diagnostics identify the failing stage.
-- Conflicting or stale outbox effects yield to other work and remain eligible for reconciliation. Storage failures still stop the resident.
+- Recoverable outbox races yield to other work and preserve the original request key for reconciliation. Store and integrity failures still stop the resident.
+- Endpoint leases serialize stale socket cleanup across residents that use different stores.
 
 ## 0.2.2
 
