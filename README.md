@@ -186,7 +186,10 @@ wakeable profile such as `implement` or `review`. Pool refuses `research` for bo
 start and replacement because it cannot receive pool chat notices. The owner
 `pool_get` overview includes up to five recently retired seats and reports
 `notice_undeliverable` per seat. Use `section=members` to page through all current
-and retired chat seats. Mutations take the observed `expected_revision`. Owners supply a
+and retired chat seats. For each continuation, pass the previous page’s `next` as
+the string `after` and the first page’s `revision` as `expected_revision`. If the
+revision changed, restart at the first page. Mutations take the observed
+`expected_revision`. Owners supply a
 stable `request_key`. The resident reconciles Run receipts when admission is uncertain,
 even if the owner disconnects.
 `pool_start` accepts an optional canonical `owner_address` for Bridge notices.
