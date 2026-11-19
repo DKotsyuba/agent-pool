@@ -179,19 +179,25 @@ admission acknowledgement. Pool stores it privately by Run store and pin in
 the same transaction as the admission. Receipt lookup and replay can recover
 the pin but cannot recover the token. Pool releases it over the original verified
 socket with `history_pins_release {pin_id, release_token, expected_store_id}`.
-The request-key form and the older combined method remain compatibility paths
-for older Run servers. On current Run, legacy pins and recovered admissions
+Pool selects the token, request-key or older combined method from the socket
+tool catalog before release. On current Run, legacy pins and recovered admissions
 with missing tokens settle as `pin_release_token_unavailable`. The owner gets
-Run’s offline release guidance in deliveries, and Pool stops automatic retries.
+the exact non-secret recovery inputs in deliveries when the public receipt is
+known. After offline release or a Run rollback, a fresh `pool_release_history`
+request requeues the same intent. On token-only Run, Pool accepts an exact
+store-fenced released tombstone. A rejected parameter shape stops automatic
+retries and requires another owner request after correction. After formal
+completion, retained late public admissions expose a dormant release operation
+per pin. Closing the pool lets the owner release it by the recorded member ID
+without installing the late member.
 A managed pin goes over the authenticated attempt channel as
 `_managed_pin_release_v1` when `_attempt_capabilities_v1` lists
-`managed_pin_release_v1`; otherwise only the old combined socket method is tried,
-which a current Run rejects, so the outcome stays unknown. A changed route or
-store also stays unknown.
+`managed_pin_release_v1`. On older Run, the advertised combined socket method
+can release a managed pin. A changed route or store stays unknown.
 
 A confirmed release (`already_released` false or true) settles `accepted`.
-`RequestConflict` or `ValidationError` on the socket, or `intent_conflict` on the
-wire, settles `refused`: Run declines the release, for example while
+`RequestConflict` on the socket or `intent_conflict` on the managed
+wire settles `refused`. Run declines the release, for example while
 a lineage hold protects the pin. A refused intent no longer blocks a new owner
 request, so the owner can retry after the hold is released. `PinNotFound`,
 `StoreIdentityMismatch`, `pin_not_found`, `route_mismatch`,

@@ -1018,6 +1018,19 @@ pub struct Delivery {
     /// Whether a relaunch applies to the removed/current member or the Pool resident.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention_subject: Option<String>,
+    /// Owner-only exact inputs for a public pin recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin_recovery: Option<PinRecovery>,
+}
+/// Public admission identifiers needed for the Run database owner to recover a pin.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PinRecovery {
+    /// Original Run store fence.
+    pub store_id: String,
+    /// Exact retained pin.
+    pub pin_id: String,
+    /// Original public batch request identifier.
+    pub request_key: String,
 }
 /// Mutation receipt remains safe for all participants and exact retries.
 #[derive(Clone, Debug, Serialize, Deserialize)]
