@@ -963,7 +963,7 @@ fn owner_member_page(db: &Connection, pool: &Pool, input: GetPool) -> Result<Cha
         .unwrap_or("0")
         .parse::<i64>()
         .map_err(|_| Fault::Invalid)?;
-    if offset < 0 {
+    if offset < 0 || (offset != 0 && input.expected_revision.is_none()) {
         return Err(Fault::Invalid);
     }
     let mut stmt = db.prepare(

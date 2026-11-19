@@ -21,6 +21,8 @@ Proposal {{ proposal.id }} {{ proposal.state }} roster_key={{ proposal.roster_ke
 {% if completion %}
 Completion {{ completion }}
 {% endif %}
+{% elif more %}
+Continue with section=members after="{{ next }}" expected_revision={{ revision }}.
 {% endif %}
 {% elif view == "history" %}
 Pool {{ pool_id }} revision={{ revision }} | history more={{ more }} next={{ next }}

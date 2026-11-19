@@ -1116,6 +1116,11 @@ async fn chat_owner_pages_retired_seats_and_failures() -> Result<(), Box<dyn std
     args["members"] = json!(vec![spec("review"); 8]);
     let batch = stored(&store, move |store| state::start(store, parse(args)?)).await?;
     install(&store, &batch).await?;
+    let mut walk = input(None);
+    walk["request_key"] = json!("interleaved-walk");
+    walk["members"] = json!(vec![spec("review"); 6]);
+    let walk = stored(&store, move |store| state::start(store, parse(walk)?)).await?;
+    install(&store, &walk).await?;
     let templates = renderer()?;
     stored(&store, move |store| {
         let pid = batch.pool_id;
@@ -1139,6 +1144,7 @@ async fn chat_owner_pages_retired_seats_and_failures() -> Result<(), Box<dyn std
         };
         assert_eq!(view.roster.len(), 5);
         assert_eq!((view.omitted_retired, view.omitted_undeliverable), (3, 3));
+        let revision = view.revision;
         let text = serde_json::to_string(&present(Ok(overview), templates))
             .map_err(|_| Fault::Internal)?;
         assert!(text.contains("+3 more retired seats (3 undeliverable), see section=members."));
@@ -1147,7 +1153,7 @@ async fn chat_owner_pages_retired_seats_and_failures() -> Result<(), Box<dyn std
             let reply = state::owner_call(
                 store,
                 "pool_get",
-                json!({"pool_id":pid,"section":"members","after":after}),
+                json!({"pool_id":pid,"section":"members","after":after,"expected_revision":revision}),
             )?;
             let ChatReply::Members {
                 roster,
@@ -1169,6 +1175,23 @@ async fn chat_owner_pages_retired_seats_and_failures() -> Result<(), Box<dyn std
             assert!(text.contains("retired=true") && text.contains("notice_undeliverable=true"));
         }
         assert_eq!(ids.len(), 8);
+
+        let pid = walk.pool_id;
+        let page = state::owner_call(store, "pool_get", json!({"pool_id":pid,"section":"members"}))?;
+        let ChatReply::Members { revision, next, more: true, .. } = page else {
+            return Err(Fault::Internal);
+        };
+        let after = next.to_string();
+        assert_eq!(state::owner_call(store, "pool_get", json!({
+            "pool_id":pid,"section":"members","after":after
+        })).err(), Some(Fault::Invalid));
+        state::replace(store, parse(json!({
+            "pool_id":pid,"expected_revision":revision,"request_key":"interleaved-replace",
+            "member_id":walk.jobs[0].member_id,"member":spec("review")
+        }))?)?;
+        assert_eq!(state::owner_call(store, "pool_get", json!({
+            "pool_id":pid,"section":"members","after":after,"expected_revision":revision
+        })).err(), Some(Fault::Stale));
         Ok(())
     })
     .await?;
