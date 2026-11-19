@@ -1,6 +1,9 @@
 {% if view == "overview" %}
 Pool {{ pool_id }} revision={{ revision }} {{ state }}
 {{ name|quote }} | Goal {{ purpose }}
+{% if latest_admission %}
+Latest batch admission={{ latest_admission }}
+{% endif %}
 {% if acceptance %}
 Structured acceptance. Read pool_get section=criteria.
 {% endif %}

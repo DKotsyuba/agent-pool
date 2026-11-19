@@ -180,6 +180,8 @@ pub(crate) struct AgreementBallot {
 
 #[derive(Serialize)]
 pub(crate) struct Overview {
+    /// Durable state of the latest launch or replacement, including after closure.
+    pub latest_admission: Option<String>,
     pub pool_id: String,
     pub name: String,
     pub purpose: String,
@@ -313,7 +315,7 @@ fn present(result: Result<ChatReply, Fault>, templates: &Templates) -> CallToolR
     match result {
         Ok(ChatReply::Existing(reply)) => crate::tools::present(Ok(reply), templates),
         Ok(reply) => {
-            let is_error = matches!(&reply, ChatReply::Launch { state, .. } if matches!(state.as_str(), "refused" | "cancelled"));
+            let is_error = matches!(&reply, ChatReply::Launch { state, .. } if matches!(state.as_str(), "refused" | "cancelled" | "not_launched"));
             let text = templates.render("chat", &reply).unwrap_or_else(|_| match &reply {
                 ChatReply::Launch { pool_id, revision, state, request_key, old_agent_id, .. } => format!("Pool {pool_id} revision={revision} admission={state}. Request key {request_key}. Read pool_get for current admission. Prior Run ID: {old_agent_id:?}"),
                 _ => "READ COMPLETED; presentation degraded. Repeat the read with the same cursor.".into(),
@@ -478,36 +480,43 @@ pub(crate) async fn reconcile(
         return Ok(());
     };
     cursor.clone_from(&batch.id);
-    let run_store = if let Some(fence) = &batch.run_store {
-        fence.clone()
+    let run_store = if let Some(identity) = &batch.run_store {
+        identity.clone()
     } else {
         let Ok(identity) = integrations::run_store_identity(config).await else {
             return Ok(());
         };
         identity
     };
-    let lookup =
-        integrations::batch_receipt(config, &batch.id, &batch.jobs, false, Some(&run_store)).await;
-    let rows = match lookup {
-        Ok(Some(rows)) if batch.run_store.is_some() => rows,
-        Ok(None) if batch.run_store.is_none() => {
-            // The store lock orders close against this durable possible-send decision.
-            let (id, identity) = (batch.id.clone(), run_store.clone());
-            batch = stored(store, move |store| state::fence(store, &id, &identity)).await?;
-            if batch.state != "pending" || batch.run_store.is_none() {
-                return Ok(());
+    // Reload under the store lock so close during identity discovery wins.
+    let (id, identity) = (batch.id.clone(), run_store.clone());
+    batch = stored(store, move |store| state::fence(store, &id, &identity)).await?;
+    if batch.state != "pending" {
+        return Ok(());
+    }
+    let fence = batch.run_store.as_deref();
+    let rows = if batch.closed {
+        match integrations::batch_receipt(config, &batch.id, &batch.jobs, false, fence).await {
+            Ok(Some(rows)) => rows,
+            Ok(None) => {
+                return stored(store, move |store| {
+                    state::settle_batch(store, &batch.id, "not_launched")
+                })
+                .await;
             }
-            match integrations::start_batch(config, &batch.id, &batch.jobs, false, Some(&run_store))
-                .await
-            {
-                Ok(rows) => rows,
-                Err(failure) if failure.known_unadmitted => {
-                    return stored(store, move |store| state::refused(store, &batch.id)).await;
-                }
-                Err(_) => return Ok(()),
-            }
+            Err(_) => return Ok(()),
         }
-        _ => return Ok(()),
+    } else {
+        match integrations::start_batch(config, &batch.id, &batch.jobs, false, fence).await {
+            Ok(rows) => rows,
+            Err(failure) if failure.known_unadmitted => {
+                return stored(store, move |store| {
+                    state::settle_batch(store, &batch.id, "refused")
+                })
+                .await;
+            }
+            Err(_) => return Ok(()),
+        }
     };
     stored(store, move |store| state::admitted(store, &batch, rows)).await
 }

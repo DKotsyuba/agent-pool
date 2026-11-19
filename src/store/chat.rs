@@ -134,6 +134,7 @@ pub(super) fn commit_agreement(
 /// Frozen ordered batch shared by receipt lookup and admission.
 #[derive(Serialize, serde::Deserialize)]
 pub(crate) struct ChatBatch {
+    pub closed: bool,
     pub id: String,
     pub pool_id: String,
     pub request_key: String,
@@ -169,6 +170,7 @@ fn batch_by_id(db: &Connection, id: &str) -> Result<ChatBatch, Fault> {
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
     )?;
     Ok(ChatBatch {
+        closed: pool(db, &pool_id)?.0.closed,
         id: id.into(),
         pool_id,
         request_key,
@@ -421,15 +423,15 @@ pub(crate) fn admitted(
 
 /// Cancels a batch that has not been fenced or submitted to Run.
 pub(super) fn cancel_unsubmitted(db: &Connection, pool: &str) -> Result<(), Fault> {
-    db.execute("UPDATE chat_batches SET state='cancelled' WHERE pool=?1 AND state='pending' AND run_store IS NULL", [pool])?;
+    db.execute("UPDATE chat_batches SET state='not_launched' WHERE pool=?1 AND state='pending' AND run_store IS NULL", [pool])?;
     Ok(())
 }
 
-/// Records only a definitive Run refusal.
-pub(crate) fn refused(store: &mut Store, id: &str) -> Result<(), Fault> {
+/// Settles a pending batch with definitive Run evidence.
+pub(crate) fn settle_batch(store: &mut Store, id: &str, state: &str) -> Result<(), Fault> {
     store.db.execute(
-        "UPDATE chat_batches SET state='refused' WHERE id=?1 AND state='pending'",
-        [id],
+        "UPDATE chat_batches SET state=?2 WHERE id=?1 AND state='pending'",
+        params![id, state],
     )?;
     Ok(())
 }
@@ -767,6 +769,13 @@ pub(crate) fn get(db: &Connection, input: GetPool, seat: Option<&str>) -> Result
                 })
         });
     Ok(ChatReply::Overview(Overview {
+        latest_admission: db
+            .query_row(
+                "SELECT state FROM chat_batches WHERE pool=?1 ORDER BY rowid DESC LIMIT 1",
+                [&input.pool_id],
+                |row| row.get(0),
+            )
+            .optional()?,
         pool_id: pool.pool_id,
         name: pool.name,
         purpose: brief(&pool.purpose, 600),
