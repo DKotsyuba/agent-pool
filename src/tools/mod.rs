@@ -30,7 +30,65 @@ fn mutation(fields: Value, required: &[&str]) -> Value {
 fn tool(name: &str, description: &str, schema: Value, read: bool) -> Value {
     json!({"name":name,"description":description,"inputSchema":schema,"annotations":{"readOnlyHint":read,"destructiveHint":!read,"idempotentHint":true,"openWorldHint":!read}})
 }
-/// Exports all tools without credentials; each actual Pool execution authenticates in the resident.
+/// Derives a closed chat catalog from the shared command schemas and chat-only selectors.
+pub(crate) fn chat_definitions(names: &[&str], member: bool) -> Vec<Value> {
+    let base = definitions();
+    let string = json!({"type":"string","minLength":1,"maxLength":128});
+    let seat = json!({"type":"object","additionalProperties":false,"required":["assignment","spec"],"properties":{
+        "assignment":{"type":"string","minLength":1,"maxLength":512},
+        "spec":{"type":"object","required":["provider","model","profile","workdir"],"properties":{
+            "provider":{"type":"string"},"model":{"type":"string"},"profile":{"type":"string"},"workdir":{"type":"string"},"effort":{"type":"string"},"task":{"type":"string"}
+        }}
+    }});
+    names.iter().map(|name| {
+        let mut tool = base.iter().find(|row| row["name"] == *name).cloned().unwrap_or_else(|| json!({"name":name}));
+        match *name {
+            "pool_start" => {
+                let mut schema = base.iter().find(|row| row["name"] == "pool_create").map_or(Value::Null, |row| row["inputSchema"].clone());
+                schema["properties"]["members"] = json!({"type":"array","minItems":1,"maxItems":crate::domain::MAX_MEMBERS,"items":seat});
+                schema["properties"]["owner_address"] = json!({"type":"string","description":"Optional initiating Bridge address for notices."});
+                schema["required"] = json!(["request_key","name","purpose","members"]);
+                tool = json!({"name":name,"description":"Create a shared chat and start ordinary Run agents. Retry uncertain admission with the same request_key and intent.","inputSchema":schema});
+            }
+            "pool_get" => {
+                tool["description"] = json!("Read a compact overview or select history, members, proposal, votes, criteria or content. Use the exact next cursor for the selected section.");
+                tool["inputSchema"] = json!({"type":"object","additionalProperties":false,"required":if member {json!([])} else {json!(["pool_id"])},
+                  "properties":{"pool_id":string,"section":{"enum":["overview","history","members","proposal","votes","criteria","content"]},
+                    "after":string,"field":{"enum":["purpose","snapshot"]},"expected_revision":{"type":"integer","minimum":1}}});
+                if member && let Some(props) = tool["inputSchema"]["properties"].as_object_mut() { props.remove("pool_id"); }
+            }
+            "pool_list" => {
+                tool["description"] = json!("List pools across all owners. Continue with the exact after cursor.");
+                tool["inputSchema"]["properties"]["state"] = json!({"enum":["open","completed","closed"]});
+            }
+            "pool_replace" => {
+                tool["description"] = json!("Replace a seat using a new ordinary Run start spec. Cancel the old execution through Run if needed.");
+                tool["inputSchema"]["properties"] = json!({"pool_id":string,"request_key":string,"expected_revision":{"type":"integer","minimum":1},"member_id":string,"member":seat});
+                tool["inputSchema"]["required"] = json!(["pool_id","request_key","expected_revision","member_id","member"]);
+            }
+            "pool_completion_get" => {
+                tool = json!({"name":name,"description":"Read an immutable agreement or a historical managed completion page.","inputSchema":{
+                  "type":"object","additionalProperties":false,"required":["pool_id"],"properties":{
+                    "pool_id":string,"completion_id":string,"section":{"enum":["header","content"]},"after":{"type":"object"}}}});
+            }
+            "pool_join" => tool["description"] = json!("Join your admitted seat at the current pool revision."),
+            "pool_propose" => tool["description"] = json!("Propose a result for all current seats to vote on after every seat joins."),
+            "pool_send_member" => tool["description"] = json!("Send to an exact current member_id. History is visible to the sender, recipient and owners."),
+            _ => {}
+        }
+        if member && *name != "pool_get" {
+            if let Some(props) = tool["inputSchema"]["properties"].as_object_mut() {
+                props.remove("pool_id");
+                props.remove("request_key");
+            }
+            if let Some(required) = tool["inputSchema"]["required"].as_array_mut() {
+                required.retain(|field| field != "pool_id" && field != "request_key");
+            }
+        }
+        tool
+    }).collect()
+}
+/// Exports the legacy tools without credentials; the resident authenticates calls.
 pub fn definitions() -> Vec<Value> {
     let role = json!({"name":string(80),"role":string(160),"task":string(512)});
     let mut add = role.clone();

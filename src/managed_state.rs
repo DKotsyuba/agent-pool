@@ -2762,6 +2762,7 @@ pub(crate) mod tests {
             run_peer_uid: None,
             managed_run_reader: None,
             observer_socket: None,
+            owner_ingress: None,
             managed_run_transport: Some(crate::config::ManagedRunTransport {
                 frontend_enabled: false,
                 mcp_server: None,

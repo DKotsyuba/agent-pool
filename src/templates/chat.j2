@@ -1,0 +1,65 @@
+{% if view == "overview" %}
+Pool {{ pool_id }} revision={{ revision }} {{ state }}
+{{ name|quote }} | Goal {{ purpose }}
+{% if acceptance %}
+Structured acceptance. Read pool_get section=criteria.
+{% endif %}
+Seats {{ seat_count }} | ready={{ ready }} blocked={{ blocked }}
+{% for s in roster %}
+{{ s.seat_id }} | {{ s.profile|quote }} | admission={{ s.admitted }} joined={{ s.joined }} process={{ s.process }}{% if s.agent_id %} run={{ s.agent_id }} sequence={{ s.sequence }}{% endif %} | {{ s.assignment }}
+{% endfor %}
+{% if proposal %}
+Proposal {{ proposal.id }} {{ proposal.state }} roster_key={{ proposal.roster_key }}
+{% endif %}
+{% if completion %}
+Completion {{ completion }}
+{% endif %}
+{% elif view == "history" %}
+Pool {{ pool_id }} revision={{ revision }} | history more={{ more }} next={{ next }}
+{% for e in events %}
+{{ e.id }} {{ e.kind }} {{ e.author }}{% if e.recipient %} to={{ e.recipient }}{% endif %}{% if e.message_event_id %} message={{ e.message_event_id }} part={{ e.part_index }}/{{ e.part_count }}{% endif %} {{ e.body|quote }}
+{% endfor %}
+{% elif view == "list" %}
+Pools {{ returned }}
+{% for p in pools %}
+{{ p.id }} {{ p.status }} {{ p.name|quote }}{% if p.completion %} completion={{ p.completion }}{% endif %}
+{% endfor %}
+{% if next %}
+Next after={{ next }}
+{% endif %}
+{% elif view == "launch" %}
+Pool {{ pool_id }} revision={{ revision }} admission={{ state }}
+{% for s in seats %}
+Seat {{ s.id }} current={{ s.current }} joined={{ s.joined }}{% if s.agent_id %} run={{ s.agent_id }}{% endif %}
+{% endfor %}
+{% if state == "pending" %}
+Run admission may be uncertain. Repeat request_key={{ request_key }} with identical intent to reconcile.
+{% endif %}
+{% if old_agent_id %}
+Prior Run ID {{ old_agent_id }}. Use Run if cancellation is needed.
+{% endif %}
+{% elif view == "agreement" %}
+Agreement {{ completion_id }} | pool {{ pool_id }} revision={{ revision }} event={{ event_id }}
+Proposal {{ proposal_id }} roster_key={{ roster_key }}
+Result {{ result|quote }}
+{% for ballot in ballots %}
+Seat {{ ballot.seat_id }} Run {{ ballot.agent_id }} vote_event={{ ballot.vote_event_id }}
+{% endfor %}
+{% elif view == "legacy" %}
+Managed completion {{ completion_id }} | pool {{ pool_id }} section={{ section }} digest={{ record_digest }}
+{% if header %}
+Proposal {{ header.proposal_id }} revision={{ header.source_revision }}
+Roster {{ header.roster_entries }} | ballots {{ header.ballots }} | Run targets {{ header.run_targets }}
+{% for field in header.content %}
+{{ field.field }} bytes={{ field.length }} present={{ field.present }}
+{% endfor %}
+{% endif %}
+{% for item in items %}
+{% if item.item == "content" %}
+{{ item.field }} offset={{ item.offset }}/{{ item.total_bytes }} {{ item.text|quote }}
+{% endif %}
+{% endfor %}
+{% if next_cursor %}
+Next after {version:1, completion_id:{{ next_cursor.completion_id|quote }}, record_digest:{{ next_cursor.record_digest|quote }}, section:{{ next_cursor.section|quote }}, position:{{ next_cursor.position|quote }}}
+{% endif %}
+{% endif %}

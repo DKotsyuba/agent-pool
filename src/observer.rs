@@ -377,6 +377,8 @@ pub enum Data {
     RunProof(#[serde(deserialize_with = "crate::integrations::json_object")] Box<RunProof>),
     /// One verified, cursor-fenced completion record page.
     Completion(Box<crate::completion::Page>),
+    /// Immutable ordinary chat agreement.
+    Agreement(Box<crate::chat::Agreement>),
     /// One owner-visible managed enrollment projection.
     Enrollment(Box<domain::EnrollmentView>),
 }
@@ -786,7 +788,7 @@ impl Expected {
                     | ("delivery_attention", Data::DeliveryAttention(_))
                     | ("pool_detail", Data::Detail(_))
                     | ("run_proof", Data::RunProof(_))
-                    | ("completion_page", Data::Completion(_))
+                    | ("completion_page", Data::Completion(_) | Data::Agreement(_))
                     | ("enrollment", Data::Enrollment(_))
             )
         }) {
@@ -796,6 +798,16 @@ impl Expected {
             return Err(Fault::Unavailable);
         }
         if matches!(&envelope.data, Some(Data::DeliveryAttention(attention)) if !attention.valid())
+        {
+            return Err(Fault::Unavailable);
+        }
+        if let Some(Data::Agreement(agreement)) = &envelope.data
+            && !self.completion.as_ref().is_some_and(|request| {
+                request.section == crate::completion::Section::Header
+                    && agreement.version == 1
+                    && request.pool_id == agreement.pool_id
+                    && request.completion_id == agreement.completion_id
+            })
         {
             return Err(Fault::Unavailable);
         }

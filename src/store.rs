@@ -1,4 +1,5 @@
 //! Single-writer SQLite state machine. Transactions commit business state and delivery intents together.
+pub(crate) mod chat;
 use crate::{domain::*, integrations::PinReleaseToken};
 use fs2::FileExt;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -1240,9 +1241,17 @@ impl Store {
             Operation::InventorySnapshot(args) => {
                 inventory_snapshot(&self.db, &self.read_epoch, args)
             }
-            Operation::CompletionGet(args) => Ok(Data::Completion(Box::new(
-                crate::completion::page(&self.db, args)?,
-            ))),
+            Operation::CompletionGet(args) => {
+                match chat::agreement(&self.db, &args.pool_id, Some(&args.completion_id))? {
+                    Some(agreement) if args.section == crate::completion::Section::Header => {
+                        Ok(Data::Agreement(Box::new(agreement)))
+                    }
+                    Some(_) => Err(Fault::Invalid),
+                    None => Ok(Data::Completion(Box::new(crate::completion::page(
+                        &self.db, args,
+                    )?))),
+                }
+            }
             Operation::EnrollmentGet(args) => Ok(Data::Enrollment(Box::new(
                 crate::managed_enrollment::view(&self.db, &args.pool_id, &args.enrollment_id)?,
             ))),
@@ -1502,6 +1511,9 @@ PRAGMA user_version=5;")?;
         }
         if version < 17 {
             db.execute_batch("CREATE TABLE IF NOT EXISTS run_pin_release_tokens(store_id TEXT NOT NULL,pin_id TEXT NOT NULL,token TEXT NOT NULL,PRIMARY KEY(store_id,pin_id)); PRAGMA user_version=17;")?;
+        }
+        if version < 18 {
+            chat::migrate(&db)?;
         }
         if version < crate::completion::SCHEMA_VERSION {
             db.execute_batch("COMMIT;")?;
@@ -1966,6 +1978,10 @@ PRAGMA user_version=5;")?;
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let retired: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM chat_notice_targets n JOIN members m ON m.id=n.member WHERE n.effect=?1 AND m.current=0)", [effect_id], |r| r.get(0))?;
+        if retired {
+            return Err(Fault::Closed);
+        }
         let e = effect(&tx, effect_id)?;
         if !matches!(e.work, Work::Deliver { .. }) || producer.is_empty() || !params.is_object() {
             return Err(Fault::Invalid);
@@ -2165,7 +2181,8 @@ PRAGMA user_version=5;")?;
             [effect_id],
             |r| r.get(0),
         )?;
-        if !failure_notice
+        if !chat::enabled(&tx, &effect.pool_id)?
+            && !failure_notice
             && matches!(state, "refused" | "unknown")
             && !matches!(effect.work, Work::Retire { .. })
         {
@@ -2664,7 +2681,7 @@ PRAGMA user_version=5;")?;
     pub fn observation_targets(&self) -> Result<Vec<Binding>, Fault> {
         let mut stmt = self
             .db
-            .prepare("SELECT data FROM members WHERE current=1 ORDER BY id")?;
+            .prepare("SELECT data FROM members WHERE current=1 AND NOT EXISTS(SELECT 1 FROM chat_pools WHERE pool=members.pool) ORDER BY id")?;
         stmt.query_map([], |r| r.get::<_, String>(0))?
             .map(|r| decode(&r?))
             .collect()
@@ -2870,7 +2887,7 @@ fn execute(
     command: &Command,
     enrollment: Option<&crate::managed_enrollment::EnrollmentRoute>,
 ) -> Result<Reply, Fault> {
-    execute_authorized(db, actor, command, None, false, enrollment)
+    execute_authorized(db, actor, command, None, false, enrollment, None)
 }
 
 /// Apply an already admitted participant mutation under its exact frozen binding.
@@ -2929,13 +2946,21 @@ pub(crate) fn apply_managed_mutation(
         "INSERT INTO temp.managed_delivery_origin(singleton,namespace_id) VALUES(1,?1)",
         [&namespace],
     )?;
-    let result = execute_authorized(db, &actor, command, Some(binding), checked_consensus, None)
-        .and_then(|reply| {
-            if matches!(command, Command::Join(_)) {
-                crate::managed_enrollment::mark_joined(db, &binding.member_id)?;
-            }
-            Ok(reply)
-        });
+    let result = execute_authorized(
+        db,
+        &actor,
+        command,
+        Some(binding),
+        checked_consensus,
+        None,
+        None,
+    )
+    .and_then(|reply| {
+        if matches!(command, Command::Join(_)) {
+            crate::managed_enrollment::mark_joined(db, &binding.member_id)?;
+        }
+        Ok(reply)
+    });
     db.execute(
         "DELETE FROM temp.managed_delivery_origin WHERE singleton=1",
         [],
@@ -2955,6 +2980,7 @@ fn execute_authorized(
     managed: Option<&crate::managed_state::ManagedBinding>,
     checked_consensus: bool,
     enrollment: Option<&crate::managed_enrollment::EnrollmentRoute>,
+    chat_actor: Option<crate::chat::ChatActor<'_>>,
 ) -> Result<Reply, Fault> {
     if let Command::Create(c) = command {
         return create(db, actor, c, command);
@@ -2982,12 +3008,20 @@ fn execute_authorized(
     };
     let (mut p, owner) = pool(db, pid)?;
     let mut roster = bindings(db, pid)?;
+    use crate::chat::ChatActor;
+    if chat_actor.is_none() && chat::enabled(db, pid)? {
+        return Err(Fault::Forbidden);
+    }
     let is_owner = owner == actor.key;
     let caller = roster
         .iter()
         .find(|b| {
-            b.actor.as_deref() == Some(&actor.key)
-                || (b.actor.is_none() && b.address.as_deref() == Some(&actor.address))
+            if let Some(ChatActor::Member(seat)) = chat_actor {
+                b.member.member_id == seat
+            } else {
+                b.actor.as_deref() == Some(&actor.key)
+                    || (b.actor.is_none() && b.address.as_deref() == Some(&actor.address))
+            }
         })
         .cloned();
     if !is_owner && caller.is_none() {
@@ -3004,7 +3038,8 @@ fn execute_authorized(
         {
             return Err(Fault::Unauthorized);
         }
-    } else if !is_owner
+    } else if chat_actor.is_none()
+        && !is_owner
         && caller
             .as_ref()
             .is_some_and(|binding| binding.run_id.is_some())
@@ -3050,7 +3085,8 @@ fn execute_authorized(
             | Command::Join(_)
             | Command::Propose(_)
             | Command::Vote(_)
-    ) && crate::completion::completed(db, pid)?
+    ) && (crate::completion::completed(db, pid)?
+        || (chat_actor.is_some() && chat::agreement(db, pid, None)?.is_some()))
     {
         return Err(Fault::Completed);
     }
@@ -3120,10 +3156,17 @@ fn execute_authorized(
         }
         Command::Close(_) => {
             p.closed = true;
+            if chat_actor.is_some() {
+                chat::cancel_unsubmitted(db, pid)?;
+            }
             stale(&mut p);
             closed_members = roster.clone();
             for b in &roster {
-                remove_binding(db, b, &p)?;
+                if chat_actor.is_some() {
+                    save_binding(db, b, false)?;
+                } else {
+                    remove_binding(db, b, &p)?;
+                }
             }
             roster.clear();
             (
@@ -3391,7 +3434,9 @@ fn execute_authorized(
             if occupied {
                 return Err(Fault::Conflict);
             }
-            b.actor = Some(actor.key.clone());
+            if chat_actor.is_none() {
+                b.actor = Some(actor.key.clone());
+            }
             b.member.state = MemberState::Active;
             target = Some(b.member.member_id.clone());
             save_binding(db, b, true)?;
@@ -3422,7 +3467,11 @@ fn execute_authorized(
             )
         }
         Command::Notify(x) => {
-            direct_address = Some(owner_address(db, &owner)?);
+            direct_address = if chat_actor.is_some() {
+                chat::owner_address(db, pid)?
+            } else {
+                Some(owner_address(db, &owner)?)
+            };
             direct_scope = Some(format!("owner:{pid}"));
             (
                 "owner_message",
@@ -3436,7 +3485,7 @@ fn execute_authorized(
                 .filter(|b| b.member.state == MemberState::Active)
                 .map(|b| b.member.member_id.clone())
                 .collect();
-            if voters.is_empty() {
+            if voters.is_empty() || (chat_actor.is_some() && voters.len() != roster.len()) {
                 return Err(Fault::Conflict);
             }
             let superseded = if let Some(previous) = p
@@ -3570,7 +3619,7 @@ fn execute_authorized(
         append_message_parts(db, &p, &mut event, &message_parts)?;
     }
     if let Command::Vote(x) = command
-        && p.acceptance.is_some()
+        && (p.acceptance.is_some() || chat_actor.is_some())
     {
         let member = &caller.as_ref().ok_or(Fault::Forbidden)?.member.member_id;
         let ballot = p
@@ -3584,7 +3633,25 @@ fn execute_authorized(
         }
     }
     save_pool(db, &p)?;
-    if system {
+    let mut chat_completed = false;
+    if chat_actor.is_some() {
+        chat::queue_chat_notices(
+            db,
+            &p,
+            &roster,
+            &event,
+            direct_address.as_deref(),
+            caller.as_ref(),
+        )?;
+        if matches!(command, Command::Vote(_))
+            && p.proposal
+                .as_ref()
+                .is_some_and(|proposal| proposal.state == ProposalState::Accepted)
+        {
+            created = Some(chat::commit_agreement(db, &p, &roster)?);
+            chat_completed = true;
+        }
+    } else if system {
         // A member created by this command gets its onboarding (same event,
         // same roster), never a second native turn for its own creation.
         let mut skip: Vec<&str> = caller
@@ -3823,9 +3890,11 @@ fn execute_authorized(
         final_notice(db, &p, &b, event.event_id)?;
     }
     for b in &closed_members {
-        final_notice(db, &p, b, event.event_id)?;
+        if chat_actor.is_none() {
+            final_notice(db, &p, b, event.event_id)?;
+        }
     }
-    if p.closed {
+    if chat_actor.is_none() && p.closed {
         crate::managed_egress::retire_final_scope(db, &p.pool_id)?;
         // Nothing of a closed pool that was never published stays open: its
         // ordinary seeds and unbindable final notices settle with the close.
@@ -3842,7 +3911,11 @@ fn execute_authorized(
         created_id: created,
         created_ids,
         event,
-        status: if managed_status {
+        status: if chat_completed {
+            "committed; agreement recorded".into()
+        } else if chat_actor.is_some() {
+            "committed".into()
+        } else if managed_status {
             "committed; managed enrollment pending".into()
         } else {
             "committed; delivery pending".into()

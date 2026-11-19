@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Added Linux owner ingress and Pool chat v1 for ordinary Run profiles. Authorized owners share chat management, and current seats reach a durable agreement through Run-authenticated chat tools.
+- Schema v18 adds durable chat batches and agreement records. Take a private WAL-consistent backup before opening an existing store. The v0.1.5 binary refuses a v18 database.
+
 ## 0.1.5
 
 Feature release, 2026-11-19. Qualification fields are unchanged from 0.1.0: `x86_64-unknown-linux-gnu` on the host `dobi`; this release ships that target only.

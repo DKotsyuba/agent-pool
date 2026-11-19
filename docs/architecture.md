@@ -11,8 +11,8 @@ its EOF never starts, stops or replaces the resident.
 - `domain.rs` defines strict flat commands, safe public views and private outbox work.
 - `store.rs` owns the single SQLite writer and synchronous transactions. A process
   lifetime file lock excludes a second writer. WAL, full synchronization, foreign
-  keys and schema version 17 are explicit. Future schema versions refuse to open.
-  Schema v1–v16 upgrades transactionally to v17 before use. Schema v17 adds the
+  keys and schema version 18 are explicit. Future schema versions refuse to open.
+  Schema v1–v17 upgrades transactionally to v18 before use. Schema v17 adds the
   private Run pin credential table. The v5 replacement
   and stable-slot migration and v6 inventory revision fence remain in that upgrade.
   v16 records every non-current incarnation as `removed`; every open then settles
@@ -1155,3 +1155,42 @@ newline are capped at 1 MiB; oversized results fail explicitly without partial
 publication or silently advancing a cursor. Resident exchanges use the existing
 finite transport timeout; stdin waits for EOF without an execution deadline.
 No observer configuration, grant, release qualification or service is installed.
+
+## Pool chat v1
+
+`[owner_ingress]` is an opt-in Linux listener. It reuses the group observer
+socket's directory, inode, group and mode checks and uses a separate connection
+budget. Kernel peer UID checks precede frame reads. The resident UID is excluded.
+The stdio owner frontend checks the resident's socket and kernel UID before
+sending an owner command. Allowed owners share authority over chat pools.
+Legacy managed pools continue using their existing mutation route.
+
+Start commits the pool, ordered seats and exact Run batch in one SQLite
+transaction. Before sending, Pool freezes the Run store identity. An uncertain
+start remains recoverable under the original owner request key, batch payload
+and Run request ID. On retry Pool looks up the receipt before it resubmits.
+Ordered receipt rows install Run lineage IDs atomically. A seat may join once
+its admission is recorded. Replacement requires a pool revision, retires the
+old seat at reservation and invalidates the open proposal. It reports the prior
+lineage for cancellation through Run. Admission, join and sampled process state
+are independent.
+
+Run advertises the seven Pool tools on ordinary chat lineages' worker MCP.
+Pool authorizes `member_call_v1` by pool, seat, Run store and lineage on its
+same-UID private socket, before reading state or returning a mutation replay.
+Run checks the calling attempt. Pool derives author and replay identity from
+the relay. A retired seat cannot read or write even on an exact retry, and
+closing a pool revokes all seats. Direct history is restricted to the sender,
+recipient and authorized owners. Owner messages are visible to their sender and
+authorized owners. Notices use the existing durable outbox. Member notices use
+Run's current native destination when available, and the optional initiating
+Bridge address routes owner notices. Delivery is best effort.
+
+Schema v18 adds chat pool metadata, durable batch intents, notice target mappings
+and the immutable agreement ledger. All current seats must join, and every seat
+must cast a ready vote on the same proposal and unchanged roster. The qualifying
+vote writes the agreement, vote event references and completion event in the same
+transaction. A completion notice is queued when the initiating address is known.
+The agreement records member consensus and Run continues to report process
+outcomes separately. Observer `completion_get` with section `header` returns the
+agreement for its exact ID; managed records retain their existing format.

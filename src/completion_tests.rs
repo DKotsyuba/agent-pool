@@ -685,6 +685,21 @@ async fn p3_completion_ready_finish() {
     let saga = run_to_end(&fixture, &run).await.unwrap();
     assert_eq!(fixture.stage(&saga).0, "released");
     assert_eq!(record_count(&fixture), 1);
+    {
+        let store = fixture.store();
+        let mut store = store.lock().unwrap();
+        let request = json!({"pool_id":POOL,"section":"content"});
+        let crate::chat::ChatReply::Legacy(page) =
+            crate::store::chat::owner_call(&mut store, "pool_completion_get", request).unwrap()
+        else {
+            panic!("owner chat completion must project the retained managed record");
+        };
+        assert_eq!(page.pool_id, POOL);
+        assert!(matches!(
+            page.items.as_slice(),
+            [completion::Item::Content { .. }]
+        ));
+    }
     assert_eq!(run.state().created, 1);
     assert_eq!(run.active_holds(), 0);
     assert_eq!(
@@ -2649,6 +2664,7 @@ async fn p3_hold_lost_ack_release_over_operator_socket() {
         run_peer_uid: None,
         managed_run_reader: None,
         observer_socket: None,
+        owner_ingress: None,
         managed_run_transport: None,
     };
     // Settlement stays off without the managed consensus transport.
@@ -2730,6 +2746,7 @@ fn worker_config(fixture: &Fixture, sockets: &tempfile::TempDir) -> crate::confi
         run_peer_uid: None,
         managed_run_reader: None,
         observer_socket: None,
+        owner_ingress: None,
         managed_run_transport: None,
     }
 }

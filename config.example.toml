@@ -77,3 +77,12 @@ bridge_server_sha256 = "00000000000000000000000000000000000000000000000000000000
 # pool_start_agent, pool_start_batch and pool_replace use the exact managed role.
 # enrollment_enabled = false
 # managed_role = "managed"
+
+# Optional Linux-only owner ingress for ordinary Run chat. Use the protected
+# directory and group policy documented above for observer_socket. The resident
+# UID must be absent from the allowlist. Set run_socket to Run's operator socket.
+# [owner_ingress]
+# path = "/run/agent-pool/owner.sock"
+# gid = 986
+# mode = 0o660
+# allowed_uids = [1000, 1001, 1002]

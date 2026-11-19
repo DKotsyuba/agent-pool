@@ -88,6 +88,23 @@ pub(crate) fn admit(
     }
 }
 
+/// Rejects the resident UID even if an internally constructed config allows it.
+pub(crate) fn admit_owner(
+    stream: UnixStream,
+    resident_uid: u32,
+    allowed: &[u32],
+    permits: &Arc<Semaphore>,
+) -> Option<(UnixStream, OwnedSemaphorePermit)> {
+    if stream
+        .peer_cred()
+        .is_ok_and(|peer| peer.uid() == resident_uid)
+    {
+        refuse(stream, Fault::Unauthorized);
+        return None;
+    }
+    admit(stream, allowed, permits)
+}
+
 /// True only when the kernel reports a peer UID on the allowlist.
 fn admitted(stream: &UnixStream, allowed: &[u32]) -> bool {
     stream
@@ -262,6 +279,7 @@ mod tests {
             managed_run_reader: None,
             managed_run_transport: None,
             observer_socket: None,
+            owner_ingress: None,
         }
     }
 
