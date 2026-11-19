@@ -30,7 +30,7 @@ Pool {{ pool_id }} revision={{ revision }} | history more={{ more }} next={{ nex
 {% elif view == "list" %}
 Pools {{ returned }}
 {% for p in pools %}
-{{ p.id }} {{ p.status }} {{ p.name|quote }}{% if p.completion %} completion={{ p.completion }}{% endif %}
+{{ p.id }} {{ p.status }} {{ p.name|quote }}{% if p.completion %} completion={{ p.completion }}{% endif +%}
 {% endfor %}
 {% if next %}
 Next after={{ next }}
@@ -38,7 +38,7 @@ Next after={{ next }}
 {% elif view == "launch" %}
 Pool {{ pool_id }} revision={{ revision }} admission={{ state }}
 {% for s in seats %}
-Seat {{ s.id }} current={{ s.current }} joined={{ s.joined }}{% if s.agent_id %} run={{ s.agent_id }}{% endif %}
+Seat {{ s.id }} current={{ s.current }} joined={{ s.joined }}{% if s.agent_id %} run={{ s.agent_id }}{% endif +%}
 {% endfor %}
 {% if state == "pending" %}
 The resident reconciles Run admission. Read pool_get for current seat admission.
