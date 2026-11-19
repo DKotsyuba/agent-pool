@@ -1330,6 +1330,12 @@ impl Store {
                                 &delivery.operation_id,
                                 &delivery.state,
                             )?;
+                        if pin_release_attention(&delivery.state) {
+                            delivery.pin_recovery = pin_recovery_inputs(
+                                &effect(&self.db, &delivery.operation_id)?,
+                                &delivery.state,
+                            );
+                        }
                     }
                 }
                 let returned = match get.section {
@@ -1487,6 +1493,7 @@ PRAGMA user_version=5;")?;
         {
             let tx = rusqlite::Transaction::new_unchecked(&db, TransactionBehavior::Immediate)?;
             crate::managed_egress::settle_closed_pools(&tx, None)?;
+            recover_late_pin_releases(&tx)?;
             tx.commit()?;
         }
         // Transaction-local managed mutation provenance, never retained after restart.
@@ -2022,6 +2029,7 @@ PRAGMA user_version=5;")?;
             "refused",
             "cancelled",
             PIN_RELEASE_TOKEN_UNAVAILABLE,
+            PIN_RELEASE_PARAMETERS_REJECTED,
         ]
         .contains(&state)
         {
@@ -2035,7 +2043,10 @@ PRAGMA user_version=5;")?;
             // A retained late receipt is terminal; no later settlement overwrites it.
             return Ok(());
         }
-        if state == PIN_RELEASE_TOKEN_UNAVAILABLE && !matches!(effect.work, Work::ReleasePin { .. })
+        if matches!(
+            state,
+            PIN_RELEASE_TOKEN_UNAVAILABLE | PIN_RELEASE_PARAMETERS_REJECTED
+        ) && !matches!(effect.work, Work::ReleasePin { .. })
         {
             return Err(Fault::Invalid);
         }
@@ -2069,6 +2080,8 @@ PRAGMA user_version=5;")?;
             "refused",
             "cancelled",
             PIN_RELEASE_TOKEN_UNAVAILABLE,
+            PIN_RELEASE_PARAMETERS_REJECTED,
+            PIN_RELEASE_READY,
         ]
         .contains(&effect.state.as_str())
         {
@@ -3102,6 +3115,7 @@ fn execute_authorized(
     let mut closed_members = Vec::new();
     let mut message_parts = Vec::new();
     let mut release_pin = None;
+    let mut retry_release = None;
     let mut replacement = None;
     let mut managed_replacement = None;
     let (kind, body, system) = match command {
@@ -3327,27 +3341,36 @@ fn execute_authorized(
             )
         }
         Command::ReleaseHistory(x) => {
-            let raw: Option<String> = db
-                .query_row(
-                    "SELECT data FROM members WHERE id=?1 AND pool=?2",
-                    params![x.member_id, pid],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            let binding: Binding = decode(&raw.ok_or(Fault::Forbidden)?)?;
-            let pin = binding
-                .run_pin_id
-                .as_deref()
-                .ok_or(Fault::Invalid)?
-                .to_owned();
-            pin_id(&pin)?;
-            if pin_release_exists(db, pid, &x.member_id, &pin)? {
-                return Err(Fault::Conflict);
+            if let Some(id) = retryable_pin_release(db, pid, &x.member_id)? {
+                retry_release = Some(id);
+            } else {
+                let raw: Option<String> = db
+                    .query_row(
+                        "SELECT data FROM members WHERE id=?1 AND pool=?2",
+                        params![x.member_id, pid],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let binding: Binding = decode(&raw.ok_or(Fault::Forbidden)?)?;
+                let pin = binding
+                    .run_pin_id
+                    .as_deref()
+                    .ok_or(Fault::Invalid)?
+                    .to_owned();
+                pin_id(&pin)?;
+                if pin_release_exists(db, pid, &x.member_id, &pin)? {
+                    return Err(Fault::Conflict);
+                }
+                let (route, owner) = pin_release_origin(
+                    db,
+                    pid,
+                    &x.member_id,
+                    binding.run_store_id.as_deref(),
+                    &pin,
+                )?;
+                release_pin = Some((x.member_id.clone(), pin, route, owner));
             }
             target = Some(x.member_id.clone());
-            let (route, owner) =
-                pin_release_origin(db, pid, &x.member_id, binding.run_store_id.as_deref(), &pin)?;
-            release_pin = Some((x.member_id.clone(), pin, route, owner));
             (
                 "history_release_requested",
                 "Owner requested release of the closed member's retained Run history.".into(),
@@ -3789,6 +3812,10 @@ fn execute_authorized(
                 send_first: None,
             },
         )?);
+    }
+    if let Some(id) = retry_release {
+        db.execute("UPDATE effects SET state='queued' WHERE id=?1", [&id])?;
+        created = Some(id);
     }
     if let Some((member_id, pin_id, route, owner)) = release_pin {
         created = Some(queue(
@@ -4270,7 +4297,13 @@ fn view(
                 } else {
                     (None, None)
                 };
+                let pin_recovery = if owner {
+                    pin_recovery_inputs(&e, &state)
+                } else {
+                    None
+                };
                 deliveries.push(Delivery {
+                    pin_recovery,
                     attention,
                     attention_subject,
                     operation_id: id,
@@ -4570,14 +4603,14 @@ fn completed_admission(
     effect: &Effect,
     receipt: &serde_json::Value,
 ) -> Result<Admitted, Fault> {
-    let receipt = serde_json::to_string(receipt).map_err(|_| Fault::Internal)?;
+    let encoded = serde_json::to_string(receipt).map_err(|_| Fault::Internal)?;
     if effect.state == RECONCILIATION_NEEDED {
         let retained: String = db.query_row(
             "SELECT receipt FROM completed_admissions WHERE effect=?1",
             [&effect.effect_id],
             |r| r.get(0),
         )?;
-        return if retained == receipt {
+        return if retained == encoded {
             Ok(Admitted::ReconciliationNeeded)
         } else {
             Err(Fault::Conflict)
@@ -4589,8 +4622,9 @@ fn completed_admission(
     }
     db.execute(
         "INSERT INTO completed_admissions(effect,receipt) VALUES(?1,?2)",
-        params![effect.effect_id, receipt],
+        params![effect.effect_id, encoded],
     )?;
+    stage_late_pin_releases(db, effect, receipt)?;
     let mut settled = effect.clone();
     settled.state = RECONCILIATION_NEEDED.into();
     if let Work::Replace {
@@ -4788,6 +4822,151 @@ fn validate_replacement_source(db: &Connection, effect: &Effect) -> Result<(), F
     }
     Ok(())
 }
+/// A Run release request rejected the exact advertised parameter shape.
+pub(crate) const PIN_RELEASE_PARAMETERS_REJECTED: &str = "pin_release_parameters_rejected";
+/// A retained late admission has a pin that the closed pool owner can release.
+const PIN_RELEASE_READY: &str = "pin_release_ready";
+
+/// Reports states that require an explicit owner retry after closure.
+fn pin_release_attention(state: &str) -> bool {
+    matches!(
+        state,
+        PIN_RELEASE_TOKEN_UNAVAILABLE | PIN_RELEASE_PARAMETERS_REJECTED | PIN_RELEASE_READY
+    )
+}
+
+/// Returns the exact public offline recovery inputs for owner delivery views.
+fn pin_recovery_inputs(effect: &Effect, state: &str) -> Option<PinRecovery> {
+    if !pin_release_attention(state) {
+        return None;
+    }
+    let Work::ReleasePin {
+        pin_id,
+        route,
+        owner: Some(PinOwner::Batch { request_key }),
+    } = &effect.work
+    else {
+        return None;
+    };
+    Some(PinRecovery {
+        store_id: route.as_ref()?.store_id.clone()?,
+        pin_id: pin_id.clone(),
+        request_key: request_key.clone(),
+    })
+}
+
+/// Looks up a dormant release for this member, including a candidate that never joined.
+fn retryable_pin_release(
+    db: &Connection,
+    pool: &str,
+    member: &str,
+) -> Result<Option<String>, Fault> {
+    let mut stmt = db.prepare(
+        "SELECT e.id,e.state FROM effects e WHERE e.pool=?1 AND e.member=?2
+         AND (e.state!='refused' OR EXISTS(
+            SELECT 1 FROM alerts WHERE effect=e.id AND kind='late_pin_release'
+         ))",
+    )?;
+    let rows = stmt.query_map(params![pool, member], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut found = None;
+    for row in rows {
+        let (id, state) = row?;
+        if (pin_release_attention(&state) || state == "refused") && found.replace(id).is_some() {
+            return Err(Fault::Conflict);
+        }
+    }
+    Ok(found)
+}
+
+/// Stages recovery for retained receipts written by prior Pool binaries.
+fn recover_late_pin_releases(db: &Connection) -> Result<(), Fault> {
+    let mut stmt = db.prepare(
+        "SELECT effect,receipt FROM completed_admissions WHERE NOT EXISTS(
+            SELECT 1 FROM alerts WHERE alerts.effect=completed_admissions.effect
+            AND kind='late_pin_release_staged'
+        )",
+    )?;
+    for row in stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })? {
+        let (id, receipt) = row?;
+        stage_late_pin_releases(db, &effect(db, &id)?, &decode(&receipt)?)?;
+    }
+    Ok(())
+}
+
+/// Gives each reconciled public pin an owner-visible release intent without changing membership.
+fn stage_late_pin_releases(
+    db: &Connection,
+    effect: &Effect,
+    receipt: &serde_json::Value,
+) -> Result<(), Fault> {
+    if db.execute(
+        "INSERT OR IGNORE INTO alerts(effect,kind) VALUES(?1,'late_pin_release_staged')",
+        [&effect.effect_id],
+    )? == 0
+    {
+        return Ok(());
+    }
+    let (members, route, key): (Vec<&str>, _, _) = match &effect.work {
+        Work::StartBatch {
+            jobs,
+            retain_history: true,
+            route: Some(route),
+            request_key,
+            ..
+        } => (
+            jobs.iter().map(|job| job.member_id.as_str()).collect(),
+            route,
+            request_key,
+        ),
+        Work::Replace {
+            new,
+            route,
+            request_key,
+            ..
+        } => (vec![new.member.member_id.as_str()], route, request_key),
+        _ => return Ok(()),
+    };
+    if route.store_id.is_none() {
+        return Ok(());
+    }
+    if receipt["store_id"].as_str() != route.store_id.as_deref() {
+        return Err(Fault::Conflict);
+    }
+    let admissions = receipt["admissions"].as_array().ok_or(Fault::Internal)?;
+    if members.len() != admissions.len() {
+        return Err(Fault::Conflict);
+    }
+    for (member, admission) in members.into_iter().zip(admissions) {
+        let pin = admission["pin_id"].as_str().ok_or(Fault::Internal)?;
+        pin_id(pin)?;
+        let id = queue(
+            db,
+            &effect.pool_id,
+            Some(member),
+            Work::ReleasePin {
+                pin_id: pin.into(),
+                route: Some(route.clone()),
+                owner: Some(PinOwner::Batch {
+                    request_key: key.clone(),
+                }),
+            },
+        )?;
+        db.execute(
+            "UPDATE effects SET state=?2 WHERE id=?1",
+            params![&id, PIN_RELEASE_READY],
+        )?;
+        db.execute(
+            "INSERT INTO alerts(effect,kind) VALUES(?1,'late_pin_release')",
+            [&id],
+        )?;
+    }
+    Ok(())
+}
+
 /// Terminal release state requiring recovery by the Run database owner.
 pub(crate) const PIN_RELEASE_TOKEN_UNAVAILABLE: &str = "pin_release_token_unavailable";
 
@@ -4797,8 +4976,8 @@ fn delivery_owner_attention(
     id: &str,
     state: &str,
 ) -> Result<(Option<String>, Option<String>), Fault> {
-    if state == PIN_RELEASE_TOKEN_UNAVAILABLE {
-        return Ok((Some(PIN_RELEASE_TOKEN_UNAVAILABLE.into()), None));
+    if pin_release_attention(state) {
+        return Ok((Some(state.into()), None));
     }
     crate::managed_egress::owner_attention(db, id)
 }

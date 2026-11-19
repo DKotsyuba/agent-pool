@@ -9,8 +9,19 @@ Name: {{ member.name|quote }}; role: {{ member.role|quote }}
 Task: {{ member.task|quote }}
 {% endfor %}
 {% for delivery in deliveries %}Operation {{ delivery.operation_id }} {{ delivery.operation }} state={{ delivery.state }}{% if delivery.member_id %} member={{ delivery.member_id }}{% endif %}{% if delivery.attention is defined and delivery.attention %} attention={{ delivery.attention }}{% endif %}{% if delivery.attention_subject is defined and delivery.attention_subject %} attention_subject={{ delivery.attention_subject }}{% endif %}
-{% if delivery.attention is defined and delivery.attention == "pin_release_token_unavailable" %}
-The Run database owner must verify the original public batch receipt, stop the broker, service manager and recorded workers, then use agent-run --home HOME history-pins release-offline --expected-store-id STORE_ID --pin-id PIN_ID --request-id ORIGINAL_BATCH_ID. Keep the pin active if the original receipt cannot be verified.
+{% if delivery.pin_recovery is defined and delivery.pin_recovery %}
+Run store={{ delivery.pin_recovery.store_id }} pin={{ delivery.pin_recovery.pin_id }} original_batch={{ delivery.pin_recovery.request_key|quote }}
+{% endif %}
+{% if delivery.attention is defined and delivery.attention == "pin_release_ready" %}
+An admission arrived after completion. After closing the pool, request pool_release_history for this member to release its pin.
+{% elif delivery.attention is defined and delivery.attention == "pin_release_token_unavailable" %}
+{% if delivery.pin_recovery is defined and delivery.pin_recovery %}
+The Run database owner can verify the original receipt, stop the broker, service manager and recorded workers, and use agent-run --home HOME history-pins release-offline --expected-store-id STORE_ID --pin-id PIN_ID --request-id ORIGINAL_BATCH_ID with the values above. Then request pool_release_history with a fresh request key to confirm release.
+{% else %}
+Keep the pin active until the Run database owner can verify the original public receipt.
+{% endif %}
+{% elif delivery.attention is defined and delivery.attention == "pin_release_parameters_rejected" %}
+Run rejected the advertised release parameters. Check the Run API and request pool_release_history with a fresh request key after correcting the problem.
 {% endif %}
 {% endfor %}
 {% if section == 'criteria' and pool.acceptance is defined %}{% for criterion in pool.acceptance %}Criterion {{ criterion.id }}: {{ criterion.text|quote }}

@@ -1034,6 +1034,68 @@ async fn completed_pool_refuses_late_batch_and_replacement_receipts() {
         fixture.count("SELECT count(*) FROM alerts WHERE kind='completed_admission'"),
         2
     );
+    assert_eq!(
+        fixture.count("SELECT count(*) FROM effects WHERE state='pin_release_ready'"),
+        2
+    );
+    let mut guard = store.lock().unwrap();
+    let revision: i64 = guard
+        .completion_db()
+        .query_row(
+            "SELECT json_extract(data,'$.revision') FROM pools WHERE id=?1",
+            [POOL],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let revision = u64::try_from(revision).unwrap();
+    let request = |revision| {
+        Command::ReleaseHistory(crate::domain::ReleaseHistory {
+            change: Change {
+                pool_id: POOL.into(),
+                expected_revision: revision,
+                request_key: "release-late".into(),
+            },
+            member_id: "new-member".into(),
+        })
+    };
+    assert_eq!(
+        guard.execute(&owner(), &request(revision)).err(),
+        Some(Fault::Conflict)
+    );
+    let crate::domain::Reply::Receipt(closed) = guard
+        .execute(
+            &owner(),
+            &Command::Close(Change {
+                pool_id: POOL.into(),
+                expected_revision: revision,
+                request_key: "close-late".into(),
+            }),
+        )
+        .unwrap()
+    else {
+        panic!("close receipt")
+    };
+    let crate::domain::Reply::Receipt(released) =
+        guard.execute(&owner(), &request(closed.revision)).unwrap()
+    else {
+        panic!("release receipt")
+    };
+    let effect_id = released.created_id.unwrap();
+    let state: String = guard
+        .completion_db()
+        .query_row(
+            "SELECT state FROM effects WHERE id=?1 AND member='new-member'",
+            [&effect_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "queued");
+    guard.settle_effect(&effect_id, "accepted").unwrap();
+    drop(guard);
+    assert_eq!(
+        fixture.count("SELECT count(*) FROM members WHERE id='new-member'"),
+        0
+    );
 }
 
 /// All-voter currentness and the complete roster/epoch/generation CAS refuse stale settlement.
@@ -2813,6 +2875,9 @@ async fn completed_pool_late_start_recovery_keeps_worker_running() {
                     json!({"schema_version":1,"product":"agent-run","store_id":RUN_STORE})
                 }
                 "batch_receipt" => json!({"found":true,"receipt":receipt}),
+                "tools" => json!([{"name":"history_pins_release","inputSchema":{
+                    "properties":{"request_id":{}}, "required":["request_id"]
+                }}]),
                 "history_pins_release" if request["params"]["request_id"] == "released-request" => {
                     json!({"pin_id":request["params"]["pin_id"],
                     "status":"released","already_released":false})

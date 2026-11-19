@@ -3,7 +3,7 @@ use crate::{
     config::{Config, private_file, private_parent, private_socket},
     domain::{Actor, Binding, Command, Effect, Fault, PinOwner, Reply, Work},
     integrations::{self, Assertion, EXCHANGE_TIMEOUT, MAX_FRAME},
-    store::{Admitted, PIN_RELEASE_TOKEN_UNAVAILABLE, Store},
+    store::{Admitted, PIN_RELEASE_PARAMETERS_REJECTED, PIN_RELEASE_TOKEN_UNAVAILABLE, Store},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -3929,10 +3929,6 @@ async fn effect(
                     let token =
                         stored(store, move |store| store.pin_release_token(&store_id, &pin))
                             .await?;
-                    if token.is_none() && owner_key.is_none() {
-                        return settle(store, effect.effect_id, PIN_RELEASE_TOKEN_UNAVAILABLE)
-                            .await;
-                    }
                     match integrations::release_history_pin(
                         config,
                         pin_id,
@@ -3945,6 +3941,9 @@ async fn effect(
                         Ok(()) => "accepted",
                         Err(failure) if failure.code == PIN_RELEASE_TOKEN_UNAVAILABLE => {
                             PIN_RELEASE_TOKEN_UNAVAILABLE
+                        }
+                        Err(failure) if failure.code == PIN_RELEASE_PARAMETERS_REJECTED => {
+                            PIN_RELEASE_PARAMETERS_REJECTED
                         }
                         Err(failure) if integrations::pin_release_refused(&failure) => "refused",
                         Err(_) => "unknown",
@@ -6959,6 +6958,7 @@ mod tests {
         release: Effect,
         pin: String,
         store_identity: String,
+        wire_key: &'static str,
         batch_key: String,
     }
 
@@ -7144,6 +7144,11 @@ mod tests {
             release,
             pin,
             store_identity,
+            wire_key: if replayed.is_some() {
+                "release_token"
+            } else {
+                "request_id"
+            },
             batch_key,
         })
     }
@@ -7211,6 +7216,7 @@ mod tests {
 
     /// One scripted fake Run socket reply.
     enum RunScript {
+        RawResult(String),
         Result(serde_json::Value),
         Error(serde_json::Value),
         Drop,
@@ -7228,10 +7234,31 @@ mod tests {
                 effect(&fixture.store, &fixture.config, effect_value, reconcile),
                 async {
                     let mut requests = Vec::new();
-                    for step in script {
+                    for (index, step) in script.into_iter().enumerate() {
+                        if index == 1 {
+                            use serde_json::json;
+                            let (mut stream, request) = receive_run_request(&fixture.listener).await?;
+                            assert_eq!(request["method"], "tools");
+                            let key = fixture.wire_key;
+                            let catalog = if key == "combined" {
+                                json!([{"name":"history_pins","inputSchema":{"properties":{"action":{}}}}])
+                            } else {
+                                json!([{"name":"history_pins_release","inputSchema":{"properties":{(key):{}},"required":[key]}}])
+                            };
+                            let mut bytes = serde_json::to_vec(&json!({"jsonrpc":"2.0","id":request["id"],"result":catalog}))?;
+                            bytes.push(b'\n');
+                            stream.write_all(&bytes).await?;
+                        }
+
                         let (mut stream, request) = receive_run_request(&fixture.listener).await?;
                         let mut envelope = serde_json::json!({"jsonrpc":"2.0","id":request["id"]});
                         match step {
+                            RunScript::RawResult(result) => {
+                                let bytes = format!(concat!(r#"{{"jsonrpc":"2.0","id":{},"result":{}}}"#, "\n"), request["id"], result);
+                                stream.write_all(bytes.as_bytes()).await?;
+                                requests.push(request);
+                                continue;
+                            }
                             RunScript::Result(result) => envelope["result"] = result,
                             RunScript::Error(error) => envelope["error"] = error,
                             RunScript::Drop => {
@@ -7317,20 +7344,15 @@ mod tests {
         let error = RunScript::Error(
             json!({"code":-32000,"message":PIN_RELEASE_CANARY,"data":{"code":"RequestConflict","message":PIN_RELEASE_CANARY}}),
         );
-        let old_params = RunScript::Error(json!({"code":-32602,"message":"expected request_id"}));
         let params = json!({"pin_id":fixture.pin,"release_token":PIN_RELEASE_CANARY,"expected_store_id":fixture.store_identity});
         let requests = scripted_release(
             &fixture,
             fixture.release.clone(),
             false,
-            vec![capabilities(), old_params, error],
+            vec![capabilities(), error],
         )
         .await?;
         assert!(requests[1]["params"] == params);
-        assert_eq!(
-            requests[2]["params"],
-            json!({"pin_id":fixture.pin,"request_id":fixture.batch_key,"expected_store_id":fixture.store_identity})
-        );
         assert_eq!(
             effect_state(&fixture.store, &fixture.release_id)?,
             "refused"
@@ -7385,7 +7407,7 @@ mod tests {
         let fixture = release_fixture(Some(true)).await?;
         let requests = scripted_release(&fixture, fixture.release.clone(), false, vec![
             RunScript::Result(json!({"schema_version":1,"product":"agent-run","store_id":fixture.store_identity})),
-            RunScript::Error(json!({"code":-32602,"message":"missing release_token"})),
+            RunScript::Result(json!({"pins":[{"pin_id":fixture.pin,"agent_id":"ag-20261107-010101-0000000003","status":"active"}],"next_after_pin_id":null})),
         ]).await?;
         assert!(requests[1]["params"].get("release_token").is_none());
         assert_eq!(
@@ -7401,6 +7423,86 @@ mod tests {
         let (observer, tool) = release_views(&fixture)?;
         assert!(observer.contains(PIN_RELEASE_TOKEN_UNAVAILABLE));
         assert!(tool.contains("history-pins release-offline"));
+        for exact in [&fixture.pin, &fixture.store_identity, &fixture.batch_key] {
+            assert!(tool.contains(exact));
+            assert!(observer.contains(exact));
+        }
+        let (id, retry) = request_release(
+            &fixture.store,
+            &fixture.owner,
+            &fixture.pool_id,
+            &fixture.member_id,
+            "after-offline",
+        )
+        .await?;
+        assert_eq!(id, fixture.release_id);
+        let requests = scripted_release(&fixture, retry, false, vec![
+            RunScript::Result(json!({"schema_version":1,"product":"agent-run","store_id":fixture.store_identity})),
+            RunScript::Result(json!({"pins":[{"pin_id":fixture.pin,"agent_id":"ag-20261107-010101-0000000003","status":"released"}],"next_after_pin_id":null})),
+        ]).await?;
+        assert_eq!(requests[1]["method"], "history_pins_list");
+        assert_eq!(
+            requests[1]["params"]["expected_store_id"],
+            fixture.store_identity
+        );
+        assert_eq!(effect_state(&fixture.store, &id)?, "accepted");
+        assert!(
+            !release_views(&fixture)?
+                .1
+                .contains("history-pins release-offline")
+        );
+        Ok(())
+    }
+
+    /// An owner retry discovers the older combined API after rollback.
+    #[tokio::test]
+    async fn pin_release_owner_retry_can_use_rolled_back_run()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use serde_json::json;
+        let mut fixture = release_fixture(Some(true)).await?;
+        let capabilities = || {
+            RunScript::Result(
+                json!({"schema_version":1,"product":"agent-run","store_id":fixture.store_identity}),
+            )
+        };
+        scripted_release(
+            &fixture,
+            fixture.release.clone(),
+            false,
+            vec![
+                capabilities(),
+                RunScript::Result(json!({"pins":[],"next_after_pin_id":null})),
+            ],
+        )
+        .await?;
+        assert_eq!(
+            effect_state(&fixture.store, &fixture.release_id)?,
+            PIN_RELEASE_TOKEN_UNAVAILABLE
+        );
+        fixture.wire_key = "combined";
+        let (id, retry) = request_release(
+            &fixture.store,
+            &fixture.owner,
+            &fixture.pool_id,
+            &fixture.member_id,
+            "after-rollback",
+        )
+        .await?;
+        assert_eq!(id, fixture.release_id);
+        let requests = scripted_release(
+            &fixture,
+            retry,
+            false,
+            vec![
+                capabilities(),
+                RunScript::Result(
+                    json!({"pin_id":fixture.pin,"status":"released","already_released":false}),
+                ),
+            ],
+        )
+        .await?;
+        assert_eq!(requests[1]["method"], "history_pins");
+        assert_eq!(effect_state(&fixture.store, &id)?, "accepted");
         Ok(())
     }
 
@@ -7442,6 +7544,15 @@ mod tests {
             first[1]["params"],
             json!({"pin_id":pin,"request_id":fixture.batch_key,"expected_store_id":store_identity})
         );
+        let retry = stored(&fixture.store, |store| store.pending_unknown())
+            .await?
+            .into_iter()
+            .find(|item| item.effect_id == release_id)
+            .ok_or("release retry")?;
+        scripted_release(&fixture, retry, true, vec![capabilities(), RunScript::RawResult(format!(
+            r#"{{"pin_id":"{pin}","status":"active","status":"released","already_released":true}}"#
+        ))]).await?;
+        assert_eq!(effect_state(&fixture.store, &release_id)?, "unknown");
         let retry = stored(&fixture.store, |store| store.pending_unknown())
             .await?
             .into_iter()
@@ -7566,10 +7677,16 @@ mod tests {
             &fixture,
             second,
             false,
-            vec![capabilities(), domain_error("ValidationError")],
+            vec![
+                capabilities(),
+                RunScript::Error(json!({"code":-32602,"message":"invalid parameters"})),
+            ],
         )
         .await?;
-        assert_eq!(effect_state(&fixture.store, &second_id)?, "refused");
+        assert_eq!(
+            effect_state(&fixture.store, &second_id)?,
+            PIN_RELEASE_PARAMETERS_REJECTED
+        );
         let (third_id, third) = request_release(
             &fixture.store,
             &fixture.owner,
@@ -7612,7 +7729,8 @@ mod tests {
     async fn pin_release_falls_back_on_old_run_and_rederives_legacy_owner()
     -> Result<(), Box<dyn std::error::Error>> {
         use serde_json::json;
-        let fixture = release_fixture(None).await?;
+        let mut fixture = release_fixture(None).await?;
+        fixture.wire_key = "combined";
         let mut legacy = fixture.release.clone();
         let Work::ReleasePin { owner, .. } = &mut legacy.work else {
             return Err("release work".into());
@@ -7633,21 +7751,15 @@ mod tests {
                 RunScript::Result(
                     json!({"schema_version":1,"product":"agent-run","store_id":fixture.store_identity}),
                 ),
-                RunScript::Error(json!({"code":-32601,"message":"method not found"})),
                 RunScript::Result(
                     json!({"pin_id":fixture.pin,"status":"released","already_released":false}),
                 ),
             ],
         )
         .await?;
-        assert_eq!(requests[1]["method"], "history_pins_release");
+        assert_eq!(requests[1]["method"], "history_pins");
         assert_eq!(
-            requests[1]["params"]["request_id"],
-            json!(fixture.batch_key)
-        );
-        assert_eq!(requests[2]["method"], "history_pins");
-        assert_eq!(
-            requests[2]["params"],
+            requests[1]["params"],
             json!({"action":"release","pin_id":fixture.pin,"expected_store_id":fixture.store_identity})
         );
         assert_eq!(

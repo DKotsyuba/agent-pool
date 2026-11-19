@@ -16,8 +16,12 @@ compatibility with older distributions has not been verified.
 
 Provision explicit private paths and the required Bridge producer/audience grants
 using [config.example.toml](config.example.toml).
-The resident upgrades schema v1–v4 to v5 on first open. Older binaries refuse a v5
-database; returning to an older binary requires a compatible state backup.
+Upgrade Pool before upgrading Run to 0.32. The Pool resident migrates the
+SQLite store to schema v17 on first open. Take a private, WAL-consistent
+pre-upgrade backup using SQLite’s backup API or a consistent offline snapshot.
+Pool 0.1.4 refuses v17. Restoring the pre-upgrade backup loses subsequent
+admissions and release credentials. Protect v17 database files, WAL files,
+dumps and backups as credential-bearing data.
 
 Run uses a private same-user socket by default. On Linux, an explicit different
 `run_peer_uid` enables a protected shared Run socket when OS permissions already
@@ -28,10 +32,14 @@ prove the exact execution and caller attempt; Bridge-only participants still wor
 New single and grouped admissions request durable Run history pins. A single
 admission requires Run's read-only batch receipt lookup before it can start; after
 removal Pool only looks up its original receipt and never starts it again.
-After closure, an owner may explicitly request release; Pool sends it only to the
-original verified Run store, with the admission key Run 0.32 requires as ownership
-proof (older Run versions use the previous release method). Guarded replacement requires a terminal, cleaned
-lineage and an atomic Run precondition; uncertain results freeze the old roster.
+After closure, an owner may explicitly request release. Pool sends it only to the
+original verified Run store. Run 0.32 public pins use a private bearer token
+returned only on original admission. Pool selects older release methods from
+Run socket discovery. For missing tokens, owner deliveries show the exact
+offline recovery inputs when available. Submit `pool_release_history` with
+a fresh request key after offline release to confirm the released pin.
+Guarded replacement requires a terminal, cleaned lineage and an atomic Run
+precondition. Uncertain results freeze the old roster.
 Admission receipts alone cannot establish completion. Older uncertain intents
 without a stored identity remain on hold.
 Replaced members' history pins also remain retained until explicit release after

@@ -705,7 +705,7 @@ struct RunReply<T> {
     /// Exact numeric request correlation identifier.
     id: u64,
     /// Successful object projection; mutually exclusive with error.
-    result: Option<JsonObject<T>>,
+    result: Option<T>,
     /// Structured service failure; prose is ignored by the closed classifier.
     error: Option<Value>,
 }
@@ -863,6 +863,17 @@ pub(crate) async fn run_rpc_typed<T: serde::de::DeserializeOwned>(
     method: &str,
     params: Value,
 ) -> Result<T, RunFailure> {
+    run_rpc_result::<JsonObject<T>>(config, method, params)
+        .await
+        .map(|object| object.0)
+}
+
+/// Exchanges a correlated Run response with its method-specific result shape.
+async fn run_rpc_result<T: serde::de::DeserializeOwned>(
+    config: &Config,
+    method: &str,
+    params: Value,
+) -> Result<T, RunFailure> {
     let socket = config.run_socket.as_ref().ok_or(RunFailure::unknown())?;
     let request_id = u64::from_le_bytes(
         uuid::Uuid::new_v4().as_bytes()[..8]
@@ -886,7 +897,13 @@ pub(crate) async fn run_rpc_typed<T: serde::de::DeserializeOwned>(
         let frame = read_frame(&mut stream)
             .await
             .map_err(|_| RunFailure::unknown())?;
-        if method.starts_with("_lineage_hold_") && !strict_hold_envelope(&frame, request_id) {
+        let pin_release = matches!(
+            method,
+            "history_pins_release" | "history_pins" | "history_pins_list"
+        );
+        if (method.starts_with("_lineage_hold_") || pin_release)
+            && !strict_hold_envelope(&frame, request_id)
+        {
             return Err(RunFailure::unknown());
         }
         let JsonObject(reply): JsonObject<RunReply<T>> =
@@ -899,6 +916,11 @@ pub(crate) async fn run_rpc_typed<T: serde::de::DeserializeOwned>(
         }
         if let Some(error) = reply.error {
             if error.get("message").and_then(Value::as_str).is_none() {
+                return Err(RunFailure::unknown());
+            }
+            if pin_release
+                && serde_json::from_slice::<JsonObject<AdmissionErrorEnvelope>>(&frame).is_err()
+            {
                 return Err(RunFailure::unknown());
             }
             let mut failure = RunFailure::from_response(&error);
@@ -918,10 +940,7 @@ pub(crate) async fn run_rpc_typed<T: serde::de::DeserializeOwned>(
                 },
             );
         }
-        reply
-            .result
-            .map(|result| result.0)
-            .ok_or(RunFailure::unknown())
+        reply.result.ok_or(RunFailure::unknown())
     })
     .await
     .map_err(|_| RunFailure::unknown())?
@@ -1193,11 +1212,146 @@ pub async fn run_store_identity(config: &Config) -> Result<String, RunFailure> {
     Ok(id.to_owned())
 }
 
-/// Releases one exact pin only within the expected Run store; malformed replies remain unknown.
-///
-/// Uses the bearer token on current Run. Parameter rejection permits the earlier
-/// request-key form, and method-not-found permits the combined method. A key-only
-/// request rejected for its parameter shape needs offline owner recovery.
+/// Advertised release input contract for one Run operator socket.
+enum PinReleaseApi {
+    Token,
+    RequestKey,
+    Combined,
+}
+
+/// A discovery entry, with typed decoding of every field used to select the release API.
+#[derive(Deserialize)]
+struct PinTool {
+    name: String,
+    #[serde(rename = "inputSchema", deserialize_with = "json_object")]
+    input: PinToolInput,
+}
+
+/// Accepted property names and required arguments advertised by Run.
+#[derive(Deserialize)]
+struct PinToolInput {
+    #[serde(default)]
+    properties: std::collections::BTreeMap<String, serde::de::IgnoredAny>,
+    #[serde(default)]
+    required: Vec<String>,
+}
+
+/// Chooses the wire shape before sending a release mutation.
+async fn pin_release_api(config: &Config) -> Result<PinReleaseApi, RunFailure> {
+    let tools: Vec<JsonObject<PinTool>> = run_rpc_result(config, "tools", json!({})).await?;
+    let mut dedicated = tools
+        .iter()
+        .filter(|tool| tool.0.name == "history_pins_release");
+    if let Some(tool) = dedicated.next() {
+        if dedicated.next().is_some() {
+            return Err(RunFailure::unknown());
+        }
+        let input = &tool.0.input;
+        let requires_token = input.required.iter().any(|key| key == "release_token");
+        if requires_token
+            && input.properties.contains_key("release_token")
+            && !input.properties.contains_key("request_id")
+        {
+            return Ok(PinReleaseApi::Token);
+        }
+        if !input.properties.contains_key("release_token")
+            && input.properties.contains_key("request_id")
+        {
+            return Ok(PinReleaseApi::RequestKey);
+        }
+        return Err(RunFailure::unknown());
+    }
+    if tools
+        .iter()
+        .filter(|tool| tool.0.name == "history_pins")
+        .count()
+        == 1
+    {
+        return Ok(PinReleaseApi::Combined);
+    }
+    Err(RunFailure::unknown())
+}
+
+/// A correlated successful release reply. Duplicate fields invalidate the receipt.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PinReleaseReceipt {
+    pin_id: String,
+    status: String,
+    #[serde(rename = "already_released")]
+    _already_released: bool,
+}
+
+/// Typed page from the store-fenced pin lookup.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PinPage {
+    #[serde(deserialize_with = "json_objects")]
+    pins: Vec<PinListing>,
+    #[serde(rename = "next_after_pin_id")]
+    _next_after_pin_id: Option<String>,
+}
+
+/// A single listing identifying the exact pin and its retained state.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PinListing {
+    pin_id: String,
+    status: String,
+    #[serde(rename = "agent_id")]
+    _agent_id: String,
+}
+
+/// Returns the immediately preceding canonical Run pin for an exclusive keyset lookup.
+fn pin_predecessor(pin: &str) -> Option<String> {
+    let mut digits = pin.as_bytes().to_vec();
+    let hex = b"0123456789abcdef";
+    for index in (4..digits.len()).rev() {
+        let (min, max) = match index - 4 {
+            12 => continue,
+            16 => (8, 11),
+            _ => (0, 15),
+        };
+        let current = hex.iter().position(|digit| *digit == digits[index])?;
+        if current > min {
+            digits[index] = hex[current - 1];
+            return String::from_utf8(digits).ok();
+        }
+        digits[index] = hex[max];
+    }
+    None
+}
+
+/// Confirms a released tombstone by exact pin in a single store-fenced page.
+async fn pin_is_released(config: &Config, pin: &str, store: &str) -> Result<bool, RunFailure> {
+    let page: PinPage = run_rpc_typed(
+        config,
+        "history_pins_list",
+        json!({
+            "limit":1,"status":"all","after_pin_id":pin_predecessor(pin),"expected_store_id":store,
+        }),
+    )
+    .await
+    .map_err(pin_release_parameter_failure)?;
+    match page.pins.as_slice() {
+        [] => Ok(false),
+        [entry] => Ok(entry.pin_id == pin && entry.status == "released"),
+        _ => Err(RunFailure::unknown()),
+    }
+}
+
+/// Stops automatic retries on a definitive Run parameter rejection.
+fn pin_release_parameter_failure(failure: RunFailure) -> RunFailure {
+    if matches!(failure.code, "invalid_params" | "ValidationError") {
+        return RunFailure {
+            code: crate::store::PIN_RELEASE_PARAMETERS_REJECTED,
+            ..failure
+        };
+    }
+    failure
+}
+
+/// Uses the advertised Run release method and accepts an exact typed receipt or tombstone.
 pub(crate) async fn release_history_pin(
     config: &Config,
     pin: &str,
@@ -1207,55 +1361,37 @@ pub(crate) async fn release_history_pin(
 ) -> Result<(), RunFailure> {
     crate::domain::pin_id(pin).map_err(|_| RunFailure::unknown())?;
     crate::domain::store_id(expected_store_id).map_err(|_| RunFailure::unknown())?;
-    let legacy = || {
-        run_rpc(
-            config,
-            "history_pins",
-            json!({"action":"release","pin_id":pin,"expected_store_id":expected_store_id}),
-        )
+    let unavailable = || RunFailure {
+        code: crate::store::PIN_RELEASE_TOKEN_UNAVAILABLE,
+        ..RunFailure::unknown()
     };
-    let current = if let Some(token) = release_token {
-        match run_rpc(config, "history_pins_release",
-            json!({"pin_id":pin,"release_token":token.as_str(),"expected_store_id":expected_store_id}),
-        ).await {
-            Err(failure) if failure.code == "method_not_found" => Some(legacy().await?),
-            Err(failure) if failure.code == "invalid_params" => None,
-            result => Some(result?),
-        }
-    } else {
-        None
-    };
-    let reply = if let Some(reply) = current {
-        reply
-    } else {
-        match owner_request_key {
-            Some("") => return Err(RunFailure::unknown()),
-            Some(key) => match run_rpc(
-                config,
+    let (method, params) = match pin_release_api(config).await? {
+        PinReleaseApi::Token => match release_token {
+            Some(token) => (
+                "history_pins_release",
+                json!({"pin_id":pin,"release_token":token.as_str(),"expected_store_id":expected_store_id}),
+            ),
+            None if pin_is_released(config, pin, expected_store_id).await? => return Ok(()),
+            None => return Err(unavailable()),
+        },
+        PinReleaseApi::RequestKey => {
+            let key = owner_request_key
+                .filter(|key| !key.is_empty())
+                .ok_or_else(unavailable)?;
+            (
                 "history_pins_release",
                 json!({"pin_id":pin,"request_id":key,"expected_store_id":expected_store_id}),
             )
-            .await
-            {
-                Err(failure) if failure.code == "method_not_found" => legacy().await?,
-                Err(failure) if failure.code == "invalid_params" && release_token.is_none() => {
-                    return Err(RunFailure {
-                        code: "pin_release_token_unavailable",
-                        ..failure
-                    });
-                }
-                outcome => outcome?,
-            },
-            None => legacy().await?,
         }
+        PinReleaseApi::Combined => (
+            "history_pins",
+            json!({"action":"release","pin_id":pin,"expected_store_id":expected_store_id}),
+        ),
     };
-    if reply.get("pin_id").and_then(Value::as_str) != Some(pin)
-        || reply.get("status").and_then(Value::as_str) != Some("released")
-        || reply
-            .get("already_released")
-            .and_then(Value::as_bool)
-            .is_none()
-    {
+    let reply: PinReleaseReceipt = run_rpc_typed(config, method, params)
+        .await
+        .map_err(pin_release_parameter_failure)?;
+    if reply.pin_id != pin || reply.status != "released" {
         return Err(RunFailure::unknown());
     }
     Ok(())
@@ -1263,7 +1399,8 @@ pub(crate) async fn release_history_pin(
 
 /// Whether a history-pin release failure is Run's definitive refusal rather than an unknown
 /// outcome: `RequestConflict` (credential mismatch, missing pin, or an active
-/// lineage hold) and `ValidationError` (a request Run will never accept). `PinNotFound`,
+/// lineage hold). `ValidationError` remains a refusal for the managed legacy mapping.
+/// `PinNotFound`,
 /// `StoreIdentityMismatch`, transport loss and malformed replies stay unknown.
 pub fn pin_release_refused(failure: &RunFailure) -> bool {
     matches!(failure.code, "RequestConflict" | "ValidationError")
