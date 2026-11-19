@@ -126,35 +126,21 @@ async fn chat_uncertain_start_reuses_saved_receipt() -> Result<(), Box<dyn std::
     fs::set_permissions(socket, fs::Permissions::from_mode(0o600))?;
     let mock = tokio::spawn(async move {
         let mut original = Value::Null;
-        for (index, method) in [
-            "capabilities",
-            "batch_receipt",
-            "start_batch",
-            "capabilities",
-            "batch_receipt",
-            "start_batch",
-            "batch_receipt",
-            "batch_receipt",
-        ]
-        .into_iter()
-        .enumerate()
-        {
+        for index in 0..3 {
             let (mut stream, _) = listener.accept().await?;
             let request: Value =
                 serde_json::from_slice(&integrations::read_frame(&mut stream).await?)?;
-            assert_eq!(request["method"], method);
-            let result = match method {
-                "capabilities" => {
-                    json!({"schema_version":1,"product":"agent-run","store_id":RUN_STORE,"pool_chat_v1":true})
-                }
-                "batch_receipt" if index == 1 || index == 4 || index == 6 => json!({"found":false}),
-                "start_batch" if index == 2 => {
+            assert_eq!(request["method"], "start_batch");
+            let result = match index {
+                0 => {
                     original = request["params"].clone();
                     continue;
                 }
                 _ => {
-                    if index == 7 {
+                    if index == 2 {
                         assert_eq!(request["params"], original);
+                    } else {
+                        assert_ne!(request["params"]["request_id"], original["request_id"]);
                     }
                     let request_jobs = &request["params"];
                     let jobs = request_jobs["jobs"].as_array().ok_or("jobs")?;
@@ -171,11 +157,7 @@ async fn chat_uncertain_start_reuses_saved_receipt() -> Result<(), Box<dyn std::
                         entries.push(json!({"index":index,"agent_id":agent(index),"sequence":1,"execution_ref":execution(index)}));
                     }
                     let receipt = json!({"version":1,"store_id":RUN_STORE,"request_id":request_jobs["request_id"],"jobs":entries});
-                    if index == 7 {
-                        json!({"found":true,"receipt":receipt})
-                    } else {
-                        json!({"replayed":false,"receipt":receipt})
-                    }
+                    json!({"replayed":index == 2,"receipt":receipt})
                 }
             };
             write(
@@ -226,9 +208,23 @@ async fn chat_uncertain_start_reuses_saved_receipt() -> Result<(), Box<dyn std::
         );
         launched.push((pool_id, seats));
     }
-    // Both MCP requests have finished and neither owner reconnects.
+    // Persist the Run fence, then restart before any socket write.
+    stored(&store, |store| {
+        let first = state::next_batch(store, "")?.ok_or(Fault::Internal)?;
+        let second = state::next_batch(store, &first.id)?.ok_or(Fault::Internal)?;
+        assert_ne!(first.id, second.id);
+        state::fence(store, &first.id, RUN_STORE)?;
+        state::fence(store, &second.id, RUN_STORE)?;
+        Ok(())
+    })
+    .await?;
+    drop(store);
+    let store = Arc::new(Mutex::new(crate::store::Store::open(
+        &config.database_path,
+    )?));
+    // Neither owner reconnects.
     let mut cursor = String::new();
-    for _ in 0..4 {
+    for _ in 0..3 {
         reconcile(&config, &store, &mut cursor).await?;
     }
     let original = tokio::time::timeout(EXCHANGE_TIMEOUT, mock)
@@ -643,62 +639,102 @@ async fn chat_migrates_v17_without_changing_old_pool() -> Result<(), Box<dyn std
     Ok(())
 }
 
-/// Close wins while the first receipt lookup is stalled, before the send fence.
+/// A closed batch uses receipt lookup only and exposes its terminal admission fate.
 #[tokio::test]
-async fn chat_close_during_receipt_lookup_prevents_launch() -> Result<(), Box<dyn std::error::Error>>
-{
-    let (_root, config, store) = fixture()?;
-    let socket = config.run_socket.as_ref().ok_or("fixture Run socket")?;
-    let listener = UnixListener::bind(socket)?;
-    fs::set_permissions(socket, fs::Permissions::from_mode(0o600))?;
-    let (lookup, stalled) = tokio::sync::oneshot::channel();
-    let (resume, closed) = tokio::sync::oneshot::channel();
-    let mock = tokio::spawn(async move {
-        for method in ["capabilities", "batch_receipt"] {
+async fn chat_closed_batch_settles_from_receipt() -> Result<(), Box<dyn std::error::Error>> {
+    for found in [false, true] {
+        let (_root, config, store) = fixture()?;
+        let socket = config.run_socket.as_ref().ok_or("fixture Run socket")?;
+        let listener = UnixListener::bind(socket)?;
+        fs::set_permissions(socket, fs::Permissions::from_mode(0o600))?;
+        let batch = reserve(&store, None).await?;
+        let id = batch.id.clone();
+        stored(&store, move |store| state::fence(store, &id, RUN_STORE)).await?;
+        owner_call(OwnerRequest { tool:"pool_close".into(), arguments:json!({"pool_id":batch.pool_id,"expected_revision":1,"request_key":"close"}) },&config,&store).await?;
+        let mock = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await?;
             let request: Value =
                 serde_json::from_slice(&integrations::read_frame(&mut stream).await?)?;
-            assert_eq!(request["method"], method);
-            let result = if method == "capabilities" {
-                json!({"schema_version":1,"product":"agent-run","store_id":RUN_STORE})
-            } else {
-                let _ = lookup.send(());
-                closed.await?;
-                write(
-                    &mut stream,
-                    &json!({"jsonrpc":"2.0","id":request["id"],"result":{"found":false}}),
-                )
-                .await?;
-                break;
-            };
+            assert_eq!(request["method"], "batch_receipt");
+            let mut result = json!({"found":found});
+            if found {
+                let jobs: Vec<_> = (0..3).map(|index| json!({"index":index,"agent_id":agent(index),"sequence":1,"execution_ref":execution(index)})).collect();
+                result["receipt"] = json!({"version":1,"store_id":RUN_STORE,"request_id":request["params"]["request_id"],"jobs":jobs});
+            }
             write(
                 &mut stream,
                 &json!({"jsonrpc":"2.0","id":request["id"],"result":result}),
             )
             .await?;
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+        });
+        reconcile(&config, &store, &mut String::new()).await?;
+        mock.await?.map_err(|error| error.to_string())?;
+        let expected = if found { "admitted" } else { "not_launched" };
+        let pool_id = batch.pool_id.clone();
+        let ChatReply::Overview(view) = stored(&store, move |store| {
+            state::owner_call(store, "pool_get", json!({"pool_id":pool_id}))
+        })
+        .await?
+        else {
+            return Err("overview".into());
+        };
+        assert_eq!(view.latest_admission.as_deref(), Some(expected));
+        let ChatReply::Launch { state, seats, .. } =
+            stored(&store, move |store| state::launch_read(store, &batch)).await?
+        else {
+            return Err("launch".into());
+        };
+        assert_eq!(state, expected);
+        assert!(
+            seats
+                .iter()
+                .all(|seat| !seat.current && seat.agent_id.is_some() == found)
+        );
+    }
+    Ok(())
+}
+
+/// Run validation refusal settles the batch durably without preflight lookup.
+#[tokio::test]
+async fn chat_invalid_spec_settles_refused() -> Result<(), Box<dyn std::error::Error>> {
+    let (_root, config, store) = fixture()?;
+    let socket = config.run_socket.as_ref().ok_or("fixture Run socket")?;
+    let listener = UnixListener::bind(socket)?;
+    fs::set_permissions(socket, fs::Permissions::from_mode(0o600))?;
+    let mut args = input(None);
+    args["members"][0]["spec"]["model"] = json!("invalid-run-model");
+    let batch = stored(&store, move |store| state::start(store, parse(args)?)).await?;
+    let mock = tokio::spawn(async move {
+        for method in ["capabilities", "start_batch"] {
+            let (mut stream, _) = listener.accept().await?;
+            let request: Value =
+                serde_json::from_slice(&integrations::read_frame(&mut stream).await?)?;
+            assert_eq!(request["method"], method);
+            let reply = if method == "capabilities" {
+                json!({"jsonrpc":"2.0","id":request["id"],"result":{"schema_version":1,"product":"agent-run","store_id":RUN_STORE}})
+            } else {
+                assert_eq!(request["params"]["jobs"][0]["model"], "invalid-run-model");
+                json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":-32602,"message":"Invalid model"}})
+            };
+            write(&mut stream, &reply).await?;
         }
-        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(listener)
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
     });
-    let batch = reserve(&store, None).await?;
-    let worker = tokio::spawn({
-        let (config, store) = (config.clone(), Arc::clone(&store));
-        async move { reconcile(&config, &store, &mut String::new()).await }
-    });
-    tokio::time::timeout(EXCHANGE_TIMEOUT, stalled).await??;
-    owner_call(OwnerRequest { tool:"pool_close".into(), arguments:json!({"pool_id":batch.pool_id,"expected_revision":1,"request_key":"close-during-lookup"}) },&config,&store).await?;
-    resume.send(()).map_err(|_| "Run mock went away")?;
-    tokio::time::timeout(EXCHANGE_TIMEOUT, worker).await???;
-    let listener = mock.await?.map_err(|e| e.to_string())?;
+    reconcile(&config, &store, &mut String::new()).await?;
+    mock.await?.map_err(|error| error.to_string())?;
+    let ChatReply::Overview(view) = stored(&store, move |store| {
+        state::owner_call(store, "pool_get", json!({"pool_id":batch.pool_id}))
+    })
+    .await?
+    else {
+        return Err("overview".into());
+    };
+    assert_eq!(view.latest_admission.as_deref(), Some("refused"));
     assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
-            .await
-            .is_err()
-    );
-    let id = batch.id.clone();
-    assert!(
-        stored(&store, move |store| state::next_batch(store, &id))
-            .await?
-            .is_none()
+        view.roster
+            .iter()
+            .all(|seat| seat.admitted == "refused" && seat.agent_id.is_none())
     );
     Ok(())
 }
