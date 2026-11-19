@@ -29,3 +29,12 @@ inter-service wire contract is
 observer `completion_get` header data can also be an ordinary chat agreement
 with `version: 1`, `completion_id`, `pool_id`, `revision`, `event_id`,
 `proposal_id`, `roster_key`, `result`, and per-seat `ballots` references.
+
+A seat that is awaiting its Run receipt returns JSON-RPC `-32000` with
+`data.kind=admission_pending` and `data.retry_after_ms`. Observer inventory rows
+and get details expose `kind` (`chat` or `managed`) and `completion_id` when
+completed. Chat rows in `pools[].roster[]` and `view.members[]` expose
+`seat_id`, nullable `run_agent_id`, `profile`, `admission` and `joined`.
+Admission is `pending`, `admitted`, `refused` or `unknown`. Group observer
+chat history includes direct and owner-only messages only for peers also
+allowlisted on owner ingress.

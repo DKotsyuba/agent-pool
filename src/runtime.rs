@@ -3627,7 +3627,8 @@ pub async fn serve(config_path: &Path) -> Result<(), Fault> {
                 let (stream, _) = match accepted { Ok(value) => value, Err(_) => break Err(Fault::Unavailable) };
                 let Some((stream, permit)) = crate::observer_socket::admit(stream, &observer_uids, &observer_permits) else { continue; };
                 let store = Arc::clone(&store);
-                connections.spawn(async move { let _permit = permit; crate::observer_socket::connection(stream, store).await });
+                let owner_history = crate::observer_socket::admitted(&stream, &owner_uids);
+                connections.spawn(async move { let _permit = permit; crate::observer_socket::connection(stream, store, owner_history).await });
             }
         }
     };
@@ -4581,6 +4582,7 @@ async fn work(
     let mut interval = tokio::time::interval(OBSERVATION_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut observation_cursor = 0;
+    let mut chat_cursor = String::new();
     // P3 enrollment reconciliation: rotating cursor, backoff and a per-pass budget.
     let mut enrollment_schedule = enrollment_dispatch::Schedule::default();
     let started = std::time::Instant::now();
@@ -4592,6 +4594,7 @@ async fn work(
             changed = stopped.changed() => { if changed.is_err() || *stopped.borrow() { return Ok(()); } }
             _ = interval.tick() => (),
         }
+        crate::chat::reconcile(&config, &store, &mut chat_cursor).await?;
         recover_managed(&config, &store, &stopped, &activity).await?;
         if config.managed_run_transport.is_some() {
             let pool_store = stored(&store, |store| store.managed_store_id()).await?;
@@ -7610,7 +7613,7 @@ mod tests {
                 .ok_or("allowlisted group peer")?;
         let (served, group_response) = tokio::time::timeout(Duration::from_secs(15), async {
             tokio::join!(
-                crate::observer_socket::connection(server, Arc::clone(&fixture.store)),
+                crate::observer_socket::connection(server, Arc::clone(&fixture.store), false),
                 async {
                     let mut bytes = serde_json::to_vec(&request)?;
                     bytes.push(b'\n');

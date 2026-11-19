@@ -232,6 +232,7 @@ fn fixture(options: Options) -> Fixture {
         let t = target(n, 1);
         let binding = Binding {
             member: Member {
+                chat_seat: None,
                 member_id: member_id.clone(),
                 name: format!("worker {n}"),
                 role: "builder".into(),
@@ -2793,6 +2794,7 @@ async fn completed_pool_late_start_recovery_keeps_worker_running() {
     // A current, never-bound member whose single-batch start outcome is unknown.
     let late = Binding {
         member: Member {
+            chat_seat: None,
             member_id: "member-late".into(),
             name: "late worker".into(),
             role: "builder".into(),

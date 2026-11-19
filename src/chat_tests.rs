@@ -126,7 +126,19 @@ async fn chat_uncertain_start_reuses_saved_receipt() -> Result<(), Box<dyn std::
     fs::set_permissions(socket, fs::Permissions::from_mode(0o600))?;
     let mock = tokio::spawn(async move {
         let mut original = Value::Null;
-        for method in ["capabilities", "start_batch", "batch_receipt"] {
+        for (index, method) in [
+            "capabilities",
+            "batch_receipt",
+            "start_batch",
+            "capabilities",
+            "batch_receipt",
+            "start_batch",
+            "batch_receipt",
+            "batch_receipt",
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let (mut stream, _) = listener.accept().await?;
             let request: Value =
                 serde_json::from_slice(&integrations::read_frame(&mut stream).await?)?;
@@ -135,13 +147,17 @@ async fn chat_uncertain_start_reuses_saved_receipt() -> Result<(), Box<dyn std::
                 "capabilities" => {
                     json!({"schema_version":1,"product":"agent-run","store_id":RUN_STORE,"pool_chat_v1":true})
                 }
-                "start_batch" => {
+                "batch_receipt" if index == 1 || index == 4 || index == 6 => json!({"found":false}),
+                "start_batch" if index == 2 => {
                     original = request["params"].clone();
                     continue;
                 }
                 _ => {
-                    assert_eq!(request["params"], original);
-                    let jobs = original["jobs"].as_array().ok_or("jobs")?;
+                    if index == 7 {
+                        assert_eq!(request["params"], original);
+                    }
+                    let request_jobs = &request["params"];
+                    let jobs = request_jobs["jobs"].as_array().ok_or("jobs")?;
                     let mut entries = Vec::new();
                     for (index, spec) in jobs.iter().enumerate() {
                         assert_eq!(spec["pool_chat"]["version"], 1);
@@ -154,7 +170,12 @@ async fn chat_uncertain_start_reuses_saved_receipt() -> Result<(), Box<dyn std::
                         assert_eq!(spec["profile"], ["implement", "review", "research"][index]);
                         entries.push(json!({"index":index,"agent_id":agent(index),"sequence":1,"execution_ref":execution(index)}));
                     }
-                    json!({"found":true,"receipt":{"version":1,"store_id":RUN_STORE,"request_id":original["request_id"],"jobs":entries}})
+                    let receipt = json!({"version":1,"store_id":RUN_STORE,"request_id":request_jobs["request_id"],"jobs":entries});
+                    if index == 7 {
+                        json!({"found":true,"receipt":receipt})
+                    } else {
+                        json!({"replayed":false,"receipt":receipt})
+                    }
                 }
             };
             write(
@@ -169,38 +190,68 @@ async fn chat_uncertain_start_reuses_saved_receipt() -> Result<(), Box<dyn std::
         tool: "pool_start".into(),
         arguments: input(None),
     };
-    let ChatReply::Launch {
-        pool_id,
-        state,
-        seats,
-        ..
-    } = owner_call(request(), &config, &store).await?
-    else {
-        return Err("launch".into());
-    };
-    assert_eq!(state, "pending");
-    let ChatReply::Launch {
-        pool_id: retried,
-        state,
-        seats: admitted,
-        ..
-    } = owner_call(request(), &config, &store).await?
-    else {
-        return Err("retry".into());
-    };
-    assert_eq!(retried, pool_id);
-    assert_eq!(state, "admitted");
-    for (index, (old, new)) in seats.iter().zip(admitted).enumerate() {
-        assert_eq!(old.id, new.id);
-        assert_eq!(new.agent_id, Some(agent(index)));
+    let mut second = request();
+    second.arguments["request_key"] = json!("other-start");
+    let (first, second) = tokio::join!(
+        owner_call(request(), &config, &store),
+        owner_call(second, &config, &store),
+    );
+    let mut launched = Vec::new();
+    for reply in [first?, second?] {
+        let templates = renderer()?;
+        let ChatReply::Launch {
+            pool_id,
+            state,
+            seats,
+            ..
+        } = reply
+        else {
+            return Err("launch".into());
+        };
+        assert_eq!(state, "pending");
+        assert_eq!(
+            present(
+                Ok(ChatReply::Launch {
+                    pool_id: pool_id.clone(),
+                    revision: 1,
+                    state: state.clone(),
+                    request_key: "start".into(),
+                    seats: Vec::new(),
+                    old_agent_id: None
+                }),
+                templates
+            )
+            .is_error,
+            Some(false)
+        );
+        launched.push((pool_id, seats));
     }
-    let request_bytes = tokio::time::timeout(EXCHANGE_TIMEOUT, mock)
+    // Both MCP requests have finished and neither owner reconnects.
+    let mut cursor = String::new();
+    for _ in 0..4 {
+        reconcile(&config, &store, &mut cursor).await?;
+    }
+    let original = tokio::time::timeout(EXCHANGE_TIMEOUT, mock)
         .await??
         .map_err(|e| e.to_string())?;
-    assert_eq!(
-        request_bytes["jobs"][0]["pool_chat"]["seat_id"],
-        seats[0].id
+    assert!(
+        launched
+            .iter()
+            .any(|(_, seats)| original["jobs"][0]["pool_chat"]["seat_id"] == seats[0].id)
     );
+    for (pool_id, seats) in launched {
+        let ChatReply::Overview(view) = stored(&store, move |store| {
+            state::owner_call(store, "pool_get", json!({"pool_id":pool_id}))
+        })
+        .await?
+        else {
+            return Err("overview".into());
+        };
+        for (index, (old, new)) in seats.iter().zip(view.roster).enumerate() {
+            assert_eq!(old.id, new.seat_id);
+            assert_eq!(new.agent_id, Some(agent(index)));
+        }
+    }
     let mut changed = request();
     changed.arguments["purpose"] = json!("changed");
     assert!(matches!(
@@ -277,10 +328,11 @@ async fn complete_with_address(
         state::fence(store, &batch_id, RUN_STORE)
     })
     .await?;
-    assert!(
-        call(get()).await["error"]["message"]
-            .as_str()
-            .is_some_and(|text| text.contains("admission is pending"))
+    let pending = call(get()).await;
+    assert_eq!(pending["error"]["code"], -32000);
+    assert_eq!(
+        pending["error"]["data"],
+        json!({"kind":"admission_pending","retry_after_ms":1000})
     );
     install(&store, &batch).await?;
     let mut foreign = get();
@@ -451,6 +503,61 @@ async fn complete_with_address(
         assert_eq!(count, if address.is_some() { 2 } else { 0 });
         Ok(db.query_row("SELECT id FROM chat_agreements WHERE pool=?1",[pid],|r|r.get::<_,String>(0))?)
     }).await?;
+    let observe = |operation: &'static str, params: Value, owner| {
+        let store = &store;
+        async move {
+            let request = serde_json::to_vec(
+                &json!({"schema_version":1,"operation":operation,"params":params}),
+            )
+            .map_err(|_| Fault::Internal)?;
+            serde_json::to_value(crate::observer_socket::answer(&request, store, owner).await)
+                .map_err(|_| Fault::Internal)
+        }
+    };
+    let inventory = observe(
+        "inventory_snapshot",
+        json!({"filter":"all","limit":10}),
+        false,
+    )
+    .await?;
+    let row = &inventory["data"]["pools"][0];
+    assert_eq!(row["kind"], "chat");
+    assert_eq!(row["completion_id"], completion_id);
+    let seat = &row["roster"][0];
+    assert_eq!(seat["seat_id"], batch.jobs[0].member_id);
+    assert_eq!(seat["run_agent_id"], agent(0));
+    assert_eq!(seat["profile"], "implement");
+    assert_eq!(seat["admission"], "admitted");
+    assert_eq!(seat["joined"], true);
+    let detail = observe(
+        "get",
+        json!({"pool_id":batch.pool_id,"section":"overview"}),
+        false,
+    )
+    .await?;
+    assert_eq!(detail["data"]["kind"], "chat");
+    assert_eq!(detail["data"]["completion_id"], completion_id);
+    assert_eq!(detail["data"]["view"]["members"][0], *seat);
+    for direction in [None, Some("forward")] {
+        let mut args = json!({"pool_id":batch.pool_id,"section":"history","after":4});
+        if let Some(direction) = direction {
+            args["direction"] = json!(direction);
+        }
+        let public = observe("get", args.clone(), false).await?;
+        let events = public["data"]["view"]["events"]
+            .as_array()
+            .ok_or("observer history")?;
+        assert!(events.iter().any(|e| e["kind"] == "proposal_opened"));
+        assert!(events.iter().all(|e| e["kind"] != "direct_message"
+            && e["kind"] != "owner_message"
+            && e["kind"] != "message_part"));
+        let owner = observe("get", args, true).await?;
+        let events = owner["data"]["view"]["events"]
+            .as_array()
+            .ok_or("owner observer history")?;
+        assert!(events.iter().any(|e| e["kind"] == "direct_message"));
+        assert!(events.iter().any(|e| e["kind"] == "message_part"));
+    }
     let observer = crate::observer::Request {
         schema_version: 1,
         operation: crate::observer::Operation::CompletionGet(completion::GetRequest {
@@ -461,7 +568,8 @@ async fn complete_with_address(
             limit: 1,
         }),
     };
-    let observed = crate::observer_socket::answer(&serde_json::to_vec(&observer)?, &store).await;
+    let observed =
+        crate::observer_socket::answer(&serde_json::to_vec(&observer)?, &store, false).await;
     assert!(matches!(
         observed.data,
         Some(crate::observer::Data::Agreement(_))
@@ -532,5 +640,65 @@ async fn chat_migrates_v17_without_changing_old_pool() -> Result<(), Box<dyn std
     assert!(old.purpose.contains("Old purpose"));
     let new = state::start(&mut upgraded, parse(input(None))?)?;
     assert_ne!(new.pool_id, pid);
+    Ok(())
+}
+
+/// Close wins while the first receipt lookup is stalled, before the send fence.
+#[tokio::test]
+async fn chat_close_during_receipt_lookup_prevents_launch() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (_root, config, store) = fixture()?;
+    let socket = config.run_socket.as_ref().ok_or("fixture Run socket")?;
+    let listener = UnixListener::bind(socket)?;
+    fs::set_permissions(socket, fs::Permissions::from_mode(0o600))?;
+    let (lookup, stalled) = tokio::sync::oneshot::channel();
+    let (resume, closed) = tokio::sync::oneshot::channel();
+    let mock = tokio::spawn(async move {
+        for method in ["capabilities", "batch_receipt"] {
+            let (mut stream, _) = listener.accept().await?;
+            let request: Value =
+                serde_json::from_slice(&integrations::read_frame(&mut stream).await?)?;
+            assert_eq!(request["method"], method);
+            let result = if method == "capabilities" {
+                json!({"schema_version":1,"product":"agent-run","store_id":RUN_STORE})
+            } else {
+                let _ = lookup.send(());
+                closed.await?;
+                write(
+                    &mut stream,
+                    &json!({"jsonrpc":"2.0","id":request["id"],"result":{"found":false}}),
+                )
+                .await?;
+                break;
+            };
+            write(
+                &mut stream,
+                &json!({"jsonrpc":"2.0","id":request["id"],"result":result}),
+            )
+            .await?;
+        }
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(listener)
+    });
+    let batch = reserve(&store, None).await?;
+    let worker = tokio::spawn({
+        let (config, store) = (config.clone(), Arc::clone(&store));
+        async move { reconcile(&config, &store, &mut String::new()).await }
+    });
+    tokio::time::timeout(EXCHANGE_TIMEOUT, stalled).await??;
+    owner_call(OwnerRequest { tool:"pool_close".into(), arguments:json!({"pool_id":batch.pool_id,"expected_revision":1,"request_key":"close-during-lookup"}) },&config,&store).await?;
+    resume.send(()).map_err(|_| "Run mock went away")?;
+    tokio::time::timeout(EXCHANGE_TIMEOUT, worker).await???;
+    let listener = mock.await?.map_err(|e| e.to_string())?;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+    let id = batch.id.clone();
+    assert!(
+        stored(&store, move |store| state::next_batch(store, &id))
+            .await?
+            .is_none()
+    );
     Ok(())
 }

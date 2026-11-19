@@ -819,6 +819,9 @@ pub enum MemberState {
 /// Transport-free member projection used in every participant response and event.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Member {
+    /// Observer-only ordinary Run seat facts. Legacy member wire fields are unchanged.
+    #[serde(default, flatten, skip_serializing_if = "Option::is_none")]
+    pub chat_seat: Option<ChatSeat>,
     /// Opaque membership incarnation, not a native or Run identifier.
     pub member_id: String,
     /// Display name selected by the owner.
@@ -831,6 +834,20 @@ pub struct Member {
     pub state: MemberState,
     /// Observed execution state; unknown is never treated as completion.
     pub runtime: String,
+}
+/// Observer-safe admission facts for a chat seat.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatSeat {
+    /// Stable Pool seat ID.
+    pub seat_id: String,
+    /// Run lineage from the confirmed receipt, if installed.
+    pub run_agent_id: Option<String>,
+    /// Ordinary Run profile reserved for the seat.
+    pub profile: String,
+    /// Pending, admitted, refused, or unknown.
+    pub admission: String,
+    /// Whether this seat joined.
+    pub joined: bool,
 }
 /// Proposal lifecycle; accepted proposals are immutable and independent of pool lifetime.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

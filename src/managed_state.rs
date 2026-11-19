@@ -2610,6 +2610,7 @@ pub(crate) mod tests {
         db.execute("INSERT INTO pools(id,owner,data) VALUES('pool','owner',?1)",[r#"{"pool_id":"pool","name":"pool","purpose":"goal","revision":1,"closed":false,"proposal":null}"#]).unwrap();
         let member = crate::domain::Binding {
             member: crate::domain::Member {
+                chat_seat: None,
                 member_id: "member".into(),
                 name: "member".into(),
                 role: "role".into(),

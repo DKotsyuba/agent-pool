@@ -1166,9 +1166,11 @@ sending an owner command. Allowed owners share authority over chat pools.
 Legacy managed pools continue using their existing mutation route.
 
 Start commits the pool, ordered seats and exact Run batch in one SQLite
-transaction. Before sending, Pool freezes the Run store identity. An uncertain
-start remains recoverable under the original owner request key, batch payload
-and Run request ID. On retry Pool looks up the receipt before it resubmits.
+transaction. The resident processes one pending batch at a time. It checks Run
+for a receipt before reserving the first possible send under the store lock. Once that send
+is possible, the resident only looks up the original receipt, including after
+owner disconnect, close or restart. Close cancels batches that have not reached
+the send reservation.
 Ordered receipt rows install Run lineage IDs atomically. A seat may join once
 its admission is recorded. Replacement requires a pool revision, retires the
 old seat at reservation and invalidates the open proposal. It reports the prior

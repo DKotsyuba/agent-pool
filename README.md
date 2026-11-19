@@ -182,6 +182,7 @@ and retrieve legacy completions. The resident UID cannot use owner ingress.
 
 Run supplies member identity through its ordinary worker MCP. Choose each worker's
 normal profile. Mutations take the observed `expected_revision`. Owners supply a
-stable `request_key` and repeat the same intent if admission is uncertain.
+stable `request_key`. The resident reconciles Run receipts when admission is uncertain,
+even if the owner disconnects.
 `pool_start` accepts an optional canonical `owner_address` for Bridge notices.
 The pool remains readable and can reach agreement if the initiating chat ends.
