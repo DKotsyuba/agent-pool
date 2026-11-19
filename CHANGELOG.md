@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.2.3
+
+Fix release, 2026-11-19.
+
+### Fixed
+
+- On restart, the resident waits briefly for its predecessor to release the writer lease and the listening socket. Startup diagnostics identify the failing stage.
+- Conflicting or stale outbox effects yield to other work and remain eligible for reconciliation. Storage failures still stop the resident.
+
 ## 0.2.2
 
 Feature release, 2026-11-19.

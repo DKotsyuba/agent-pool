@@ -1449,11 +1449,18 @@ impl Store {
             .open(path.with_extension("lock"))
             .map_err(|_| Fault::Unavailable)?;
         let deadline = std::time::Instant::now() + wait;
-        while lease.try_lock_exclusive().is_err() {
-            if std::time::Instant::now() >= deadline {
-                return Err(Fault::Conflict);
+        loop {
+            match lease.try_lock_exclusive() {
+                Ok(()) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(Fault::Conflict);
+                    }
+                    std::thread::sleep(SETTLE_POLL.min(remaining));
+                }
+                Err(_) => return Err(Fault::Unavailable),
             }
-            std::thread::sleep(SETTLE_POLL);
         }
         let file = OpenOptions::new()
             .create(true)
@@ -1696,6 +1703,14 @@ PRAGMA user_version=5;")?;
         }
         tx.commit()?;
         Ok(Some(effect))
+    }
+    /// Releases a failed dispatch claim for reconciliation while preserving any newer outcome.
+    pub(crate) fn defer_effect(&mut self, effect_id: &str) -> Result<(), Fault> {
+        self.db.execute(
+            "UPDATE effects SET state='unknown' WHERE id=?1 AND state='inflight'",
+            [effect_id],
+        )?;
+        Ok(())
     }
     /// Returns at most 32 uncertain effects for status reconciliation, never automatic new IDs.
     pub fn pending_unknown(&mut self) -> Result<Vec<Effect>, Fault> {
