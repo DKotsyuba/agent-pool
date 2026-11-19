@@ -441,7 +441,9 @@ native/Run mappings, owner diagnostics, or make the resident call Run. Any other
 input — an unknown operation, a participant command, an assertion, a credential,
 a managed or JSON-RPC frame, extra fields, invalid UTF-8, a second line or an
 oversized line — is `invalid` with kind `error` and is never dispatched. Reads
-use the same Store projections as the owner observer and never write.
+share pagination with the owner observer and never write. Group delivery
+responses omit `pin_recovery`. The authenticated owner observer and owner
+`pool_get` show those inputs when the original public admission can be verified.
 
 A client may speak this NDJSON protocol directly, or run
 `agent-pool observe --socket /run/agent-pool/observer.sock --server-uid 1003`,
