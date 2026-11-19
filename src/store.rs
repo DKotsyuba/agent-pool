@@ -3615,17 +3615,30 @@ fn execute_authorized(
                     let supplied: BTreeSet<_> =
                         x.checks.iter().map(|c| c.criterion_id.as_str()).collect();
                     if supplied != required {
-                        return Err(Fault::Invalid);
+                        return Err(if chat_actor.is_some() {
+                            Fault::VoteCriterion
+                        } else {
+                            Fault::Invalid
+                        });
                     }
                     Some(x.checks.iter().all(|c| c.status == CheckStatus::Met))
                 } else {
                     None
                 }
             } else {
-                if !x.checks.is_empty()
-                    || (matches!(x.choice, Choice::Ready | Choice::Block) && x.evidence.is_empty())
-                {
-                    return Err(Fault::Invalid);
+                if !x.checks.is_empty() {
+                    return Err(if chat_actor.is_some() {
+                        Fault::VoteChecksUnsupported
+                    } else {
+                        Fault::Invalid
+                    });
+                }
+                if matches!(x.choice, Choice::Ready | Choice::Block) && x.evidence.is_empty() {
+                    return Err(if chat_actor.is_some() {
+                        Fault::VoteEvidence
+                    } else {
+                        Fault::Invalid
+                    });
                 }
                 None
             };
@@ -3684,6 +3697,11 @@ fn execute_authorized(
     if !message_parts.is_empty() {
         append_message_parts(db, &p, &mut event, &message_parts)?;
     }
+    if matches!(command, Command::Propose(_))
+        && let Some(ChatActor::Member(seat)) = chat_actor
+    {
+        record_proposer_vote(db, &mut p, seat, &author)?;
+    }
     if let Command::Vote(x) = command
         && (p.acceptance.is_some() || chat_actor.is_some())
     {
@@ -3708,12 +3726,15 @@ fn execute_authorized(
             &event,
             direct_address.as_deref(),
         )?;
-        if matches!(command, Command::Vote(_))
+        if matches!(command, Command::Vote(_) | Command::Propose(_))
             && p.proposal
                 .as_ref()
                 .is_some_and(|proposal| proposal.state == ProposalState::Accepted)
         {
-            created = Some(chat::commit_agreement(db, &p, &roster)?);
+            let agreement = chat::commit_agreement(db, &p, &roster)?;
+            if matches!(command, Command::Vote(_)) {
+                created = Some(agreement);
+            }
             chat_completed = true;
         }
     } else if system {
@@ -3989,6 +4010,60 @@ fn execute_authorized(
     remember(db, &replay_scope, &c.request_key, &digest, &reply)?;
     Ok(reply)
 }
+/// Journals the proposer's ready attestation at the proposal revision and accepts a sole voter.
+fn record_proposer_vote(
+    db: &Connection,
+    pool: &mut Pool,
+    seat: &str,
+    author: &Author,
+) -> Result<(), Fault> {
+    let proposal = pool.proposal.as_ref().ok_or(Fault::Internal)?;
+    let only_voter = proposal.voters.len() == 1;
+    let event = append_event(
+        db,
+        pool,
+        if only_voter {
+            "proposal_accepted"
+        } else {
+            "vote_recorded"
+        },
+        author.clone(),
+        format!("Proposal {}: Ready.\nproposer", proposal.proposal_id),
+        None,
+    )?;
+    if let Some(criteria) = &pool.acceptance {
+        for criterion in criteria {
+            append_check(
+                db,
+                pool,
+                author.clone(),
+                event.event_id,
+                &CriterionCheck {
+                    criterion_id: criterion.id.clone(),
+                    status: CheckStatus::Met,
+                    evidence: "proposer".into(),
+                },
+            )?;
+        }
+    }
+    let proposal = pool.proposal.as_mut().ok_or(Fault::Internal)?;
+    proposal.votes.insert(
+        seat.into(),
+        Ballot {
+            choice: Choice::Ready,
+            evidence: "proposer".into(),
+            checks_met: pool.acceptance.as_ref().map(|_| true),
+            checks_count: pool.acceptance.as_ref().map(Vec::len),
+            vote_event_id: Some(event.event_id.to_string()),
+            validity: None,
+        },
+    );
+    if only_voter {
+        proposal.state = ProposalState::Accepted;
+    }
+    Ok(())
+}
+
 /// Enforces tool-specific owner/member roles, including pending-member read/join restrictions.
 pub(crate) fn authorize(
     command: &Command,

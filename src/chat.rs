@@ -293,9 +293,65 @@ pub(crate) fn parse<T: DeserializeOwned>(value: Value) -> Result<T, Fault> {
 
 /// Uses the existing closed domain schemas and validators for shared chat mutations.
 pub(crate) fn command(name: &str, args: Value) -> Result<Command, Fault> {
+    if name == "pool_vote" {
+        validate_vote_fields(&args)?;
+    }
     let command: Command = parse(json!({"name":name,"arguments":args}))?;
     command.validate()?;
     Ok(command)
+}
+
+/// Reports safe, field-specific issues before the shared vote decoder runs.
+fn validate_vote_fields(args: &Value) -> Result<(), Fault> {
+    if let Some(evidence) = args.get("evidence") {
+        let evidence = evidence.as_str().ok_or(Fault::VoteEvidence)?;
+        if !evidence.is_empty() {
+            crate::domain::text(evidence, crate::domain::MAX_TEXT)
+                .map_err(|_| Fault::VoteEvidence)?;
+        }
+    }
+    let Some(value) = args.get("checks") else {
+        return Ok(());
+    };
+    let checks = value.as_array().ok_or(Fault::VoteChecks)?;
+    if checks.len() > 10
+        || serde_json::to_vec(value)
+            .map_err(|_| Fault::VoteChecks)?
+            .len()
+            > 16384
+    {
+        return Err(Fault::VoteChecks);
+    }
+    if !checks.is_empty() && args["choice"] == "revoke" {
+        return Err(Fault::VoteChecksUnsupported);
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    for check in checks {
+        let check = check.as_object().ok_or(Fault::VoteChecks)?;
+        let id = check
+            .get("criterion_id")
+            .and_then(Value::as_str)
+            .ok_or(Fault::VoteCriterion)?;
+        crate::domain::criterion_id(id).map_err(|_| Fault::VoteCriterion)?;
+        if !ids.insert(id) {
+            return Err(Fault::VoteCriterion);
+        }
+        if !matches!(
+            check.get("status").and_then(Value::as_str),
+            Some("met" | "unmet")
+        ) {
+            return Err(Fault::VoteCheckStatus);
+        }
+        let evidence = check
+            .get("evidence")
+            .and_then(Value::as_str)
+            .ok_or(Fault::VoteCheckEvidence)?;
+        crate::domain::text(evidence, 1024).map_err(|_| Fault::VoteCheckEvidence)?;
+        if check.len() != 3 {
+            return Err(Fault::VoteChecks);
+        }
+    }
+    Ok(())
 }
 
 /// Returns the exact group owner catalog.

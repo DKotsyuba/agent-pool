@@ -301,7 +301,12 @@ async fn complete_with_address(
     address: Option<&'static str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_root, config, store) = fixture()?;
-    let batch = reserve(&store, address).await?;
+    let mut args = input(address);
+    let structured = address.is_some();
+    if structured {
+        args["acceptance"] = json!([{"id":"tested","text":"Result is tested"}]);
+    }
+    let batch = stored(&store, move |store| state::start(store, parse(args)?)).await?;
     let templates = renderer()?;
     let call = |value| private_call(value, &config, &store, templates);
     let catalog =
@@ -437,7 +442,10 @@ async fn complete_with_address(
         "proposal",
         json!({"expected_revision":6,"result":"agreed result","criteria":"checked"}),
     );
-    assert!(ok(&call(proposal).await));
+    let opened = call(proposal.clone()).await;
+    assert!(ok(&opened));
+    assert!(reply_text(&opened).contains("revision=7"));
+    assert_eq!(call(proposal).await, opened);
     let pid = batch.pool_id.clone();
     let (proposal, roster_key) = stored(&store, move |store| {
         let ChatReply::Overview(view) =
@@ -449,17 +457,43 @@ async fn complete_with_address(
         Ok((proposal.id, proposal.roster_key))
     })
     .await?;
-    for index in 0..3 {
-        let vote = member_call(
-            &batch,
-            index,
-            "pool_vote",
-            &format!("ready-{index}"),
-            json!({
-                "expected_revision":7+index,"proposal_id":proposal,"roster_key":roster_key,
-                "choice":"ready","evidence":format!("evidence {index}")
-            }),
-        );
+    let vote_args = |revision, evidence: String| {
+        json!({
+            "expected_revision":revision,"proposal_id":proposal,"roster_key":roster_key,
+            "choice":"ready","evidence":evidence
+        })
+    };
+    for (status, expected) in [
+        (
+            "met",
+            if structured {
+                "pool_get section=criteria"
+            } else {
+                "Omit checks"
+            },
+        ),
+        (
+            "private-invalid-status",
+            "checks[].status must be met or unmet",
+        ),
+    ] {
+        let mut args = vote_args(7, "private-evidence".into());
+        args["checks"] =
+            json!([{"criterion_id":"1","status":status,"evidence":"private-evidence"}]);
+        let rejected = call(member_call(&batch, 1, "pool_vote", "invalid-check", args)).await;
+        assert_eq!(rejected["result"]["is_error"], true);
+        let text = reply_text(&rejected);
+        assert!(text.contains(expected), "{text}");
+        assert!(!text.contains("private-"));
+    }
+    let first_voter = usize::from(address.is_none());
+    for index in first_voter..3 {
+        let mut args = vote_args(7 + index - first_voter, format!("evidence {index}"));
+        if structured {
+            args["checks"] =
+                json!([{"criterion_id":"tested","status":"met","evidence":"verified"}]);
+        }
+        let vote = member_call(&batch, index, "pool_vote", &format!("ready-{index}"), args);
         let result = call(vote.clone()).await;
         assert!(ok(&result), "{result}");
         if index == 2 {
@@ -618,7 +652,7 @@ async fn complete_with_address(
     ));
     let close = OwnerRequest {
         tool: "pool_close".into(),
-        arguments: json!({"pool_id":batch.pool_id,"expected_revision":10,"request_key":"close"}),
+        arguments: json!({"pool_id":batch.pool_id,"expected_revision":10-first_voter,"request_key":"close"}),
     };
     let ChatReply::Existing(Reply::Receipt(receipt)) = owner_call(close, &config, &store).await?
     else {
@@ -1589,5 +1623,59 @@ async fn chat_owner_text_separates_pool_and_seat_rows() -> Result<(), Box<dyn st
         3,
         "{text}"
     );
+    Ok(())
+}
+
+/// A sole joined proposer completes in one revision with a durable ballot and exact replay.
+#[tokio::test]
+async fn chat_sole_proposer_completes() -> Result<(), Box<dyn std::error::Error>> {
+    let (_root, config, store) = fixture()?;
+    let mut args = input(None);
+    args["members"] = json!([spec("implement")]);
+    args["acceptance"] = json!([{"id":"tested","text":"Result is tested"}]);
+    let batch = stored(&store, move |store| state::start(store, parse(args)?)).await?;
+    install(&store, &batch).await?;
+    let templates = renderer()?;
+    let call = |value| private_call(value, &config, &store, templates);
+    assert!(ok(&call(member_call(
+        &batch,
+        0,
+        "pool_join",
+        "join",
+        json!({"expected_revision":1})
+    ))
+    .await));
+    let propose = member_call(
+        &batch,
+        0,
+        "pool_propose",
+        "proposal",
+        json!({"expected_revision":2,"result":"done","criteria":"tested"}),
+    );
+    let receipt = call(propose.clone()).await;
+    assert!(ok(&receipt), "{receipt}");
+    assert!(reply_text(&receipt).contains("revision=3"));
+    assert!(reply_text(&receipt).contains("agreement recorded"));
+    assert_eq!(call(propose).await, receipt);
+    let pid = batch.pool_id.clone();
+    let seat = batch.jobs[0].member_id.clone();
+    stored(&store, move |store| {
+        let db = store.test_db();
+        let data: String = db.query_row("SELECT data FROM chat_agreements WHERE pool=?1", [&pid], |row| row.get(0))?;
+        let record: Value = serde_json::from_str(&data).map_err(|_| Fault::Internal)?;
+        assert_eq!(record["revision"], 3);
+        assert_eq!(record["ballots"][0]["seat_id"], seat);
+        let ballot = record["ballots"][0]["vote_event_id"].as_str().ok_or(Fault::Internal)?;
+        let (kind, revision, body): (String, i64, String) = db.query_row(
+            "SELECT json_extract(data,'$.kind'),json_extract(data,'$.revision'),json_extract(data,'$.body') FROM events WHERE rowid=?1",
+            [ballot], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        )?;
+        assert_eq!(kind, "proposal_accepted");
+        assert_eq!(revision, 3);
+        assert!(body.ends_with("proposer"));
+        let count: i64 = db.query_row("SELECT count(*) FROM events WHERE pool=?1 AND json_extract(data,'$.revision')=3", [&pid], |row| row.get(0))?;
+        assert_eq!(count, 4);
+        Ok(())
+    }).await?;
     Ok(())
 }

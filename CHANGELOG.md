@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.2.2
+
+Feature release, 2026-11-19.
+
+### Fixed
+
+- Opening a chat proposal automatically records the proposer’s ready vote at the proposal revision. A sole joined seat completes the pool immediately.
+- Chat vote refusals identify invalid check fields and explain when to omit checks or use the pool’s exact criterion IDs.
+
 ## 0.2.1
 
 - Chat start and replacement reject the Run `research` profile. Other roles Run reports as restricted settle their notices immediately.

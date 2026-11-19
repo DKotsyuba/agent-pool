@@ -179,7 +179,13 @@ and retrieve legacy completions. The resident UID cannot use owner ingress.
 | --- | --- |
 | `pool_join`, `pool_get` | Confirm the seat and inspect the pool or its journal. |
 | `pool_post`, `pool_send_member`, `pool_notify_owner` | Broadcast, message one current seat or notify the initiating chat. |
-| `pool_propose`, `pool_vote` | Propose a result and vote ready, block or revoke against the exact proposal and roster. |
+| `pool_propose`, `pool_vote` | Open a proposal and record your ready vote in the same revision, or vote ready, block or revoke against the exact proposal and roster. |
+
+A sole joined seat completes the pool when it proposes. While a proposal is open,
+the proposer can change its vote. For free-text criteria, send `evidence` for
+ready or block and omit `checks`. For structured acceptance, use `pool_get
+section=criteria` and send one check per exact criterion ID for ready. Each
+check has `criterion_id`, `status` (`met` or `unmet`), and `evidence`.
 
 Run supplies member identity through its ordinary worker MCP. Choose each worker's
 wakeable profile such as `implement` or `review`. Pool refuses `research` for both
