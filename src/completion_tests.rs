@@ -2205,8 +2205,10 @@ fn downgrade_for_completion_test(db: &rusqlite::Connection, version: i64) {
     } else if version == 10 {
         db.execute_batch("DROP TABLE managed_namespace_retirements; DROP TABLE managed_route_pin_history; ALTER TABLE managed_bootstrap DROP COLUMN bridge_pin; ALTER TABLE managed_run_routes DROP COLUMN pool_route; ALTER TABLE managed_delivery_seeds DROP COLUMN issuer_namespace;").unwrap();
     }
-    db.execute_batch(&format!("PRAGMA user_version={version};"))
-        .unwrap();
+    db.execute_batch(&format!(
+        "DROP TABLE chat_notice_targets; PRAGMA user_version={version};"
+    ))
+    .unwrap();
 }
 
 /// Upgrade every pre-completion attempt-binding schema without inventing records.
@@ -2262,7 +2264,7 @@ fn p3_completion_migration_history_and_downgrade() {
     drop(Store::open(&path).unwrap());
     rusqlite::Connection::open(&path)
         .unwrap()
-        .execute_batch("DROP TABLE managed_delivery_liveness; DROP TABLE managed_route_attention; DROP TABLE managed_enrollment_jobs; DROP TABLE managed_enrollments; DROP TABLE completed_admissions; PRAGMA user_version=13;")
+        .execute_batch("DROP TABLE managed_delivery_liveness; DROP TABLE managed_route_attention; DROP TABLE managed_enrollment_jobs; DROP TABLE managed_enrollments; DROP TABLE completed_admissions; DROP TABLE chat_notice_targets; PRAGMA user_version=13;")
         .unwrap();
     drop(Store::open(&path).unwrap());
     let db = rusqlite::Connection::open(&path).unwrap();
@@ -2296,7 +2298,7 @@ fn review_v13_migration_preserves_prepared_retirement_and_rolls_back_on_failure(
             }
         }
         db.execute_batch(
-            "DROP TABLE managed_delivery_liveness; DROP TABLE managed_route_attention; DROP TABLE managed_enrollment_jobs; DROP TABLE managed_enrollments; DROP TABLE completed_admissions; PRAGMA user_version=12; DROP TRIGGER inventory_rev_completion_sagas_INSERT;",
+            "DROP TABLE managed_delivery_liveness; DROP TABLE managed_route_attention; DROP TABLE managed_enrollment_jobs; DROP TABLE managed_enrollments; DROP TABLE completed_admissions; DROP TABLE chat_notice_targets; PRAGMA user_version=12; DROP TRIGGER inventory_rev_completion_sagas_INSERT;",
         )
         .unwrap();
     }

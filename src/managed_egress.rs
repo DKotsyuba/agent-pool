@@ -3331,7 +3331,7 @@ pub(crate) mod tests {
             .unwrap();
         store
             .test_db()
-            .execute_batch("PRAGMA user_version=15;")
+            .execute_batch("DROP TABLE chat_notice_targets; PRAGMA user_version=15;")
             .unwrap();
         drop(store);
         let path = directory.path().join("pool.db");

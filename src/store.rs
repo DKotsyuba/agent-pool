@@ -1538,6 +1538,9 @@ PRAGMA user_version=5;")?;
         if version < 18 {
             chat::migrate(&db)?;
         }
+        if version < 19 {
+            chat::migrate_notices(&db)?;
+        }
         if version < crate::completion::SCHEMA_VERSION {
             db.execute_batch("COMMIT;")?;
         }
@@ -1634,8 +1637,9 @@ PRAGMA user_version=5;")?;
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let row: Option<String> = tx
             .query_row(
-                "SELECT data FROM effects WHERE state='queued' ORDER BY sequence LIMIT 1",
-                [],
+                "SELECT e.data FROM effects e LEFT JOIN chat_notice_targets n ON n.effect=e.id
+                 WHERE e.state='queued' AND coalesce(n.next_resolve_ms,0)<=?1 ORDER BY e.sequence LIMIT 1",
+                [chat::receipt_clock()?],
                 |r| r.get(0),
             )
             .optional()?;
@@ -2001,7 +2005,7 @@ PRAGMA user_version=5;")?;
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let retired: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM chat_notice_targets n JOIN members m ON m.id=n.member WHERE n.effect=?1 AND m.current=0)", [effect_id], |r| r.get(0))?;
+        let retired: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM chat_notice_targets n JOIN members m ON m.id=n.member WHERE n.effect=?1 AND m.current=0 AND n.close_notice=0)", [effect_id], |r| r.get(0))?;
         if retired {
             return Err(Fault::Closed);
         }
@@ -2056,6 +2060,7 @@ PRAGMA user_version=5;")?;
             "accepted",
             "refused",
             "cancelled",
+            chat::NOTICE_UNDELIVERABLE,
             PIN_RELEASE_TOKEN_UNAVAILABLE,
             PIN_RELEASE_PARAMETERS_REJECTED,
         ]
@@ -2107,6 +2112,7 @@ PRAGMA user_version=5;")?;
             "accepted",
             "refused",
             "cancelled",
+            chat::NOTICE_UNDELIVERABLE,
             PIN_RELEASE_TOKEN_UNAVAILABLE,
             PIN_RELEASE_PARAMETERS_REJECTED,
             PIN_RELEASE_READY,
@@ -3689,10 +3695,9 @@ fn execute_authorized(
         chat::queue_chat_notices(
             db,
             &p,
-            &roster,
+            if p.closed { &closed_members } else { &roster },
             &event,
             direct_address.as_deref(),
-            caller.as_ref(),
         )?;
         if matches!(command, Command::Vote(_))
             && p.proposal
@@ -10629,7 +10634,9 @@ mod tests {
                 .unwrap();
             store
                 .db
-                .execute_batch(&format!("PRAGMA user_version={prior_version}"))
+                .execute_batch(&format!(
+                    "DROP TABLE chat_notice_targets; PRAGMA user_version={prior_version}"
+                ))
                 .unwrap();
             drop(store);
             let mut upgraded = Store::open(&directory.path().join("pool.sqlite")).unwrap();
@@ -10679,7 +10686,9 @@ mod tests {
                 .unwrap();
             store
                 .db
-                .execute_batch(&format!("PRAGMA user_version={prior}"))
+                .execute_batch(&format!(
+                    "DROP TABLE chat_notice_targets; PRAGMA user_version={prior}"
+                ))
                 .unwrap();
             drop(store);
             let upgraded = Store::open(&directory.path().join("pool.sqlite")).unwrap();

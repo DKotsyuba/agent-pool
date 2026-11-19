@@ -417,7 +417,11 @@ async fn complete_with_address(
             store
                 .test_db()
                 .query_row("SELECT effect FROM chat_notice_targets", [], |r| r.get(0))?;
-        let state::Notice::Unresolved(target) = state::notice(store, &effect)? else {
+        let state::Notice::Unresolved {
+            binding: target,
+            closing: false,
+        } = state::notice(store, &effect)?
+        else {
             return Err(Fault::Internal);
         };
         assert_eq!(target.run_id, Some(agent(1)));
@@ -498,6 +502,16 @@ async fn complete_with_address(
         let count: i64 = db.query_row("SELECT count(*) FROM effects WHERE member IS NULL AND json_extract(data,'$.work.scope') LIKE 'owner:%'",[],|r|r.get(0))?;
         assert_eq!(count, if address.is_some() { 2 } else { 0 });
         Ok(db.query_row("SELECT id FROM chat_agreements WHERE pool=?1",[pid],|r|r.get::<_,String>(0))?)
+    }).await?;
+    let pid = batch.pool_id.clone();
+    let proposal_id = proposal.clone();
+    stored(&store, move |store| {
+        let db = store.test_db();
+        let proposal_notices: i64 = db.query_row("SELECT count(*) FROM chat_notice_targets n JOIN effects e ON e.id=n.effect WHERE e.pool=?1 AND instr(e.data,?2)>0", [&pid,&format!("A vote is requested on proposal {proposal_id}")], |r| r.get(0))?;
+        assert_eq!(proposal_notices,2);
+        let completion_notices: i64 = db.query_row("SELECT count(*) FROM chat_notice_targets n JOIN effects e ON e.id=n.effect WHERE e.pool=?1 AND instr(e.data,'This is informational')>0", [pid], |r| r.get(0))?;
+        assert_eq!(completion_notices,3);
+        Ok(())
     }).await?;
     let observe = |operation: &'static str, params: Value, owner| {
         let store = &store;
@@ -580,6 +594,132 @@ async fn complete_with_address(
     };
     assert!(matches!(receipt.event.author, Author::Leader));
     assert_refusal(&call(get()).await, "pool_closed");
+    let pid = batch.pool_id.clone();
+    stored(&store, move |store| {
+        let db = store.test_db();
+        let read = |closing| -> Result<Vec<String>, Fault> {
+            let mut query = db.prepare("SELECT n.effect FROM chat_notice_targets n JOIN effects e ON e.id=n.effect WHERE e.pool=?1 AND n.close_notice=?2")?;
+            Ok(query.query_map(rusqlite::params![pid,closing], |row| row.get(0))?.collect::<Result<Vec<_>,_>>()?)
+        };
+        let close = read(true)?;
+        let ordinary = read(false)?;
+        assert_eq!(close.len(),3);
+        for id in close {
+            assert!(matches!(state::notice(store, &id)?, state::Notice::Unresolved { closing: true, .. }));
+        }
+        for id in ordinary {
+            assert!(matches!(state::notice(store, &id)?, state::Notice::Cancelled));
+        }
+        Ok(())
+    }).await?;
+    Ok(())
+}
+
+/// Exercises member and owner broadcasts, durable resolution backoff, and retirement.
+#[tokio::test]
+async fn chat_notice_backoff_survives_restart() -> Result<(), Box<dyn std::error::Error>> {
+    let (_root, config, store) = fixture()?;
+    let batch = reserve(&store, None).await?;
+    let templates = renderer()?;
+    let pid = batch.pool_id.clone();
+    let post = |revision, request_key| json!({"pool_id":pid,"expected_revision":revision,"request_key":request_key,"body":"owner broadcast"});
+    let args = post(1, "before-admission");
+    stored(&store, move |store| {
+        state::owner_call(store, "pool_post", args)?;
+        assert!(store.next_effect()?.is_none());
+        Ok(())
+    })
+    .await?;
+    install(&store, &batch).await?;
+    let join = member_call(
+        &batch,
+        0,
+        "pool_join",
+        "join-for-post",
+        json!({"expected_revision":2}),
+    );
+    assert!(ok(&private_call(join, &config, &store, templates).await));
+    let request = member_call(
+        &batch,
+        0,
+        "pool_post",
+        "broadcast",
+        json!({
+            "expected_revision":3,"body":format!("{}\nINJECT", "界".repeat(2100))
+        }),
+    );
+    let reply = private_call(request.clone(), &config, &store, templates).await;
+    assert!(ok(&reply), "{reply}");
+    assert_eq!(
+        private_call(request, &config, &store, templates).await,
+        reply
+    );
+    let args = post(4, "after-admission");
+    let replay = args.clone();
+    let member = batch.jobs[0].member_id.clone();
+    let first = stored(&store, move |store| {
+        state::owner_call(store, "pool_post", args.clone())?;
+        state::owner_call(store, "pool_post", args)?;
+        let db = store.test_db();
+        let (total, author): (i64, i64) = db.query_row(
+            "SELECT count(*),sum(member=?1) FROM chat_notice_targets",
+            [member],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!((total, author), (5, 1));
+        store.next_effect()?.ok_or(Fault::Internal)
+    })
+    .await?;
+    let crate::domain::Work::Deliver { ref text, .. } = first.work else {
+        return Err("delivery".into());
+    };
+    assert!(text.contains("Untrusted chat body") && !text.contains("INJECT"));
+    assert!(text.chars().count() < 2300);
+    let effect_id = first.effect_id.clone();
+    crate::runtime::effect(&store, &config, first, false).await?;
+    drop(store);
+    let store = Arc::new(Mutex::new(Store::open(&config.database_path)?));
+    let id = effect_id.clone();
+    let (expired, next) = stored(&store, move |store| {
+        state::owner_call(store, "pool_post", replay)?;
+        let count: i64 = store.test_db().query_row("SELECT count(*) FROM chat_notice_targets", [], |row| row.get(0))?;
+        assert_eq!(count,5);
+        let db = store.test_db();
+        let (state, deferred, frozen): (String, bool, bool) = db.query_row(
+            "SELECT e.state,n.next_resolve_ms>0,EXISTS(SELECT 1 FROM publications p WHERE p.effect=e.id)
+             FROM effects e JOIN chat_notice_targets n ON n.effect=e.id WHERE e.id=?1",
+            [&id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        )?;
+        assert_eq!((state.as_str(),deferred,frozen),("queued",true,false));
+        let next = store.next_effect()?.ok_or(Fault::Internal)?;
+        assert_ne!(next.effect_id,id);
+        store.test_db().execute("UPDATE chat_notice_targets SET next_resolve_ms=0,resolve_until_ms=0 WHERE effect=?1", [&id])?;
+        let expired = store.next_effect()?.ok_or(Fault::Internal)?;
+        assert_eq!(expired.effect_id,id);
+        Ok((expired,next))
+    }).await?;
+    crate::runtime::effect(&store, &config, expired, false).await?;
+    let overview = private_call(
+        member_call(&batch, 0, "pool_get", "overview", json!({})),
+        &config,
+        &store,
+        templates,
+    )
+    .await;
+    assert!(reply_text(&overview).contains("notice_undeliverable=true"));
+    let replacement = json!({"pool_id":pid,"expected_revision":5,"request_key":"replace-notice-seat",
+        "member_id":batch.jobs[2].member_id,"member":spec("implement")});
+    let next_id = next.effect_id.clone();
+    stored(&store, move |store| {
+        state::replace(store, parse(replacement)?)?;
+        assert!(matches!(
+            state::notice(store, &next_id)?,
+            state::Notice::Cancelled
+        ));
+        Ok(())
+    })
+    .await?;
+    crate::runtime::effect(&store, &config, next, false).await?;
     Ok(())
 }
 
@@ -625,7 +765,7 @@ async fn chat_migrates_v17_without_changing_old_pool() -> Result<(), Box<dyn std
         upgraded
             .test_db()
             .query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))?,
-        18
+        19
     );
     let ChatReply::Overview(old) =
         state::owner_call(&mut upgraded, "pool_get", json!({"pool_id":pid}))?
@@ -636,6 +776,46 @@ async fn chat_migrates_v17_without_changing_old_pool() -> Result<(), Box<dyn std
     assert!(old.purpose.contains("Old purpose"));
     let new = state::start(&mut upgraded, parse(input(None))?)?;
     assert_ne!(new.pool_id, pid);
+    Ok(())
+}
+
+/// A released v18 store preserves pending notice IDs when adding backoff columns.
+#[tokio::test]
+async fn chat_migrates_pending_v18_notice() -> Result<(), Box<dyn std::error::Error>> {
+    let (_root, config, store) = fixture()?;
+    let batch = reserve(&store, None).await?;
+    install(&store, &batch).await?;
+    let effect_id = stored(&store, move |store| {
+        state::owner_call(
+            store,
+            "pool_post",
+            json!({"pool_id":batch.pool_id,"expected_revision":1,
+            "request_key":"legacy-notice","body":"pending"}),
+        )?;
+        let db = store.test_db();
+        db.execute_batch(
+            "ALTER TABLE chat_notice_targets RENAME TO notice_v19;
+            CREATE TABLE chat_notice_targets(effect TEXT PRIMARY KEY REFERENCES effects(id),
+                member TEXT NOT NULL REFERENCES members(id));
+            INSERT INTO chat_notice_targets SELECT effect,member FROM notice_v19;
+            DROP TABLE notice_v19;
+            PRAGMA user_version=18;",
+        )?;
+        Ok(db.query_row(
+            "SELECT id FROM effects ORDER BY sequence LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )?)
+    })
+    .await?;
+    drop(store);
+    let mut upgraded = Store::open(&config.database_path)?;
+    let claimed = upgraded.next_effect()?.ok_or("pending notice")?;
+    assert_eq!(claimed.effect_id, effect_id);
+    assert!(matches!(
+        state::notice(&upgraded, &effect_id)?,
+        state::Notice::Unresolved { closing: false, .. }
+    ));
     Ok(())
 }
 
