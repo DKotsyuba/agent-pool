@@ -6,6 +6,7 @@ use crate::{
 use bridge_sdk::{Client, bridge_protocol::*};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     path::Path,
@@ -1022,6 +1023,58 @@ pub struct Admission {
     /// Exact positive lineage position, never replaced by latest during reconciliation.
     pub sequence: u64,
 }
+/// Private bearer credential from Run's original public batch acknowledgement.
+#[derive(Clone, Deserialize)]
+#[serde(try_from = "String")]
+pub(crate) struct PinReleaseToken(String);
+
+impl TryFrom<String> for PinReleaseToken {
+    type Error = &'static str;
+
+    /// Validates Run's fixed lowercase hexadecimal spelling.
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err("invalid pin release token");
+        }
+        Ok(Self(value))
+    }
+}
+
+impl std::fmt::Debug for PinReleaseToken {
+    /// Formats the credential without revealing its value.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PinReleaseToken([redacted])")
+    }
+}
+
+impl PinReleaseToken {
+    /// Exposes the credential only at the private SQLite and socket boundaries.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Checks the Run 0.32 verifier binding without exposing the bearer value.
+    pub(crate) fn matches_pin(&self, agent: &str, pin: &str) -> bool {
+        let mut hash = Sha256::new();
+        hash.update(b"agent-run/history-pin/v1");
+        hash.update(Sha256::digest(self.0.as_bytes()));
+        hash.update(agent.as_bytes());
+        let mut bytes = [0; 16];
+        bytes.copy_from_slice(&hash.finalize()[..16]);
+        pin.strip_prefix("pin_").is_some_and(|value| {
+            uuid::Builder::from_random_bytes(bytes)
+                .into_uuid()
+                .simple()
+                .to_string()
+                == value
+        })
+    }
+}
+
 /// Batch admission identity, including the immutable Run execution reference.
 pub struct BatchAdmission {
     /// Stable logical Run agent ID.
@@ -1032,6 +1085,8 @@ pub struct BatchAdmission {
     pub execution_ref: String,
     /// Durable history pin when the original request required retention.
     pub pin_id: Option<String>,
+    /// Private credential present only on the original socket acknowledgement.
+    pub(crate) release_token: Option<PinReleaseToken>,
 }
 
 /// Submits the frozen original specification and original service-prefixed admission key.
@@ -1140,16 +1195,15 @@ pub async fn run_store_identity(config: &Config) -> Result<String, RunFailure> {
 
 /// Releases one exact pin only within the expected Run store; malformed replies remain unknown.
 ///
-/// With the admitting `start_batch` key this uses Run 0.32's owner-checked
-/// `history_pins_release`, falling back to the combined `history_pins` method only when
-/// Run answers method-not-found (Run before 0.32, which had no ownership check). Without
-/// a key only the old method is tried; a current Run rejects it, so the outcome stays
-/// unknown instead of guessing an owner.
-pub async fn release_history_pin(
+/// Uses the bearer token on current Run. Parameter rejection permits the earlier
+/// request-key form, and method-not-found permits the combined method. A key-only
+/// request rejected for its parameter shape needs offline owner recovery.
+pub(crate) async fn release_history_pin(
     config: &Config,
     pin: &str,
     expected_store_id: &str,
     owner_request_key: Option<&str>,
+    release_token: Option<&PinReleaseToken>,
 ) -> Result<(), RunFailure> {
     crate::domain::pin_id(pin).map_err(|_| RunFailure::unknown())?;
     crate::domain::store_id(expected_store_id).map_err(|_| RunFailure::unknown())?;
@@ -1160,19 +1214,40 @@ pub async fn release_history_pin(
             json!({"action":"release","pin_id":pin,"expected_store_id":expected_store_id}),
         )
     };
-    let reply = match owner_request_key {
-        Some("") => return Err(RunFailure::unknown()),
-        Some(key) => match run_rpc(
-            config,
-            "history_pins_release",
-            json!({"pin_id":pin,"request_id":key,"expected_store_id":expected_store_id}),
-        )
-        .await
-        {
-            Err(failure) if failure.code == "method_not_found" => legacy().await?,
-            outcome => outcome?,
-        },
-        None => legacy().await?,
+    let current = if let Some(token) = release_token {
+        match run_rpc(config, "history_pins_release",
+            json!({"pin_id":pin,"release_token":token.as_str(),"expected_store_id":expected_store_id}),
+        ).await {
+            Err(failure) if failure.code == "method_not_found" => Some(legacy().await?),
+            Err(failure) if failure.code == "invalid_params" => None,
+            result => Some(result?),
+        }
+    } else {
+        None
+    };
+    let reply = if let Some(reply) = current {
+        reply
+    } else {
+        match owner_request_key {
+            Some("") => return Err(RunFailure::unknown()),
+            Some(key) => match run_rpc(
+                config,
+                "history_pins_release",
+                json!({"pin_id":pin,"request_id":key,"expected_store_id":expected_store_id}),
+            )
+            .await
+            {
+                Err(failure) if failure.code == "method_not_found" => legacy().await?,
+                Err(failure) if failure.code == "invalid_params" && release_token.is_none() => {
+                    return Err(RunFailure {
+                        code: "pin_release_token_unavailable",
+                        ..failure
+                    });
+                }
+                outcome => outcome?,
+            },
+            None => legacy().await?,
+        }
     };
     if reply.get("pin_id").and_then(Value::as_str) != Some(pin)
         || reply.get("status").and_then(Value::as_str) != Some("released")
@@ -1187,7 +1262,7 @@ pub async fn release_history_pin(
 }
 
 /// Whether a history-pin release failure is Run's definitive refusal rather than an unknown
-/// outcome: `RequestConflict` (not the owner key, a managed-enrollment pin, or an active
+/// outcome: `RequestConflict` (credential mismatch, missing pin, or an active
 /// lineage hold) and `ValidationError` (a request Run will never accept). `PinNotFound`,
 /// `StoreIdentityMismatch`, transport loss and malformed replies stay unknown.
 pub fn pin_release_refused(failure: &RunFailure) -> bool {
@@ -1212,9 +1287,7 @@ pub async fn start_batch(
         batch_params(request_key, jobs, retain_history, expected_store_id),
     )
     .await?;
-    let reply = serde_json::to_value(reply).map_err(|_| RunFailure::unknown())?;
-    parse_batch_receipt(
-        &reply,
+    reply.validate(
         request_key,
         jobs.len(),
         retain_history,
@@ -1249,9 +1322,7 @@ pub async fn start_batch_with_preconditions(
                     RunFailure::unknown()
                 }
             })?;
-    let reply = serde_json::to_value(reply).map_err(|_| RunFailure::unknown())?;
-    parse_batch_receipt(
-        &reply,
+    reply.validate(
         request_key,
         jobs.len(),
         retain_history,
@@ -1302,11 +1373,52 @@ struct BatchLookupReceipt {
 }
 
 /// Mutating batch acknowledgement, with every receipt object decoded strictly.
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize)]
 struct BatchStartResult {
     replayed: bool,
+    #[serde(default, deserialize_with = "present")]
+    release_token: Option<PinReleaseToken>,
     #[serde(deserialize_with = "json_object")]
     receipt: BatchLookupReceipt,
+}
+
+impl BatchStartResult {
+    /// Correlates the admission and verifies a credential only on the original retained reply.
+    fn validate(
+        self,
+        request_key: &str,
+        expected_count: usize,
+        retain_history: bool,
+        expected_store_id: Option<&str>,
+        preconditions: Option<&[crate::run_status::Target]>,
+    ) -> Result<Vec<BatchAdmission>, RunFailure> {
+        let receipt = serde_json::to_value(self.receipt).map_err(|_| RunFailure::unknown())?;
+        let mut admissions = validate_batch_receipt(
+            &receipt,
+            request_key,
+            expected_count,
+            retain_history,
+            expected_store_id,
+            preconditions,
+        )?;
+        if let Some(token) = self.release_token {
+            if self.replayed
+                || !retain_history
+                || admissions.iter().any(|entry| {
+                    !entry
+                        .pin_id
+                        .as_deref()
+                        .is_some_and(|pin| token.matches_pin(&entry.agent_id, pin))
+                })
+            {
+                return Err(RunFailure::unknown());
+            }
+            for entry in &mut admissions {
+                entry.release_token = Some(token.clone());
+            }
+        }
+        Ok(admissions)
+    }
 }
 
 /// Read-only lookup result; missing and null receipts are deliberately distinct.
@@ -1432,6 +1544,7 @@ pub async fn run_status(
         .map_err(|_| RunFailure::unknown())
 }
 
+#[cfg(test)]
 /// Requires a mutation acknowledgement before checking every correlated batch receipt row.
 fn parse_batch_receipt(
     reply: &Value,
@@ -1531,6 +1644,7 @@ fn validate_batch_receipt(
             sequence,
             execution_ref: execution_ref.to_owned(),
             pin_id: pin,
+            release_token: None,
         });
     }
     Ok(admissions)
@@ -2427,9 +2541,15 @@ mod tests {
             [1, 1, 1, 1],
             "lookup and retry must not create additional work or pins"
         );
-        release_history_pin(&config, pin, &store, Some(&key))
-            .await
-            .map_err(|error| format!("pin release failed: {}", error.code))?;
+        release_history_pin(
+            &config,
+            pin,
+            &store,
+            Some(&key),
+            first.release_token.as_ref(),
+        )
+        .await
+        .map_err(|error| format!("pin release failed: {}", error.code))?;
         let after = batch_receipt(&config, &key, &jobs, true, Some(&store))
             .await
             .map_err(|error| format!("post-release lookup failed: {}", error.code))?
@@ -2557,6 +2677,7 @@ mod tests {
             assert_eq!(first.sequence, replay.sequence);
             assert_eq!(first.execution_ref, replay.execution_ref);
             assert_eq!(first.pin_id, replay.pin_id);
+            assert!(replay.release_token.is_none());
             assert!(first.pin_id.is_some());
         }
         assert_ne!(first[0].agent_id, first[1].agent_id);
@@ -2575,11 +2696,16 @@ mod tests {
             }
         }).await??;
         let pin = first[0].pin_id.as_deref().ok_or("missing retained pin")?;
+        let token = first[0]
+            .release_token
+            .as_ref()
+            .ok_or("missing original release token")?;
+        let wrong_token = PinReleaseToken::try_from("f".repeat(64))?;
         assert!(
             run_rpc(
                 &config,
                 "history_pins_release",
-                json!({"pin_id":pin,"request_id":"pool-synthetic-accept","expected_store_id":wrong_store_id})
+                json!({"pin_id":pin,"release_token":token.as_str(),"expected_store_id":wrong_store_id})
             )
             .await
             .is_err()
@@ -2589,10 +2715,11 @@ mod tests {
             pin,
             &expected_store_id,
             Some("pool-synthetic-other"),
+            Some(&wrong_token),
         )
         .await
         .err()
-        .ok_or("a foreign key must not release a pin")?;
+        .ok_or("a foreign token must not release a pin")?;
         assert_eq!(foreign.code, "RequestConflict");
         assert!(pin_release_refused(&foreign));
         let db = rusqlite::Connection::open_with_flags(
@@ -2609,7 +2736,7 @@ mod tests {
         let released = run_rpc(
             &config,
             "history_pins_release",
-            json!({"pin_id":pin,"request_id":"pool-synthetic-accept","expected_store_id":expected_store_id}),
+            json!({"pin_id":pin,"release_token":token.as_str(),"expected_store_id":expected_store_id}),
         )
         .await
         .map_err(|error| format!("release failed: {}", error.code))?;
@@ -2619,7 +2746,7 @@ mod tests {
         let repeated = run_rpc(
             &config,
             "history_pins_release",
-            json!({"pin_id":pin,"request_id":"pool-synthetic-accept","expected_store_id":expected_store_id}),
+            json!({"pin_id":pin,"release_token":token.as_str(),"expected_store_id":expected_store_id}),
         )
         .await
         .map_err(|error| format!("release retry failed: {}", error.code))?;
