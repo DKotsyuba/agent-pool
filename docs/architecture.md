@@ -410,7 +410,8 @@ refuses a live socket or a non-socket entry at the path (`conflict`), removes a
 stale socket owned by `expected_uid` only after connection refusal, binds, sets
 the group and mode, and verifies owner, group, mode, inode and directory identity
 before serving. Each resident, observer and owner-ingress socket has a persistent
-`<socket>.lock` file. The resident holds its exclusive lock from before the probe
+`<socket>.endpoint-lease` file. Startup waits up to three seconds for a contended
+endpoint lease. The resident holds it from before the probe
 through shutdown cleanup, so residents with separate stores cannot race to
 replace a shared endpoint. Any bind failure stops startup. On exit the resident
 removes the socket only if it is still the bound inode.

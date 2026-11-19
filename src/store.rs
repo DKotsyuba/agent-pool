@@ -2036,7 +2036,8 @@ PRAGMA user_version=5;")?;
         Ok(first)
     }
     /// Freezes the producer association and exact provider publication before the first write.
-    /// Every retry must match the persisted semantic parameters; a changed config cannot redirect work.
+    /// Every retry must match the persisted parameters. Returns the original producer so
+    /// callers can hold delivery if it differs from the current configuration.
     pub fn freeze_publication(
         &mut self,
         effect_id: &str,
@@ -2063,7 +2064,7 @@ PRAGMA user_version=5;")?;
             .optional()?;
         if let Some((p, s)) = prior {
             let value: serde_json::Value = decode(&s)?;
-            if p != producer || value != *params {
+            if value != *params {
                 return Err(Fault::Conflict);
             }
             return Ok((p, value));
@@ -9973,10 +9974,11 @@ mod tests {
             serde_json::json!({"destination":a.address,"event_id":e.effect_id,"payload":"frozen"});
         s.freeze_publication(&e.effect_id, "pool", &original)
             .unwrap();
-        assert!(matches!(
-            s.freeze_publication(&e.effect_id, "other", &original),
-            Err(Fault::Conflict)
-        ));
+        assert_eq!(
+            s.freeze_publication(&e.effect_id, "other", &original)
+                .unwrap(),
+            ("pool".into(), original.clone())
+        );
         drop(s);
         let mut s = Store::open(&d.path().join("pool.sqlite")).unwrap();
         let unknown = s.pending_unknown().unwrap();
