@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.1.5
+
+Feature release, 2026-11-19. Qualification fields are unchanged from 0.1.0: `x86_64-unknown-linux-gnu` on the host `dobi`; this release ships that target only.
+
+Upgrade note: upgrade Pool before Run 0.32. This release migrates the store to schema v17 on the first open. Take a private, WAL-consistent `pool.sqlite` backup before the upgrade: 0.1.4 and older refuse a v17 store, and restoring the backup loses later admissions and release credentials. Treat v17 database files, WAL files, dumps and backups as credential-bearing.
+
 ### Changed
 
 - Run 0.32 public batch and replacement pins use a bearer token delivered only in the original socket acknowledgement. Pool stores it privately in schema v17 and chooses legacy wire shapes from the Run socket catalog. Managed-enrollment pins keep the authenticated attempt route. Missing tokens and rejected release parameters require owner attention. After offline release, the owner can reissue the release request to verify the exact pin on the original Run store.
