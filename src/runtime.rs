@@ -3391,9 +3391,10 @@ async fn verify_managed_join(
 
 /// Locks one endpoint in its already validated directory before probing or binding.
 /// The persistent lock inode coordinates residents even when they use different stores.
-pub(crate) fn lock_endpoint(path: &Path, uid: u32) -> Result<File, Fault> {
+/// Only lock contention is retried, within the same bound as the writer lease.
+pub(crate) async fn lock_endpoint(path: &Path, uid: u32) -> Result<File, Fault> {
     let mut lock_path = path.as_os_str().to_owned();
-    lock_path.push(".lock");
+    lock_path.push(".endpoint-lease");
     let valid = |metadata: &fs::Metadata| {
         metadata.is_file()
             && metadata.uid() == uid
@@ -3412,7 +3413,20 @@ pub(crate) fn lock_endpoint(path: &Path, uid: u32) -> Result<File, Fault> {
         .mode(0o600)
         .open(&lock_path)
         .map_err(|_| Fault::Unavailable)?;
-    fs2::FileExt::try_lock_exclusive(&lease).map_err(|_| Fault::Conflict)?;
+    let deadline = tokio::time::Instant::now() + crate::store::PREDECESSOR_SETTLE;
+    loop {
+        match fs2::FileExt::try_lock_exclusive(&lease) {
+            Ok(()) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    return Err(Fault::Conflict);
+                }
+                tokio::time::sleep_until(deadline.min(now + crate::store::SETTLE_POLL)).await;
+            }
+            Err(_) => return Err(Fault::Conflict),
+        }
+    }
     let opened = lease.metadata().map_err(|_| Fault::Unavailable)?;
     let entry = fs::symlink_metadata(&lock_path).map_err(|_| Fault::Unavailable)?;
     if !valid(&entry) || (entry.dev(), entry.ino()) != (opened.dev(), opened.ino()) {
@@ -3439,7 +3453,7 @@ pub(crate) async fn probe_listener(path: &Path) -> std::io::Result<UnixStream> {
 /// A stale private socket is removed only after connection refusal under the endpoint lease.
 async fn listener(config: &Config) -> Result<(UnixListener, SocketGuard), Fault> {
     private_parent(&config.socket_path, config.expected_uid)?;
-    let lease = lock_endpoint(&config.socket_path, config.expected_uid)?;
+    let lease = lock_endpoint(&config.socket_path, config.expected_uid).await?;
     match fs::symlink_metadata(&config.socket_path) {
         Ok(_) => {
             private_socket(&config.socket_path, config.expected_uid)?;
@@ -3833,6 +3847,14 @@ pub(crate) async fn effect(
                 Err(Fault::Closed) => return settle(store, effect.effect_id, "cancelled").await,
                 result => result?,
             };
+            if producer != config.bridge_producer_id {
+                // Only the original producer may reconcile this publication.
+                return if reconcile {
+                    Ok(())
+                } else {
+                    settle(store, effect.effect_id, "unknown").await
+                };
+            }
             let params = serde_json::from_value(value).map_err(|_| Fault::Internal)?;
             integrations::deliver(config.clone(), producer, params, reconcile)
                 .await
@@ -12867,33 +12889,112 @@ mod tests {
         Ok(())
     }
 
-    /// Independent stores racing to replace a stale socket leave one live, reachable endpoint.
+    /// The successor waits for the predecessor, despite holding a same-stem database lease.
     #[tokio::test]
     async fn endpoint_lease_serializes_residents_with_distinct_stores()
     -> Result<(), Box<dyn std::error::Error>> {
+        use std::{future::poll_fn, task::Poll};
         let fixture = replacement_fixture()?;
-        let config = fixture.config;
+        let mut config = fixture.config;
+        config.socket_path.set_file_name("pool");
         let mut other = config.clone();
         other.database_path = config.database_path.with_file_name("other.db");
         let _other_store = Store::open(&other.database_path)?;
         drop(std::os::unix::net::UnixListener::bind(&config.socket_path)?);
         fs::set_permissions(&config.socket_path, fs::Permissions::from_mode(0o600))?;
         let old_inode = fs::symlink_metadata(&config.socket_path)?.ino();
-        let lease = lock_endpoint(&config.socket_path, config.expected_uid)?;
-        assert!(matches!(listener(&other).await, Err(Fault::Conflict)));
+        let lease = lock_endpoint(&config.socket_path, config.expected_uid).await?;
+        let mut successor = std::pin::pin!(listener(&config));
+        assert!(
+            poll_fn(|cx| Poll::Ready(successor.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
         assert_eq!(fs::symlink_metadata(&config.socket_path)?.ino(), old_inode);
         drop(lease);
-        let (first, second) = tokio::join!(listener(&config), listener(&other));
-        let (bound, guard) = match (first, second) {
-            (Ok(pair), Err(Fault::Conflict)) | (Err(Fault::Conflict), Ok(pair)) => pair,
-            _ => return Err("expected one endpoint owner".into()),
-        };
+        let (bound, guard) = tokio::time::timeout(Duration::from_secs(1), successor).await??;
+        assert!(matches!(listener(&other).await, Err(Fault::Conflict)));
         let live = fs::symlink_metadata(&config.socket_path)?;
         assert_eq!((live.dev(), live.ino()), (guard.device, guard.inode));
         let _client = UnixStream::connect(&config.socket_path).await?;
         tokio::time::timeout(Duration::from_secs(1), bound.accept()).await??;
         drop((bound, guard));
         let (_bound, _guard) = listener(&other).await?;
+        Ok(())
+    }
+
+    /// Producer rotation leaves a frozen legacy publication in custody, while payload drift stays fatal.
+    #[tokio::test]
+    async fn legacy_publication_reconciliation_survives_producer_change()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ReplacementFixture {
+            _directory,
+            mut config,
+            store,
+            pool_id,
+            ..
+        } = replacement_fixture()?;
+        let id = "legacy-frozen";
+        let effect = Effect {
+            effect_id: id.into(),
+            pool_id,
+            member_id: None,
+            work: Work::Deliver {
+                address: "local/codex/main/owner".into(),
+                scope: "fixture".into(),
+                text: "Frozen text".into(),
+            },
+            state: "custody".into(),
+        };
+        let payload = serde_json::to_value(integrations::publication(&effect)?)?;
+        let frozen = payload.clone();
+        let original_producer = config.bridge_producer_id.clone();
+        stored(&store, move |store| {
+            let data = serde_json::to_string(&effect).map_err(|_| Fault::Internal)?;
+            store.test_db().execute(
+                "INSERT INTO effects(id,pool,state,data) VALUES(?1,?2,'custody',?3)",
+                rusqlite::params![id, effect.pool_id, data],
+            )?;
+            store.freeze_publication(id, &original_producer, &frozen)?;
+            Ok(())
+        })
+        .await?;
+        drop(store);
+        let store = Arc::new(Mutex::new(Store::open(&config.database_path)?));
+        config.bridge_producer_id = "new-producer".into();
+        let pending = stored(&store, |store| store.pending_unknown()).await?;
+        let effect = pending
+            .into_iter()
+            .find(|effect| effect.effect_id == id)
+            .ok_or("frozen publication missing after restart")?;
+        let activity = Arc::new(ManagedActivity::default());
+        finish_dispatch(
+            id,
+            dispatch_effect(&store, &config, effect.clone(), true, &activity).await,
+        )?;
+        assert_eq!(effect_state(&store, id)?, "custody");
+        let configured = config.bridge_producer_id.clone();
+        let original_producer = stored(&store, move |store| {
+            store
+                .freeze_publication(id, &configured, &payload)
+                .map(|(producer, _)| producer)
+        })
+        .await?;
+        assert_eq!(original_producer, "fixture");
+        stored(&store, move |store| {
+            store
+                .test_db()
+                .execute("UPDATE publications SET params='{}' WHERE effect=?1", [id])?;
+            Ok(())
+        })
+        .await?;
+        assert_eq!(
+            finish_dispatch(
+                id,
+                dispatch_effect(&store, &config, effect, true, &activity).await
+            ),
+            Err(Fault::Conflict)
+        );
         Ok(())
     }
 

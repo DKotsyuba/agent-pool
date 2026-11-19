@@ -188,7 +188,7 @@ pub(crate) async fn listener(
         crate::config::identity_uid_map()?;
         let path = &settings.path;
         let directory = crate::config::observer_directory(path, config.expected_uid)?;
-        let lease = crate::runtime::lock_endpoint(path, config.expected_uid)?;
+        let lease = crate::runtime::lock_endpoint(path, config.expected_uid).await?;
         match fs::symlink_metadata(path) {
             Ok(metadata) => {
                 if !metadata.file_type().is_socket() || metadata.uid() != config.expected_uid {
@@ -552,7 +552,7 @@ mod tests {
         // A stale socket left by a crashed resident is replaced.
         drop(std::os::unix::net::UnixListener::bind(&path)?);
         let stale = fs::symlink_metadata(&path)?;
-        let lease = crate::runtime::lock_endpoint(&path, config.expected_uid)?;
+        let lease = crate::runtime::lock_endpoint(&path, config.expected_uid).await?;
         assert!(matches!(
             listener_result(&config, &settings).await,
             Err(Fault::Conflict)
