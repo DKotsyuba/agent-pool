@@ -40,6 +40,8 @@ impl Actor {
 pub enum Fault {
     /// The request is malformed or outside the documented size bounds.
     Invalid,
+    /// The research profile cannot receive Bridge chat notices.
+    ChatResearchProfile,
     /// Fresh trusted native identity could not be established.
     Unauthorized,
     /// The caller cannot access the requested pool or operation.

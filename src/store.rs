@@ -1637,9 +1637,10 @@ PRAGMA user_version=5;")?;
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let row: Option<String> = tx
             .query_row(
-                "SELECT e.data FROM effects e LEFT JOIN chat_notice_targets n ON n.effect=e.id
-                 WHERE e.state='queued' AND coalesce(n.next_resolve_ms,0)<=?1 ORDER BY e.sequence LIMIT 1",
-                [chat::receipt_clock()?],
+                "SELECT e.data FROM effects e WHERE e.state='queued'
+                 AND json_extract(e.data,'$.work.address') IS NOT 'pool-chat-unresolved'
+                 ORDER BY e.sequence LIMIT 1",
+                [],
                 |r| r.get(0),
             )
             .optional()?;
@@ -1676,7 +1677,7 @@ PRAGMA user_version=5;")?;
     }
     /// Returns at most 32 uncertain effects for status reconciliation, never automatic new IDs.
     pub fn pending_unknown(&mut self) -> Result<Vec<Effect>, Fault> {
-        let mut stmt=self.db.prepare("SELECT sequence,data,state FROM effects WHERE state IN ('unknown','custody') AND sequence>?1 ORDER BY sequence LIMIT 32")?;
+        let mut stmt=self.db.prepare("SELECT sequence,data,state FROM effects e WHERE state IN ('unknown','custody') AND sequence>?1 AND json_extract(e.data,'$.work.address') IS NOT 'pool-chat-unresolved' ORDER BY sequence LIMIT 32")?;
         let rows = stmt.query_map([self.unknown_cursor], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
@@ -2189,6 +2190,9 @@ PRAGMA user_version=5;")?;
             "UPDATE effects SET state=?2,data=?3 WHERE id=?1",
             params![effect_id, state, encode(&effect)?],
         )?;
+        if matches!(effect.work, Work::Deliver { .. }) {
+            chat::settle_notice(&tx, effect_id, state)?;
+        }
         if matches!(state, "refused" | "cancelled") && matches!(effect.work, Work::Start { .. }) {
             let (binding, _) =
                 binding_any(&tx, effect.member_id.as_deref().ok_or(Fault::Internal)?)?;
@@ -4366,7 +4370,11 @@ fn view(
         }
         Section::Deliveries => {
             p.proposal = None;
-            let mut stmt=db.prepare("SELECT sequence,id,member,state,data FROM effects WHERE pool=?1 AND sequence>?2 ORDER BY sequence LIMIT 21")?;
+            let mut stmt = db.prepare(
+                "SELECT e.sequence,e.id,coalesce(e.member,n.member),e.state,e.data FROM effects e
+                LEFT JOIN chat_notice_targets n ON n.effect=e.id
+                WHERE e.pool=?1 AND e.sequence>?2 ORDER BY e.sequence LIMIT 21",
+            )?;
             let rows = stmt.query_map(params![p.pool_id, sql_after], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,

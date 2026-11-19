@@ -207,6 +207,7 @@ pub(crate) struct SeatRow {
     pub agent_id: Option<String>,
     pub admitted: String,
     pub notice_undeliverable: bool,
+    pub retired: bool,
     pub joined: bool,
     pub process: String,
 }
@@ -323,6 +324,11 @@ fn present(result: Result<ChatReply, Fault>, templates: &Templates) -> CallToolR
             });
             text_reply(text, is_error)
         }
+        Err(Fault::ChatResearchProfile) => text_reply(
+            "ERROR invalid. The research profile cannot receive pool chat notices. Use review."
+                .into(),
+            true,
+        ),
         Err(fault) => crate::tools::present(Err(fault), templates),
     }
 }
@@ -612,11 +618,17 @@ pub(crate) async fn frontend(
     }
 }
 
+/// Distinguishes a temporary miss from a role Run cannot observe.
+pub(crate) enum NoticeAddress {
+    Address(String),
+    RestrictedRole,
+}
+
 /// Resolves a member's current native destination, fenced to its Run store.
 pub(crate) async fn notice_address(
     config: &Config,
     binding: &crate::domain::Binding,
-) -> Option<String> {
+) -> Option<NoticeAddress> {
     let agent = binding.run_id.as_deref()?;
     let store = binding.run_store_id.as_deref()?;
     if integrations::run_store_identity(config)
@@ -627,10 +639,7 @@ pub(crate) async fn notice_address(
     {
         return None;
     }
-    let address = integrations::observe_run(config, agent, None)
-        .await
-        .ok()?
-        .address?;
+    let observation = integrations::observe_run(config, agent, None).await.ok()?;
     if integrations::run_store_identity(config)
         .await
         .ok()?
@@ -639,7 +648,11 @@ pub(crate) async fn notice_address(
     {
         return None;
     }
-    Some(address)
+    if observation.restricted_role {
+        Some(NoticeAddress::RestrictedRole)
+    } else {
+        observation.address.map(NoticeAddress::Address)
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]

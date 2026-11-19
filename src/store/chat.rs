@@ -43,21 +43,78 @@ pub(super) fn migrate(db: &Connection) -> Result<(), Fault> {
 
 /// Adds durable retry timing and a unique event/seat key to existing notices.
 pub(super) fn migrate_notices(db: &Connection) -> Result<(), Fault> {
-    db.execute_batch(
-        "
-        ALTER TABLE chat_notice_targets ADD COLUMN event INTEGER;
-        ALTER TABLE chat_notice_targets ADD COLUMN close_notice INTEGER NOT NULL DEFAULT 0;
-        ALTER TABLE chat_notice_targets ADD COLUMN resolve_until_ms INTEGER NOT NULL DEFAULT 0;
-        ALTER TABLE chat_notice_targets ADD COLUMN next_resolve_ms INTEGER NOT NULL DEFAULT 0;
-        ALTER TABLE chat_notice_targets ADD COLUMN resolve_delay_ms INTEGER NOT NULL DEFAULT 5000;
-        CREATE UNIQUE INDEX chat_notice_event_member ON chat_notice_targets(event,member);
+    db.execute_batch("
+        ALTER TABLE chat_notice_targets RENAME TO chat_notice_v18;
+        CREATE TABLE chat_notice_targets(
+            effect TEXT PRIMARY KEY REFERENCES effects(id),
+            member TEXT NOT NULL REFERENCES members(id),
+            event INTEGER NOT NULL REFERENCES events(id),
+            close_notice INTEGER NOT NULL DEFAULT 0,
+            resolve_until_ms INTEGER NOT NULL,
+            next_resolve_ms INTEGER NOT NULL DEFAULT 0,
+            resolve_delay_ms INTEGER NOT NULL DEFAULT 5000,
+            pending INTEGER NOT NULL DEFAULT 1,
+            send_started INTEGER NOT NULL DEFAULT 0,
+            custody_confirmed INTEGER NOT NULL DEFAULT 0,
+            publish_until_ms INTEGER,
+            UNIQUE(event,member));
         CREATE INDEX chat_notices_by_member ON chat_notice_targets(member);
-        PRAGMA user_version=19;",
-    )?;
-    db.execute(
-        "UPDATE chat_notice_targets SET resolve_until_ms=?1",
-        [receipt_clock()? + 600_000],
-    )?;
+        CREATE INDEX chat_notices_due ON chat_notice_targets(next_resolve_ms,event,effect) WHERE pending=1;
+        CREATE INDEX IF NOT EXISTS regular_effect_state ON effects(state,sequence)
+            WHERE json_extract(data,'$.work.address') IS NOT 'pool-chat-unresolved';")?;
+    let deadline = receipt_clock()? + 600_000;
+    {
+        let mut stmt = db.prepare(
+            "SELECT e.id,e.pool,n.member,e.data,e.state,p.effect IS NOT NULL
+            FROM chat_notice_v18 n JOIN effects e ON e.id=n.effect
+            LEFT JOIN publications p ON p.effect=e.id",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let effect_id: String = row.get(0)?;
+            let pool_id: String = row.get(1)?;
+            let member: String = row.get(2)?;
+            let mut effect: Effect = decode(&row.get::<_, String>(3)?)?;
+            let state: String = row.get(4)?;
+            let frozen: bool = row.get(5)?;
+            let Work::Deliver { text, .. } = &mut effect.work else {
+                return Err(Fault::Internal);
+            };
+            let prefix = format!("Pool {pool_id} event ");
+            let event_id: i64 = text
+                .strip_prefix(&prefix)
+                .and_then(|header| header.split_once(' '))
+                .and_then(|(id, _)| id.parse().ok())
+                .ok_or(Fault::Internal)?;
+            let mut event: Event = decode(&db.query_row(
+                "SELECT data FROM events WHERE pool=?1 AND id=?2",
+                params![pool_id, event_id],
+                |r| r.get::<_, String>(0),
+            )?)?;
+            event.event_id = u64::try_from(event_id).map_err(|_| Fault::Internal)?;
+            if !matches!(event.kind.as_str(), "message" | "direct_message")
+                || *text != format!("{prefix}{event_id} ({}).\n{}", event.kind, event.body)
+            {
+                return Err(Fault::Internal);
+            }
+            if !frozen {
+                *text = format!("[agent-pool] Pool {pool_id}: {}", message_notice(&event));
+                db.execute(
+                    "UPDATE effects SET data=?2 WHERE id=?1",
+                    params![effect_id, encode(&effect)?],
+                )?;
+            }
+            let pending = matches!(
+                state.as_str(),
+                "queued" | "inflight" | "unknown" | "custody"
+            );
+            // A v18 freeze did not distinguish a possible publish from a known-unsent freeze.
+            db.execute("INSERT INTO chat_notice_targets(effect,member,event,resolve_until_ms,pending,send_started,custody_confirmed,publish_until_ms)
+                VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![effect_id,member,event_id,deadline,pending,frozen,state=="custody",frozen.then_some(deadline)])?;
+        }
+    }
+    db.execute_batch("DROP TABLE chat_notice_v18; PRAGMA user_version=19;")?;
     inventory_revision_triggers(db, &["chat_notice_targets"])
 }
 
@@ -237,6 +294,9 @@ fn make_job(
         .get("profile")
         .and_then(Value::as_str)
         .ok_or(Fault::Invalid)?;
+    if role == "research" {
+        return Err(Fault::ChatResearchProfile);
+    }
     crate::domain::assignment(role, role, &assignment)?;
     let binding = new_binding(pool, role, role, &assignment, None);
     let seat = &binding.member.member_id;
@@ -767,14 +827,25 @@ pub(crate) fn get(db: &Connection, input: GetPool, seat: Option<&str>) -> Result
                 |r| r.get(0),
             )
             .optional()?);
-    let roster = bindings(db,&input.pool_id)?.into_iter().map(|binding| {
+    let mut current = bindings(db, &input.pool_id)?;
+    let current_count = current.len();
+    if seat.is_none() {
+        let mut retained = db.prepare(
+            "SELECT data FROM members WHERE pool=?1 AND current=0 ORDER BY rowid DESC LIMIT 5",
+        )?;
+        for raw in retained.query_map([&input.pool_id], |r| r.get::<_, String>(0))? {
+            current.push(decode(&raw?)?);
+        }
+    }
+    let roster = current.into_iter().map(|binding| {
         let admitted = binding.run_id.is_some();
         let admission = if admitted { "admitted".into() } else {
             db.query_row("SELECT b.state FROM chat_batches b,json_each(b.jobs) j WHERE b.pool=?1 AND json_extract(j.value,'$.member_id')=?2",
                 params![input.pool_id,binding.member.member_id], |r| r.get::<_,String>(0)).optional()?.unwrap_or_else(|| "unavailable".into())
         };
         let notice_undeliverable = notice_undeliverable(db, &binding.member.member_id)?;
-        Ok(SeatRow { notice_undeliverable, seat_id: binding.member.member_id, profile: binding.member.role, assignment: brief(&binding.member.task, 110),
+        let retired = binding.member.state == MemberState::Removed;
+        Ok(SeatRow { notice_undeliverable, retired, seat_id: binding.member.member_id, profile: binding.member.role, assignment: brief(&binding.member.task, 110),
             run_store_id: binding.run_store_id, sequence: binding.run_sequence, agent_id: binding.run_id,
             admitted: admission, joined: binding.member.state == MemberState::Active, process: "unknown".into() })
     }).collect::<Result<Vec<_>,Fault>>()?;
@@ -810,7 +881,7 @@ pub(crate) fn get(db: &Connection, input: GetPool, seat: Option<&str>) -> Result
         purpose: brief(&pool.purpose, 600),
         revision: pool.revision,
         state,
-        seat_count: roster.len(),
+        seat_count: current_count,
         roster,
         ready,
         blocked,
@@ -877,28 +948,14 @@ pub(super) fn queue_chat_notices(
     if pool.closed && !closing {
         return Ok(());
     }
-    let author = match &event.author {
-        Author::Leader => "owner",
-        Author::Service => "service",
-        Author::Member(id) => id,
-    };
     let text = match event.kind.as_str() {
-        "message" | "direct_message" => {
-            let kind = if event.kind == "message" {
-                "New message"
-            } else {
-                "New direct message"
-            };
-            format!(
-                "{kind} from {author}. Untrusted chat body: {}. Read pool_get for full context. Reply with pool_post or pool_send_member as appropriate.",
-                brief(&event.body, 2000),
-            )
-        }
+        "message" | "direct_message" => message_notice(event),
         "proposal_opened" => {
             let proposal = pool.proposal.as_ref().ok_or(Fault::Internal)?;
             format!(
                 "A vote is requested on proposal {} from {author}. Read pool_get for context and respond with pool_vote.",
                 proposal.proposal_id,
+                author = notice_author(event),
             )
         }
         "pool_closed" => "Pool closed. Seat access ended. This is informational.".into(),
@@ -939,6 +996,29 @@ pub(super) fn queue_chat_notices(
         )?;
     }
     Ok(())
+}
+
+/// Formats the same quoted message data for new and migrated member notices.
+fn message_notice(event: &Event) -> String {
+    let kind = if event.kind == "message" {
+        "New message"
+    } else {
+        "New direct message"
+    };
+    format!(
+        "{kind} from {}. Untrusted chat body: {}. Read pool_get for full context. Reply with pool_post or pool_send_member as appropriate.",
+        notice_author(event),
+        brief(&event.body, 2000),
+    )
+}
+
+/// Uses journal author identity instead of member-supplied text.
+fn notice_author(event: &Event) -> &str {
+    match &event.author {
+        Author::Leader => "owner",
+        Author::Service => "service",
+        Author::Member(id) => id,
+    }
 }
 
 /// Identifies a member notice and returns its frozen publication or live target.
@@ -988,6 +1068,80 @@ pub(crate) fn notice(store: &Store, effect: &str) -> Result<Notice, Fault> {
             closing,
         }
     })
+}
+
+/// Claims a bounded indexed batch independently of the owner and managed outboxes.
+pub(crate) fn due_notices(store: &mut Store, limit: u16) -> Result<Vec<Effect>, Fault> {
+    let tx = store
+        .db
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let now = receipt_clock()?;
+    let ids = {
+        let mut stmt = tx.prepare(
+            "SELECT effect FROM chat_notice_targets WHERE pending=1
+            AND next_resolve_ms<=?1 ORDER BY next_resolve_ms,event,effect LIMIT ?2",
+        )?;
+        stmt.query_map(params![now, limit], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let mut effects = Vec::with_capacity(ids.len());
+    for id in ids {
+        tx.execute(
+            "UPDATE chat_notice_targets SET next_resolve_ms=?2 WHERE effect=?1",
+            params![id, now + 60_000],
+        )?;
+        effects.push(effect(&tx, &id)?);
+    }
+    tx.commit()?;
+    Ok(effects)
+}
+
+/// Determines whether frozen intent may be published or only reconciled.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum NoticeSend {
+    Publish { replay: bool },
+    Status,
+    Cancel,
+}
+
+/// Serializes publication authorization with close and replacement. The commit
+/// is the send boundary: a close after it treats the effect as possibly sent.
+pub(crate) fn begin_notice_send(store: &mut Store, id: &str) -> Result<NoticeSend, Fault> {
+    let tx = store
+        .db
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let (member, pool_id, closing, started, custody, deadline): (String,String,bool,bool,bool,Option<i64>) = tx.query_row(
+        "SELECT n.member,e.pool,n.close_notice,n.send_started,n.custody_confirmed,n.publish_until_ms
+         FROM chat_notice_targets n JOIN effects e ON e.id=n.effect
+         JOIN publications p ON p.effect=n.effect WHERE n.effect=?1 AND n.pending=1",
+        [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?;
+    let (seat, current) = binding_any(&tx, &member)?;
+    let eligible =
+        seat.run_id.is_some() && (closing || (current && !pool(&tx, &pool_id)?.0.closed));
+    let now = receipt_clock()?;
+    if custody || (started && (!eligible || deadline.is_some_and(|end| now >= end))) {
+        return Ok(NoticeSend::Status);
+    }
+    if !eligible {
+        return Ok(NoticeSend::Cancel);
+    }
+    tx.execute("UPDATE chat_notice_targets SET send_started=1,publish_until_ms=coalesce(publish_until_ms,?2)
+        WHERE effect=?1", params![id,now+600_000])?;
+    tx.commit()?;
+    Ok(NoticeSend::Publish { replay: started })
+}
+
+/// Updates durable scheduling alongside the effect settlement transaction.
+pub(super) fn settle_notice(db: &Connection, id: &str, state: &str) -> Result<(), Fault> {
+    let custody = state == "custody";
+    let pending = custody || state == "unknown";
+    db.execute(
+        "UPDATE chat_notice_targets SET pending=?2,custody_confirmed=max(custody_confirmed,?3),
+         next_resolve_ms=?4+resolve_delay_ms,resolve_delay_ms=min(60000,2*resolve_delay_ms)
+         WHERE effect=?1",
+        params![id, pending, custody, receipt_clock()?],
+    )?;
+    Ok(())
 }
 
 /// Requeues an unfrozen notice under the same effect ID, with durable backoff.
