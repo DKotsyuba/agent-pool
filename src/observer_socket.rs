@@ -193,7 +193,9 @@ pub(crate) async fn listener(
                 if !metadata.file_type().is_socket() || metadata.uid() != config.expected_uid {
                     return Err(Fault::Conflict);
                 }
-                match tokio::time::timeout(EXCHANGE_TIMEOUT, UnixStream::connect(path)).await {
+                match tokio::time::timeout(EXCHANGE_TIMEOUT, crate::runtime::probe_listener(path))
+                    .await
+                {
                     Ok(Err(error)) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
                         fs::remove_file(path).map_err(|_| Fault::Unavailable)?
                     }
