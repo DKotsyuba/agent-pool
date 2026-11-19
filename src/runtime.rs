@@ -7454,6 +7454,129 @@ mod tests {
         Ok(())
     }
 
+    /// A migrated release exposes recovery inputs only through authenticated owner reads.
+    #[tokio::test]
+    async fn pin_release_upgrade_keeps_recovery_inputs_owner_only()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use serde_json::json;
+        let mut fixture = release_fixture(None).await?;
+        let mut legacy = fixture.release.clone();
+        let Work::ReleasePin { owner, .. } = &mut legacy.work else {
+            return Err("release work".into());
+        };
+        *owner = None;
+        {
+            let mut guard = fixture.store.lock().map_err(|_| "store lock")?;
+            guard.test_db().execute(
+                "UPDATE effects SET data=?2 WHERE id=?1",
+                rusqlite::params![fixture.release_id, serde_json::to_string(&legacy)?],
+            )?;
+            guard
+                .test_db()
+                .execute_batch("DROP TABLE run_pin_release_tokens; PRAGMA user_version=16;")?;
+        }
+        drop(fixture.store);
+        fixture.store = Arc::new(Mutex::new(Store::open(&fixture.config.database_path)?));
+        fixture.wire_key = "release_token";
+        let retry = stored(&fixture.store, |store| store.pending_unknown())
+            .await?
+            .into_iter()
+            .find(|item| item.effect_id == fixture.release_id)
+            .ok_or("pending release after upgrade")?;
+        let capabilities = || {
+            RunScript::Result(
+                json!({"schema_version":1,"product":"agent-run","store_id":fixture.store_identity}),
+            )
+        };
+        let calls = scripted_release(&fixture, retry, true, vec![
+            capabilities(),
+            RunScript::Result(json!({"pins":[{"pin_id":fixture.pin,"agent_id":"ag-20261107-010101-0000000003","status":"active"}],"next_after_pin_id":null})),
+        ]).await?;
+        assert_eq!(calls[1]["method"], "history_pins_list");
+        assert_eq!(
+            effect_state(&fixture.store, &fixture.release_id)?,
+            PIN_RELEASE_TOKEN_UNAVAILABLE
+        );
+
+        let request = json!({"schema_version":1,"operation":"get","params":{"pool_id":fixture.pool_id,"section":"deliveries"}});
+        let credential = "fixture-owner-pin-recovery";
+        let token_path = fixture._directory.path().join("observer.token");
+        fs::write(&token_path, credential)?;
+        fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600))?;
+        fixture.config.owner_observer_credential_file = Some(token_path);
+        let owner_response = observer_exchange(
+            &fixture.config,
+            &fixture.store,
+            json!({"observer_credential":credential,"observe":request}),
+        )
+        .await?;
+        let delivery =
+            |response: serde_json::Value| -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+                response["data"]["view"]["deliveries"]
+                    .as_array()
+                    .and_then(|rows| {
+                        rows.iter()
+                            .find(|row| row["operation_id"] == fixture.release_id)
+                    })
+                    .cloned()
+                    .ok_or_else(|| "release missing from observer delivery page".into())
+            };
+        assert_eq!(
+            delivery(owner_response)?["pin_recovery"],
+            json!({
+                "store_id":fixture.store_identity,"pin_id":fixture.pin,"request_key":fixture.batch_key,
+            })
+        );
+
+        let (server, mut client) = UnixStream::pair()?;
+        let permits = Arc::new(Semaphore::new(1));
+        let (server, _permit) =
+            crate::observer_socket::admit(server, &[fixture.config.expected_uid], &permits)
+                .ok_or("allowlisted group peer")?;
+        let (served, group_response) = tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::join!(
+                crate::observer_socket::connection(server, Arc::clone(&fixture.store)),
+                async {
+                    let mut bytes = serde_json::to_vec(&request)?;
+                    bytes.push(b'\n');
+                    client.write_all(&bytes).await?;
+                    let response = integrations::read_frame(&mut client).await?;
+                    Ok::<serde_json::Value, Box<dyn std::error::Error>>(serde_json::from_slice(
+                        &response,
+                    )?)
+                }
+            )
+        })
+        .await?;
+        served?;
+        let group_response = group_response?;
+        assert!(
+            delivery(group_response.clone())?
+                .get("pin_recovery")
+                .is_none()
+        );
+        for exact in [&fixture.pin, &fixture.store_identity, &fixture.batch_key] {
+            assert!(!group_response.to_string().contains(exact));
+            assert!(release_views(&fixture)?.1.contains(exact));
+        }
+
+        let (id, retry) = request_release(
+            &fixture.store,
+            &fixture.owner,
+            &fixture.pool_id,
+            &fixture.member_id,
+            "upgrade-offline",
+        )
+        .await?;
+        assert_eq!(id, fixture.release_id);
+        scripted_release(&fixture, retry, false, vec![
+            capabilities(),
+            RunScript::Result(json!({"pins":[{"pin_id":fixture.pin,"agent_id":"ag-20261107-010101-0000000003","status":"released"}],"next_after_pin_id":null})),
+        ]).await?;
+        assert_eq!(effect_state(&fixture.store, &id)?, "accepted");
+        Ok(())
+    }
+
     /// An owner retry discovers the older combined API after rollback.
     #[tokio::test]
     async fn pin_release_owner_retry_can_use_rolled_back_run()

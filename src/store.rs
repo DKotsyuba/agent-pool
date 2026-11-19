@@ -1173,6 +1173,21 @@ impl Store {
         &self,
         request: &crate::observer::Request,
     ) -> Result<crate::observer::Data, Fault> {
+        self.observe_projection(request, true)
+    }
+    /// Projects the group observer's allowed reads without private pin recovery inputs.
+    pub(crate) fn observe_group(
+        &self,
+        request: &crate::observer::Request,
+    ) -> Result<crate::observer::Data, Fault> {
+        self.observe_projection(request, false)
+    }
+    /// Shares section pagination while keeping owner-only fields behind the chosen ingress.
+    fn observe_projection(
+        &self,
+        request: &crate::observer::Request,
+        owner_projection: bool,
+    ) -> Result<crate::observer::Data, Fault> {
         use crate::observer::{Data, Detail, Envelope, Operation, Page, PoolPage, PoolRow};
         request.validate()?;
         match &request.operation {
@@ -1309,7 +1324,8 @@ impl Store {
                     })));
                 }
                 let get = args.projection()?;
-                let mappings = args.include_bindings || get.section == Section::Binding;
+                let mappings =
+                    owner_projection && (args.include_bindings || get.section == Section::Binding);
                 let reply = view(
                     &self.db,
                     pool,
@@ -1330,11 +1346,12 @@ impl Store {
                                 &delivery.operation_id,
                                 &delivery.state,
                             )?;
-                        if pin_release_attention(&delivery.state) {
+                        if owner_projection && pin_release_attention(&delivery.state) {
                             delivery.pin_recovery = pin_recovery_inputs(
+                                &self.db,
                                 &effect(&self.db, &delivery.operation_id)?,
                                 &delivery.state,
-                            );
+                            )?;
                         }
                     }
                 }
@@ -1644,35 +1661,7 @@ PRAGMA user_version=5;")?;
     /// Re-derives the Run ownership proof of a release intent recorded before it was frozen.
     /// Origins are immutable, so the result equals what a new intent would have recorded.
     pub fn pin_release_owner(&self, effect_id: &str) -> Result<Option<PinOwner>, Fault> {
-        let e = effect(&self.db, effect_id)?;
-        let Work::ReleasePin { pin_id, owner, .. } = &e.work else {
-            return Err(Fault::Internal);
-        };
-        if owner.is_some() {
-            return Ok(owner.clone());
-        }
-        let Some(member_id) = e.member_id.as_deref() else {
-            return Ok(None);
-        };
-        let raw: Option<String> = self
-            .db
-            .query_row("SELECT data FROM members WHERE id=?1", [member_id], |row| {
-                row.get(0)
-            })
-            .optional()?;
-        let Some(raw) = raw else { return Ok(None) };
-        let binding: Binding = decode(&raw)?;
-        if binding.run_pin_id.as_deref() != Some(pin_id.as_str()) {
-            return Ok(None);
-        }
-        Ok(pin_release_origin(
-            &self.db,
-            &e.pool_id,
-            member_id,
-            binding.run_store_id.as_deref(),
-            pin_id,
-        )?
-        .1)
+        effective_pin_owner(&self.db, &effect(&self.db, effect_id)?)
     }
     /// Reads the private credential for the release effect’s frozen store and pin.
     pub(crate) fn pin_release_token(
@@ -4298,7 +4287,7 @@ fn view(
                     (None, None)
                 };
                 let pin_recovery = if owner {
-                    pin_recovery_inputs(&e, &state)
+                    pin_recovery_inputs(db, &e, &state)?
                 } else {
                     None
                 };
@@ -4836,23 +4825,74 @@ fn pin_release_attention(state: &str) -> bool {
 }
 
 /// Returns the exact public offline recovery inputs for owner delivery views.
-fn pin_recovery_inputs(effect: &Effect, state: &str) -> Option<PinRecovery> {
+fn pin_recovery_inputs(
+    db: &Connection,
+    effect: &Effect,
+    state: &str,
+) -> Result<Option<PinRecovery>, Fault> {
     if !pin_release_attention(state) {
-        return None;
+        return Ok(None);
     }
     let Work::ReleasePin {
         pin_id,
-        route,
-        owner: Some(PinOwner::Batch { request_key }),
+        route: Some(route),
+        ..
     } = &effect.work
     else {
-        return None;
+        return Ok(None);
     };
-    Some(PinRecovery {
-        store_id: route.as_ref()?.store_id.clone()?,
+    let Some(store_id) = &route.store_id else {
+        return Ok(None);
+    };
+    let Some(PinOwner::Batch { request_key }) = effective_pin_owner(db, effect)? else {
+        return Ok(None);
+    };
+    Ok(Some(PinRecovery {
+        store_id: store_id.clone(),
         pin_id: pin_id.clone(),
-        request_key: request_key.clone(),
-    })
+        request_key,
+    }))
+}
+
+/// Resolves a migrated intent from the immutable admission and its original route fence.
+fn effective_pin_owner(db: &Connection, effect: &Effect) -> Result<Option<PinOwner>, Fault> {
+    let Work::ReleasePin {
+        pin_id,
+        route,
+        owner,
+    } = &effect.work
+    else {
+        return Err(Fault::Internal);
+    };
+    if owner.is_some() {
+        return Ok(owner.clone());
+    }
+    let Some(member_id) = effect.member_id.as_deref() else {
+        return Ok(None);
+    };
+    let raw: Option<String> = db
+        .query_row(
+            "SELECT data FROM members WHERE id=?1 AND pool=?2",
+            params![member_id, effect.pool_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(raw) = raw else { return Ok(None) };
+    let binding: Binding = decode(&raw)?;
+    if binding.run_pin_id.as_deref() != Some(pin_id) {
+        return Ok(None);
+    }
+    let (original_route, owner) = pin_release_origin(
+        db,
+        &effect.pool_id,
+        member_id,
+        binding.run_store_id.as_deref(),
+        pin_id,
+    )?;
+    if matches!(owner, Some(PinOwner::Batch { .. })) && original_route != *route {
+        return Ok(None);
+    }
+    Ok(owner)
 }
 
 /// Looks up a dormant release for this member, including a candidate that never joined.

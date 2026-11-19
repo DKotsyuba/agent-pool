@@ -115,7 +115,7 @@ pub(crate) async fn answer(bytes: &[u8], store: &SharedStore) -> Envelope {
         let request = request.map_err(|_| Fault::Invalid)?;
         request.validate()?;
         permitted(&request)?;
-        let mut data = stored(store, move |store| store.observe(&request)).await?;
+        let mut data = stored(store, move |store| store.observe_group(&request)).await?;
         if let Data::Identity(identity) = &mut data {
             identity
                 .capabilities
