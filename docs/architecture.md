@@ -1211,10 +1211,14 @@ does not prove a new turn began.
 
 Schema v18 adds chat pool metadata, durable batch intents, notice target mappings
 and the immutable agreement ledger. Schema v19 adds durable retry timing and
-one notice intent per event and seat. All current seats must join, and every seat
-must cast a ready vote on the same proposal and unchanged roster. The qualifying
-vote writes the agreement, vote event references and completion event in the same
-transaction. A completion notice is queued when the initiating address is known.
+one notice intent per event and seat. All current seats must join before a chat
+proposal opens. Opening a proposal records the proposing seat’s ready vote with
+`proposer` evidence, including a proposer attestation for each structured criterion.
+The proposal and vote journal events share one transaction and one revision
+increment. The proposer can change that vote while the proposal is open. Once
+all frozen seats are ready on the same proposal and roster, the qualifying
+proposal or vote writes the agreement, vote event references and completion
+event in the same transaction. A sole seat qualifies on proposal opening. A completion notice is queued when the initiating address is known.
 The agreement records member consensus and Run continues to report process
 outcomes separately. Observer `completion_get` with section `header` returns the
 agreement for its exact ID; managed records retain their existing format.

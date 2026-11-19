@@ -40,6 +40,18 @@ impl Actor {
 pub enum Fault {
     /// The request is malformed or outside the documented size bounds.
     Invalid,
+    /// The chat vote check array is malformed or exceeds its bounds.
+    VoteChecks,
+    /// A chat vote check status is missing or invalid.
+    VoteCheckStatus,
+    /// A chat vote check has invalid evidence.
+    VoteCheckEvidence,
+    /// The chat vote check IDs do not match the acceptance criteria.
+    VoteCriterion,
+    /// The chat vote does not permit criterion checks.
+    VoteChecksUnsupported,
+    /// A chat vote needs nonempty evidence within its byte limit.
+    VoteEvidence,
     /// The research profile cannot receive Bridge chat notices.
     ChatResearchProfile,
     /// Fresh trusted native identity could not be established.

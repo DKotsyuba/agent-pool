@@ -72,7 +72,11 @@ pub(crate) fn chat_definitions(names: &[&str], member: bool) -> Vec<Value> {
                     "pool_id":string,"completion_id":string,"section":{"enum":["header","content"]},"after":{"type":"object"}}}});
             }
             "pool_join" => tool["description"] = json!("Join your admitted seat at the current pool revision."),
-            "pool_propose" => tool["description"] = json!("Propose a result for all current seats to vote on after every seat joins."),
+            "pool_propose" => tool["description"] = json!("Open a proposal after every current seat joins. This records your ready vote at the same revision and requests votes from peers. You may change your vote while the proposal is open. A sole seat completes the pool immediately."),
+            "pool_vote" => {
+                tool["description"] = json!("Vote on the exact proposal_id and roster_key. For free-text criteria, omit checks and provide evidence for ready or block. For structured acceptance, ready requires one check per exact ID from pool_get section=criteria. Status must be met or unmet. Block may omit checks and revoke must omit them.");
+                tool["inputSchema"]["properties"]["checks"]["items"]["properties"]["criterion_id"]["pattern"] = json!("^[A-Za-z0-9_.-]+$");
+            }
             "pool_send_member" => tool["description"] = json!("Send to an exact current member_id. History is visible to the sender, recipient and owners."),
             _ => {}
         }
@@ -373,6 +377,12 @@ pub fn present(reply: Result<Reply, Fault>, templates: &Templates) -> CallToolRe
             Fault::Closed=>"This pool was explicitly closed; global leader status remains.",
             Fault::Completed=>"This pool is completed: a formal completion record is committed and final (it was not explicitly closed). Reads, messages, explicit close and history release remain.",
             Fault::Invalid=>"Check documented fields, UTF-8 byte limits and exact identifiers.",
+            Fault::VoteChecks=>"checks must be an array of at most 10 objects with criterion_id, status and evidence only, within 16384 encoded bytes.",
+            Fault::VoteCheckStatus=>"checks[].status must be met or unmet.",
+            Fault::VoteCheckEvidence=>"checks[].evidence must be nonblank plain text within 1024 UTF-8 bytes.",
+            Fault::VoteCriterion=>"Use unique checks[].criterion_id values from pool_get section=criteria (1–32 ASCII letters, digits, hyphens, underscores or dots). Ready requires every listed ID.",
+            Fault::VoteChecksUnsupported=>"Omit checks or pass an empty array for free-text criteria or choice=revoke. For free-text ready or block, put your explanation in evidence.",
+            Fault::VoteEvidence=>"evidence must be plain text within 2048 UTF-8 bytes and is required for free-text ready or block.",
             Fault::ChatResearchProfile=>"The research profile cannot receive pool chat notices. Use review.",
             Fault::Internal=>"No success is confirmed. Inspect state before repeating the same intent.",
         }}),
