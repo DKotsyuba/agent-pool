@@ -1538,9 +1538,6 @@ PRAGMA user_version=5;")?;
         if version < 18 {
             chat::migrate(&db)?;
         }
-        if version < 19 {
-            chat::migrate_closed_reconciliation(&db)?;
-        }
         if version < crate::completion::SCHEMA_VERSION {
             db.execute_batch("COMMIT;")?;
         }

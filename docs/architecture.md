@@ -11,8 +11,8 @@ its EOF never starts, stops or replaces the resident.
 - `domain.rs` defines strict flat commands, safe public views and private outbox work.
 - `store.rs` owns the single SQLite writer and synchronous transactions. A process
   lifetime file lock excludes a second writer. WAL, full synchronization, foreign
-  keys and schema version 19 are explicit. Future schema versions refuse to open.
-  Schema v1–v18 upgrades transactionally to v19 before use. Schema v17 adds the
+  keys and schema version 18 are explicit. Future schema versions refuse to open.
+  Schema v1–v17 upgrades transactionally to v18 before use. Schema v17 adds the
   private Run pin credential table. The v5 replacement
   and stable-slot migration and v6 inventory revision fence remain in that upgrade.
   v16 records every non-current incarnation as `removed`; every open then settles

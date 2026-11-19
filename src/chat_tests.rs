@@ -625,7 +625,7 @@ async fn chat_migrates_v17_without_changing_old_pool() -> Result<(), Box<dyn std
         upgraded
             .test_db()
             .query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))?,
-        19
+        18
     );
     let ChatReply::Overview(old) =
         state::owner_call(&mut upgraded, "pool_get", json!({"pool_id":pid}))?
@@ -795,45 +795,5 @@ async fn chat_invalid_spec_settles_refused() -> Result<(), Box<dyn std::error::E
             .iter()
             .all(|seat| seat.admitted == "refused" && seat.agent_id.is_none())
     );
-    Ok(())
-}
-
-/// Upgrade reopens a v18 closed batch incorrectly finalized on an absent receipt.
-#[tokio::test]
-async fn chat_migration_recovers_closed_receipt_miss() -> Result<(), Box<dyn std::error::Error>> {
-    let (_root, config, store) = fixture()?;
-    let batch = reserve(&store, None).await?;
-    let id = batch.id.clone();
-    stored(&store, move |store| state::fence(store, &id, RUN_STORE)).await?;
-    owner_call(
-        OwnerRequest {
-            tool: "pool_close".into(),
-            arguments: json!({"pool_id":batch.pool_id,"expected_revision":1,"request_key":"close"}),
-        },
-        &config,
-        &store,
-    )
-    .await?;
-    let id = batch.id.clone();
-    stored(&store, move |store| {
-        store.test_db().execute(
-            "UPDATE chat_batches SET state='not_launched' WHERE id=?1",
-            [id],
-        )?;
-        store.test_db().execute_batch(
-            "ALTER TABLE chat_batches DROP COLUMN closed_at_ms;
-          ALTER TABLE chat_batches DROP COLUMN next_receipt_ms;
-          ALTER TABLE chat_batches DROP COLUMN receipt_delay_ms;
-          PRAGMA user_version=18;",
-        )?;
-        Ok(())
-    })
-    .await?;
-    drop(store);
-    let upgraded = crate::store::Store::open(&config.database_path)?;
-    let pending = state::next_batch(&upgraded, "")?.ok_or("closed batch must be recoverable")?;
-    assert_eq!(pending.id, batch.id);
-    assert!(pending.closed);
-    assert_eq!(pending.run_store.as_deref(), Some(RUN_STORE));
     Ok(())
 }

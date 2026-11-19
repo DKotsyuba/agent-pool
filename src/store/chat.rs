@@ -17,6 +17,8 @@ pub(super) fn migrate(db: &Connection) -> Result<(), Fault> {
             id TEXT PRIMARY KEY, pool TEXT NOT NULL REFERENCES chat_pools(pool),
             request_key TEXT NOT NULL, digest TEXT NOT NULL, jobs TEXT NOT NULL,
             old_agent_id TEXT, is_start INTEGER NOT NULL, run_store TEXT, state TEXT NOT NULL DEFAULT 'pending',
+            closed_at_ms INTEGER, next_receipt_ms INTEGER NOT NULL DEFAULT 0,
+            receipt_delay_ms INTEGER NOT NULL DEFAULT 5000,
             UNIQUE(pool, request_key, is_start));
         CREATE UNIQUE INDEX IF NOT EXISTS chat_pending_batch ON chat_batches(pool) WHERE state='pending';
         CREATE TABLE IF NOT EXISTS chat_notice_targets(effect TEXT PRIMARY KEY REFERENCES effects(id), member TEXT NOT NULL REFERENCES members(id));
@@ -976,32 +978,6 @@ pub(super) fn project_seat(
         admission,
         joined: binding.member.state == MemberState::Active,
     });
-    Ok(())
-}
-
-/// Persists receipt retry timing and reopens batches previously settled from a miss.
-pub(super) fn migrate_closed_reconciliation(db: &Connection) -> Result<(), Fault> {
-    let installed: bool = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('chat_batches') WHERE name='closed_at_ms')",
-        [],
-        |row| row.get(0),
-    )?;
-    if !installed {
-        db.execute_batch(
-            "
-            ALTER TABLE chat_batches ADD COLUMN closed_at_ms INTEGER;
-            ALTER TABLE chat_batches ADD COLUMN next_receipt_ms INTEGER NOT NULL DEFAULT 0;
-            ALTER TABLE chat_batches ADD COLUMN receipt_delay_ms INTEGER NOT NULL DEFAULT 5000;
-        ",
-        )?;
-    }
-    db.execute(
-        "UPDATE chat_batches SET state='pending',closed_at_ms=COALESCE(closed_at_ms,?1)
-         WHERE run_store IS NOT NULL AND state IN ('pending','not_launched')
-           AND pool IN (SELECT id FROM pools WHERE json_extract(data,'$.closed'))",
-        [receipt_clock()?],
-    )?;
-    db.execute_batch("PRAGMA user_version=19;")?;
     Ok(())
 }
 

@@ -3,7 +3,7 @@
 ## Unreleased
 
 - Added Linux owner ingress and Pool chat v1 for ordinary Run profiles. Authorized owners share chat management, and current seats reach a durable agreement through Run-authenticated chat tools.
-- Schema v18 adds durable chat batches and agreement records. Take a private WAL-consistent backup before opening an existing store. The v0.1.5 binary refuses a v18 database. Schema v19 adds durable receipt retry timing for closed chat batches.
+- Schema v18 adds durable chat batches, agreement records and retry timing for closed batches. Take a private WAL-consistent backup before opening an existing store. The v0.1.5 binary refuses a v18 database.
 
 ## 0.1.5
 
