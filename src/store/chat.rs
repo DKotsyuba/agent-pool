@@ -513,6 +513,31 @@ pub(super) fn close_batches(db: &Connection, pool: &str) -> Result<(), Fault> {
     Ok(())
 }
 
+/// Checks whether an effect belongs to the chat notice lane.
+pub(super) fn is_notice(db: &Connection, effect: &str) -> Result<bool, Fault> {
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM chat_notice_targets WHERE effect=?1)",
+        [effect],
+        |r| r.get(0),
+    )?)
+}
+
+/// Obsoletes ordinary notices at close unless Bridge may already have custody.
+pub(super) fn cancel_unsent_notices(db: &Connection, pool: &str) -> Result<(), Fault> {
+    db.execute(
+        "UPDATE effects SET state='cancelled' WHERE id IN
+         (SELECT n.effect FROM members m JOIN chat_notice_targets n ON n.member=m.id
+          WHERE m.pool=?1 AND n.pending=1 AND n.close_notice=0 AND n.send_started=0)",
+        [pool],
+    )?;
+    db.execute(
+        "UPDATE chat_notice_targets SET pending=0 WHERE pending=1 AND close_notice=0 AND send_started=0
+         AND member IN (SELECT id FROM members WHERE pool=?1)",
+        [pool],
+    )?;
+    Ok(())
+}
+
 /// Settles a pending batch with definitive Run evidence.
 pub(crate) fn settle_batch(store: &mut Store, id: &str, state: &str) -> Result<(), Fault> {
     store.db.execute(
@@ -774,6 +799,10 @@ pub(crate) fn get(db: &Connection, input: GetPool, seat: Option<&str>) -> Result
             next,
         });
     }
+    let owner_chat = seat.is_none() && enabled(db, &input.pool_id)?;
+    if owner_chat && input.section == ChatSection::Members {
+        return owner_member_page(db, &pool, input);
+    }
     if input.section != ChatSection::Overview {
         let section = match input.section {
             ChatSection::Members => Section::Members,
@@ -829,7 +858,17 @@ pub(crate) fn get(db: &Connection, input: GetPool, seat: Option<&str>) -> Result
             .optional()?);
     let mut current = bindings(db, &input.pool_id)?;
     let current_count = current.len();
-    if seat.is_none() {
+    let (mut omitted_retired, mut omitted_undeliverable) = (0, 0);
+    if owner_chat {
+        (omitted_retired, omitted_undeliverable) = db.query_row(
+            "SELECT count(*),count(*) FILTER (WHERE EXISTS(
+                SELECT 1 FROM chat_notice_targets n JOIN effects e ON e.id=n.effect
+                WHERE n.member=older.id AND e.state='notice_undeliverable'))
+             FROM (SELECT id FROM members WHERE pool=?1 AND current=0
+                   ORDER BY rowid DESC LIMIT -1 OFFSET 5) older",
+            [&input.pool_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
         let mut retained = db.prepare(
             "SELECT data FROM members WHERE pool=?1 AND current=0 ORDER BY rowid DESC LIMIT 5",
         )?;
@@ -837,18 +876,10 @@ pub(crate) fn get(db: &Connection, input: GetPool, seat: Option<&str>) -> Result
             current.push(decode(&raw?)?);
         }
     }
-    let roster = current.into_iter().map(|binding| {
-        let admitted = binding.run_id.is_some();
-        let admission = if admitted { "admitted".into() } else {
-            db.query_row("SELECT b.state FROM chat_batches b,json_each(b.jobs) j WHERE b.pool=?1 AND json_extract(j.value,'$.member_id')=?2",
-                params![input.pool_id,binding.member.member_id], |r| r.get::<_,String>(0)).optional()?.unwrap_or_else(|| "unavailable".into())
-        };
-        let notice_undeliverable = notice_undeliverable(db, &binding.member.member_id)?;
-        let retired = binding.member.state == MemberState::Removed;
-        Ok(SeatRow { notice_undeliverable, retired, seat_id: binding.member.member_id, profile: binding.member.role, assignment: brief(&binding.member.task, 110),
-            run_store_id: binding.run_store_id, sequence: binding.run_sequence, agent_id: binding.run_id,
-            admitted: admission, joined: binding.member.state == MemberState::Active, process: "unknown".into() })
-    }).collect::<Result<Vec<_>,Fault>>()?;
+    let roster = current
+        .into_iter()
+        .map(|binding| seat_row(db, binding))
+        .collect::<Result<Vec<_>, _>>()?;
     let state = status(&pool, completion.is_some());
     let (ready, blocked) = pool
         .proposal
@@ -882,6 +913,8 @@ pub(crate) fn get(db: &Connection, input: GetPool, seat: Option<&str>) -> Result
         revision: pool.revision,
         state,
         seat_count: current_count,
+        omitted_retired,
+        omitted_undeliverable,
         roster,
         ready,
         blocked,
@@ -916,6 +949,74 @@ pub(crate) fn launch_read(store: &Store, batch: &ChatBatch) -> Result<ChatReply,
         request_key: batch.request_key,
         seats,
         old_agent_id: batch.old_agent_id,
+    })
+}
+
+/// Lists current and retained chat seats in bounded, stable offset pages.
+fn owner_member_page(db: &Connection, pool: &Pool, input: GetPool) -> Result<ChatReply, Fault> {
+    if input.field.is_some() {
+        return Err(Fault::Invalid);
+    }
+    let offset = input
+        .after
+        .as_deref()
+        .unwrap_or("0")
+        .parse::<i64>()
+        .map_err(|_| Fault::Invalid)?;
+    if offset < 0 {
+        return Err(Fault::Invalid);
+    }
+    let mut stmt = db.prepare(
+        "SELECT m.data FROM members m LEFT JOIN member_slots s ON s.member=m.id
+         WHERE m.pool=?1 ORDER BY m.current DESC,
+         CASE WHEN m.current=1 THEN coalesce(s.slot,m.id) END,
+         CASE WHEN m.current=0 THEN m.rowid END DESC, m.id
+         LIMIT 6 OFFSET ?2",
+    )?;
+    let rows = stmt.query_map(params![pool.pool_id, offset], |row| row.get::<_, String>(0))?;
+    let mut roster = Vec::new();
+    let mut more = false;
+    for raw in rows {
+        let raw = raw?;
+        if roster.len() == 5 {
+            more = true;
+            break;
+        }
+        roster.push(seat_row(db, decode(&raw)?)?);
+    }
+    let count = roster.len() as i64;
+    Ok(ChatReply::Members {
+        pool_id: pool.pool_id.clone(),
+        revision: pool.revision,
+        roster,
+        more,
+        next: offset.saturating_add(count),
+    })
+}
+
+/// Projects one safe chat seat including durable notice failures.
+fn seat_row(db: &Connection, binding: Binding) -> Result<SeatRow, Fault> {
+    let admitted = binding.run_id.is_some();
+    let admission = if admitted {
+        "admitted".into()
+    } else {
+        db.query_row("SELECT b.state FROM chat_batches b,json_each(b.jobs) j WHERE b.pool=?1 AND json_extract(j.value,'$.member_id')=?2",
+                params![binding.pool_id,binding.member.member_id], |r| r.get::<_,String>(0)).optional()?.unwrap_or_else(|| "unavailable".into())
+    };
+    let notice_undeliverable = notice_undeliverable(db, &binding.member.member_id)?;
+    let retired = binding.member.state == MemberState::Removed;
+    Ok(SeatRow {
+        notice_undeliverable,
+        retired,
+        seat_id: binding.member.member_id,
+        profile: binding.member.role,
+        assignment: brief(&binding.member.task, 110),
+        run_store_id: binding.run_store_id,
+        sequence: binding.run_sequence,
+        agent_id: binding.run_id,
+        admitted: admission,
+        joined: binding.member.state == MemberState::Active,
+        process: "unknown".into(),
     })
 }
 
@@ -966,7 +1067,8 @@ pub(super) fn queue_chat_notices(
         _ => return Ok(()),
     };
     let text = format!("[agent-pool] Pool {}: {text}", pool.pool_id);
-    let deadline = receipt_clock()? + 600_000;
+    let enqueued_at = receipt_clock()?;
+    let deadline = enqueued_at + 600_000;
     let event_id = i64::try_from(event.event_id).map_err(|_| Fault::Internal)?;
     for binding in roster {
         let member = &binding.member.member_id;
@@ -991,8 +1093,8 @@ pub(super) fn queue_chat_notices(
             },
         )?;
         db.execute(
-            "INSERT INTO chat_notice_targets(effect,member,event,close_notice,resolve_until_ms) VALUES (?1,?2,?3,?4,?5)",
-            params![effect, member, event_id, closing, deadline],
+            "INSERT INTO chat_notice_targets(effect,member,event,close_notice,resolve_until_ms,next_resolve_ms) VALUES (?1,?2,?3,?4,?5,?6)",
+            params![effect, member, event_id, closing, deadline, enqueued_at],
         )?;
     }
     Ok(())
@@ -1113,7 +1215,8 @@ pub(crate) fn begin_notice_send(store: &mut Store, id: &str) -> Result<NoticeSen
     let (member, pool_id, closing, started, custody, deadline): (String,String,bool,bool,bool,Option<i64>) = tx.query_row(
         "SELECT n.member,e.pool,n.close_notice,n.send_started,n.custody_confirmed,n.publish_until_ms
          FROM chat_notice_targets n JOIN effects e ON e.id=n.effect
-         JOIN publications p ON p.effect=n.effect WHERE n.effect=?1 AND n.pending=1",
+         JOIN publications p ON p.effect=n.effect WHERE n.effect=?1
+         AND (n.pending=1 OR e.state='cancelled')",
         [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?;
     let (seat, current) = binding_any(&tx, &member)?;
     let eligible =
@@ -1151,7 +1254,7 @@ pub(crate) fn defer_notice(store: &mut Store, id: &str) -> Result<(), Fault> {
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute(
         "UPDATE chat_notice_targets SET next_resolve_ms=min(resolve_until_ms,?2+resolve_delay_ms),
-            resolve_delay_ms=min(60000,2*resolve_delay_ms) WHERE effect=?1",
+            resolve_delay_ms=min(60000,2*resolve_delay_ms) WHERE effect=?1 AND pending=1",
         params![id, receipt_clock()?],
     )?;
     tx.execute(
