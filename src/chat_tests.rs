@@ -32,7 +32,7 @@ fn spec(profile: &str) -> Value {
 }
 
 fn input(address: Option<&str>) -> Value {
-    json!({"request_key":"start","name":"Mixed profiles","purpose":"Agree a result","members":[spec("implement"),spec("review"),spec("research")],"owner_address":address})
+    json!({"request_key":"start","name":"Mixed profiles","purpose":"Agree a result","members":[spec("implement"),spec("review"),spec("implement")],"owner_address":address})
 }
 
 fn agent(index: usize) -> String {
@@ -153,7 +153,7 @@ async fn chat_uncertain_start_reuses_saved_receipt() -> Result<(), Box<dyn std::
                             )
                             .is_ok()
                         );
-                        assert_eq!(spec["profile"], ["implement", "review", "research"][index]);
+                        assert_eq!(spec["profile"], ["implement", "review", "implement"][index]);
                         entries.push(json!({"index":index,"agent_id":agent(index),"sequence":1,"execution_ref":execution(index)}));
                     }
                     let receipt = json!({"version":1,"store_id":RUN_STORE,"request_id":request_jobs["request_id"],"jobs":entries});
@@ -667,7 +667,7 @@ async fn chat_notice_backoff_survives_restart() -> Result<(), Box<dyn std::error
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         assert_eq!((total, author), (5, 1));
-        store.next_effect()?.ok_or(Fault::Internal)
+        state::due_notices(store, 1)?.pop().ok_or(Fault::Internal)
     })
     .await?;
     let crate::domain::Work::Deliver { ref text, .. } = first.work else {
@@ -680,7 +680,7 @@ async fn chat_notice_backoff_survives_restart() -> Result<(), Box<dyn std::error
     drop(store);
     let store = Arc::new(Mutex::new(Store::open(&config.database_path)?));
     let id = effect_id.clone();
-    let (expired, next) = stored(&store, move |store| {
+    let (expired, next, target) = stored(&store, move |store| {
         state::owner_call(store, "pool_post", replay)?;
         let count: i64 = store.test_db().query_row("SELECT count(*) FROM chat_notice_targets", [], |row| row.get(0))?;
         assert_eq!(count,5);
@@ -691,12 +691,13 @@ async fn chat_notice_backoff_survives_restart() -> Result<(), Box<dyn std::error
             [&id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
         )?;
         assert_eq!((state.as_str(),deferred,frozen),("queued",true,false));
-        let next = store.next_effect()?.ok_or(Fault::Internal)?;
+        let next = state::due_notices(store, 1)?.pop().ok_or(Fault::Internal)?;
         assert_ne!(next.effect_id,id);
+        let target: String = store.test_db().query_row("SELECT member FROM chat_notice_targets WHERE effect=?1", [&next.effect_id], |r| r.get(0))?;
         store.test_db().execute("UPDATE chat_notice_targets SET next_resolve_ms=0,resolve_until_ms=0 WHERE effect=?1", [&id])?;
-        let expired = store.next_effect()?.ok_or(Fault::Internal)?;
+        let expired = state::due_notices(store, 1)?.pop().ok_or(Fault::Internal)?;
         assert_eq!(expired.effect_id,id);
-        Ok((expired,next))
+        Ok((expired,next,target))
     }).await?;
     crate::runtime::effect(&store, &config, expired, false).await?;
     let overview = private_call(
@@ -708,7 +709,7 @@ async fn chat_notice_backoff_survives_restart() -> Result<(), Box<dyn std::error
     .await;
     assert!(reply_text(&overview).contains("notice_undeliverable=true"));
     let replacement = json!({"pool_id":pid,"expected_revision":5,"request_key":"replace-notice-seat",
-        "member_id":batch.jobs[2].member_id,"member":spec("implement")});
+        "member_id":target,"member":spec("implement")});
     let next_id = next.effect_id.clone();
     stored(&store, move |store| {
         state::replace(store, parse(replacement)?)?;
@@ -720,6 +721,252 @@ async fn chat_notice_backoff_survives_restart() -> Result<(), Box<dyn std::error
     })
     .await?;
     crate::runtime::effect(&store, &config, next, false).await?;
+    Ok(())
+}
+
+/// Rejects the non-wakeable profile through both owner admission paths.
+#[tokio::test]
+async fn chat_research_start_and_replace_are_refused() -> Result<(), Box<dyn std::error::Error>> {
+    let (_root, config, store) = fixture()?;
+    let templates = renderer()?;
+    let mut research = input(None);
+    research["members"][1] = spec("research");
+    let start = OwnerRequest {
+        tool: "pool_start".into(),
+        arguments: research,
+    };
+    let response = present(owner_call(start, &config, &store).await, templates);
+    assert_eq!(response.is_error, Some(true));
+    assert!(serde_json::to_string(&response)?.contains("Use review."));
+    let batch = reserve(&store, None).await?;
+    install(&store, &batch).await?;
+    let replace = OwnerRequest {
+        tool: "pool_replace".into(),
+        arguments: json!({
+            "pool_id":batch.pool_id,"expected_revision":1,"request_key":"reject-replace",
+            "member_id":batch.jobs[0].member_id,"member":spec("research")
+        }),
+    };
+    let response = present(owner_call(replace, &config, &store).await, templates);
+    assert_eq!(response.is_error, Some(true));
+    assert!(serde_json::to_string(&response)?.contains("Use review."));
+    Ok(())
+}
+
+/// A restricted role settles immediately and remains visible on the exact seat.
+#[tokio::test]
+async fn chat_restricted_role_is_undeliverable_without_backoff()
+-> Result<(), Box<dyn std::error::Error>> {
+    use tokio::io::AsyncWriteExt;
+    let (_root, config, store) = fixture()?;
+    let batch = reserve(&store, None).await?;
+    install(&store, &batch).await?;
+    let pid = batch.pool_id.clone();
+    let (notice, seat_id) = stored(&store, move |store| {
+        state::owner_call(
+            store,
+            "pool_post",
+            json!({"pool_id":pid,"expected_revision":1,
+            "request_key":"restricted-runtime","body":"pending"}),
+        )?;
+        assert!(
+            store.next_effect()?.is_none(),
+            "chat work belongs to its own queue"
+        );
+        let notice = state::due_notices(store, 1)?.pop().ok_or(Fault::Internal)?;
+        let seat_id = store.test_db().query_row(
+            "SELECT member FROM chat_notice_targets WHERE effect=?1",
+            [&notice.effect_id],
+            |r| r.get::<_, String>(0),
+        )?;
+        Ok((notice, seat_id))
+    })
+    .await?;
+    let target = batch
+        .jobs
+        .iter()
+        .position(|job| job.member_id == seat_id)
+        .ok_or("target")?;
+    let path = config.run_socket.as_ref().ok_or("Run socket")?;
+    let run = UnixListener::bind(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    let mock = tokio::spawn(async move {
+        for index in 0..3 {
+            let (mut stream, _) = run.accept().await.map_err(|_| Fault::Unavailable)?;
+            let request: Value =
+                serde_json::from_slice(&integrations::read_frame(&mut stream).await?)
+                    .map_err(|_| Fault::Internal)?;
+            let result = if index == 1 {
+                assert_eq!(request["method"], "agent_integration");
+                json!({"schema_version":1,"agent":{"agent_id":agent(target),"sequence":1},
+                    "communication":{"state":"unsupported","reason":"restricted_role"}})
+            } else {
+                assert_eq!(request["method"], "capabilities");
+                json!({"schema_version":1,"product":"agent-run","store_id":RUN_STORE})
+            };
+            let response = json!({"jsonrpc":"2.0","id":request["id"],"result":result});
+            stream
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .map_err(|_| Fault::Unavailable)?;
+        }
+        Ok::<_, Fault>(())
+    });
+    let id = notice.effect_id.clone();
+    crate::runtime::effect(&store, &config, notice, false).await?;
+    tokio::time::timeout(std::time::Duration::from_secs(3), mock).await???;
+    stored(&store, move |store| {
+        let db = store.test_db();
+        let result: (String, bool) = db.query_row(
+            "SELECT e.state,n.pending FROM effects e
+            JOIN chat_notice_targets n ON e.id=n.effect WHERE e.id=?1",
+            [&id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        assert_eq!(result, (state::NOTICE_UNDELIVERABLE.into(), false));
+        let request: crate::observer::Request =
+            parse(json!({"schema_version":1,"operation":"get",
+            "params":{"pool_id":batch.pool_id,"section":"deliveries"}}))?;
+        let view = serde_json::to_value(store.observe(&request)?).map_err(|_| Fault::Internal)?;
+        assert!(
+            view["view"]["deliveries"]
+                .as_array()
+                .is_some_and(|rows| rows.iter().any(|row| row["operation_id"] == id
+                    && row["member_id"] == seat_id
+                    && row["state"] == state::NOTICE_UNDELIVERABLE))
+        );
+        Ok(())
+    })
+    .await?;
+    Ok(())
+}
+
+/// Freezes two valid publications before any provider contact.
+async fn frozen_notices(
+    store: &SharedStore,
+    pool_id: String,
+) -> Result<Vec<crate::domain::Effect>, Fault> {
+    stored(store, move |store| {
+        state::owner_call(
+            store,
+            "pool_post",
+            json!({"pool_id":pool_id,"expected_revision":1,
+            "request_key":"frozen-notices","body":"pending"}),
+        )?;
+        let mut effects = state::due_notices(store, 2)?;
+        assert_eq!(effects.len(), 2);
+        for effect in &mut effects {
+            let crate::domain::Work::Deliver { address, .. } = &mut effect.work else {
+                return Err(Fault::Internal);
+            };
+            *address = "test/codex/route/session".into();
+            let params = integrations::publication(effect)?;
+            store.freeze_publication(
+                &effect.effect_id,
+                "fixture",
+                &serde_json::to_value(params).map_err(|_| Fault::Internal)?,
+            )?;
+        }
+        Ok(effects)
+    })
+    .await
+}
+
+/// A crash before the first write and a lost acknowledgement both replay the exact publication.
+#[tokio::test]
+async fn chat_replays_frozen_publish_after_restart() -> Result<(), Box<dyn std::error::Error>> {
+    let (_root, config, store) = fixture()?;
+    let batch = reserve(&store, None).await?;
+    install(&store, &batch).await?;
+    let mut effects = frozen_notices(&store, batch.pool_id).await?;
+    let effect = effects.pop().ok_or("missing frozen notice")?;
+    drop(store);
+    let store = Arc::new(Mutex::new(Store::open(&config.database_path)?));
+    let registration = UnixListener::bind(&config.bridge_registration_socket)?;
+    let core = UnixListener::bind(&config.bridge_core_socket)?;
+    for path in [
+        &config.bridge_registration_socket,
+        &config.bridge_core_socket,
+    ] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    fs::write(&config.bridge_credential_file, "abcde1234567890")?;
+    fs::set_permissions(
+        &config.bridge_credential_file,
+        fs::Permissions::from_mode(0o600),
+    )?;
+    let peer = tokio::spawn(async move {
+        let _registration = registration;
+        let mut frames = Vec::new();
+        for _ in 0..2 {
+            let (mut socket, _) = core.accept().await.map_err(|_| Fault::Unavailable)?;
+            frames.push(integrations::read_frame(&mut socket).await?);
+            // Drop the ack, as if the daemon lost the connection after accepting custody.
+        }
+        Ok::<_, Fault>(frames)
+    });
+    for _ in 0..2 {
+        let id = effect.effect_id.clone();
+        let recovered = stored(&store, move |store| {
+            store.test_db().execute(
+                "UPDATE chat_notice_targets SET next_resolve_ms=0 WHERE effect=?1",
+                [&id],
+            )?;
+            state::due_notices(store, 1)?.pop().ok_or(Fault::Internal)
+        })
+        .await?;
+        assert_eq!(recovered.effect_id, effect.effect_id);
+        crate::runtime::effect(&store, &config, recovered, true).await?;
+    }
+    let frames = tokio::time::timeout(std::time::Duration::from_secs(3), peer).await???;
+    assert_eq!(frames[0], frames[1]);
+    let frame = bridge_sdk::bridge_protocol::decode_request(&frames[0])?;
+    assert!(
+        matches!(frame.operation, bridge_sdk::bridge_protocol::Operation::Publish(params)
+        if params.event_id == effect.effect_id && params == integrations::publication(&effect)?)
+    );
+    Ok(())
+}
+
+/// Close before the send boundary suppresses publication; close after it preserves status recovery.
+#[tokio::test]
+async fn chat_close_orders_with_first_send() -> Result<(), Box<dyn std::error::Error>> {
+    let (_root, _config, store) = fixture()?;
+    let batch = reserve(&store, None).await?;
+    install(&store, &batch).await?;
+    let pool_id = batch.pool_id;
+    let effects = frozen_notices(&store, pool_id.clone()).await?;
+    stored(&store, move |store| {
+        let first = &effects[0].effect_id;
+        let second = &effects[1].effect_id;
+        assert_eq!(
+            state::begin_notice_send(store, first)?,
+            state::NoticeSend::Publish { replay: false }
+        );
+        state::owner_call(
+            store,
+            "pool_close",
+            json!({"pool_id":pool_id,"expected_revision":2,"request_key":"close-before-send"}),
+        )?;
+        assert_eq!(
+            state::begin_notice_send(store, first)?,
+            state::NoticeSend::Status
+        );
+        assert_eq!(
+            state::begin_notice_send(store, second)?,
+            state::NoticeSend::Cancel
+        );
+        let ChatReply::Overview(overview) =
+            state::owner_call(store, "pool_get", json!({"pool_id":pool_id}))?
+        else {
+            return Err(Fault::Internal);
+        };
+        assert_eq!(overview.seat_count, 0);
+        assert_eq!(overview.roster.len(), 3);
+        assert!(overview.roster.iter().all(|row| row.retired));
+        Ok(())
+    })
+    .await?;
     Ok(())
 }
 
@@ -786,32 +1033,107 @@ async fn chat_migrates_pending_v18_notice() -> Result<(), Box<dyn std::error::Er
     let batch = reserve(&store, None).await?;
     install(&store, &batch).await?;
     let effect_id = stored(&store, move |store| {
-        state::owner_call(
+        let ChatReply::Existing(Reply::Receipt(receipt)) = state::owner_call(
             store,
             "pool_post",
             json!({"pool_id":batch.pool_id,"expected_revision":1,
-            "request_key":"legacy-notice","body":"pending"}),
-        )?;
+                "request_key":"legacy-notice","body":"pending"}),
+        )?
+        else {
+            return Err(Fault::Internal);
+        };
         let db = store.test_db();
         db.execute_batch(
-            "ALTER TABLE chat_notice_targets RENAME TO notice_v19;
+            "DROP TABLE chat_notice_targets; DELETE FROM effects;
             CREATE TABLE chat_notice_targets(effect TEXT PRIMARY KEY REFERENCES effects(id),
-                member TEXT NOT NULL REFERENCES members(id));
-            INSERT INTO chat_notice_targets SELECT effect,member FROM notice_v19;
-            DROP TABLE notice_v19;
-            PRAGMA user_version=18;",
+                member TEXT NOT NULL REFERENCES members(id)); PRAGMA user_version=18;",
         )?;
-        Ok(db.query_row(
-            "SELECT id FROM effects ORDER BY sequence LIMIT 1",
-            [],
-            |row| row.get::<_, String>(0),
-        )?)
+        let event_id = receipt.event.event_id;
+        let effect_id = "released-v18-effect".to_owned();
+        let member_id = &batch.jobs[0].member_id;
+        let effect = crate::domain::Effect {
+            effect_id: effect_id.clone(),
+            pool_id: batch.pool_id.clone(),
+            member_id: None,
+            state: "queued".into(),
+            work: crate::domain::Work::Deliver {
+                address: "pool-chat-unresolved".into(),
+                scope: format!("agent-pool:member:{member_id}"),
+                text: format!(
+                    "Pool {} event {event_id} (message).\npending",
+                    batch.pool_id
+                ),
+            },
+        };
+        let data = serde_json::to_string(&effect).map_err(|_| Fault::Internal)?;
+        db.execute(
+            "INSERT INTO effects(id,pool,state,data) VALUES(?1,?2,'queued',?3)",
+            rusqlite::params![effect_id, batch.pool_id, data],
+        )?;
+        db.execute(
+            "INSERT INTO chat_notice_targets(effect,member) VALUES(?1,?2)",
+            rusqlite::params![effect_id, member_id],
+        )?;
+        let mut frozen = effect.clone();
+        frozen.effect_id = "released-v18-frozen".into();
+        frozen.state = "custody".into();
+        let frozen_seat = &batch.jobs[1].member_id;
+        let crate::domain::Work::Deliver { scope, .. } = &mut frozen.work else {
+            return Err(Fault::Internal);
+        };
+        *scope = format!("agent-pool:member:{frozen_seat}");
+        let raw = serde_json::to_string(&frozen).map_err(|_| Fault::Internal)?;
+        db.execute(
+            "INSERT INTO effects(id,pool,state,data) VALUES(?1,?2,'custody',?3)",
+            rusqlite::params![frozen.effect_id, batch.pool_id, raw],
+        )?;
+        db.execute(
+            "INSERT INTO chat_notice_targets(effect,member) VALUES(?1,?2)",
+            rusqlite::params![frozen.effect_id, frozen_seat],
+        )?;
+        let crate::domain::Work::Deliver { address, .. } = &mut frozen.work else {
+            return Err(Fault::Internal);
+        };
+        *address = "test/codex/route/session".into();
+        let publication = serde_json::to_value(integrations::publication(&frozen)?)
+            .map_err(|_| Fault::Internal)?;
+        db.execute(
+            "INSERT INTO publications(effect,producer,params) VALUES(?1,'fixture',?2)",
+            rusqlite::params![frozen.effect_id, publication.to_string()],
+        )?;
+        Ok((effect_id, raw, publication))
     })
     .await?;
     drop(store);
+    let (effect_id, old_frozen, old_publication) = effect_id;
     let mut upgraded = Store::open(&config.database_path)?;
-    let claimed = upgraded.next_effect()?.ok_or("pending notice")?;
+    let claimed = state::due_notices(&mut upgraded, 1)?
+        .pop()
+        .ok_or("pending notice")?;
     assert_eq!(claimed.effect_id, effect_id);
+    let crate::domain::Work::Deliver { text, .. } = claimed.work else {
+        return Err("expected notice".into());
+    };
+    assert!(text.contains("Untrusted chat body: \"pending\""));
+    let event: i64 = upgraded.test_db().query_row(
+        "SELECT event FROM chat_notice_targets WHERE effect=?1",
+        [&effect_id],
+        |r| r.get(0),
+    )?;
+    assert!(event > 0);
+    let (frozen_event, frozen_raw): (i64, String) = upgraded.test_db().query_row(
+        "SELECT n.event,e.data FROM chat_notice_targets n JOIN effects e ON n.effect=e.id
+         WHERE n.effect='released-v18-frozen'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    assert_eq!((frozen_event, frozen_raw), (event, old_frozen));
+    assert!(matches!(state::notice(&upgraded,"released-v18-frozen")?,
+        state::Notice::Frozen(producer, value) if producer=="fixture" && value==old_publication));
+    assert_eq!(
+        state::begin_notice_send(&mut upgraded, "released-v18-frozen")?,
+        state::NoticeSend::Status
+    );
     assert!(matches!(
         state::notice(&upgraded, &effect_id)?,
         state::Notice::Unresolved { closing: false, .. }

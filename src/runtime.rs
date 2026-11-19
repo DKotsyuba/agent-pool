@@ -3654,6 +3654,87 @@ pub async fn serve(config_path: &Path) -> Result<(), Fault> {
     final_result
 }
 
+/// Drives one bounded Bridge chat notice without delaying the owner outbox.
+async fn chat_notice_effect(
+    store: &SharedStore,
+    config: &Config,
+    mut effect: Effect,
+    notice: crate::store::chat::Notice,
+) -> Result<(), Fault> {
+    use crate::store::chat::{self, NOTICE_UNDELIVERABLE, Notice, NoticeSend};
+    let (producer, value) = match notice {
+        Notice::Legacy => return Err(Fault::Internal),
+        Notice::Cancelled => return settle(store, effect.effect_id, "cancelled").await,
+        Notice::Undeliverable => {
+            return settle(store, effect.effect_id, NOTICE_UNDELIVERABLE).await;
+        }
+        Notice::Frozen(producer, value) => (producer, value),
+        Notice::Unresolved { binding, closing } => {
+            let resolution = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                crate::chat::notice_address(config, &binding),
+            )
+            .await
+            .ok()
+            .flatten();
+            let address = match resolution {
+                Some(crate::chat::NoticeAddress::Address(address)) => address,
+                Some(crate::chat::NoticeAddress::RestrictedRole) => {
+                    return settle(store, effect.effect_id, NOTICE_UNDELIVERABLE).await;
+                }
+                None if closing => {
+                    return settle(store, effect.effect_id, NOTICE_UNDELIVERABLE).await;
+                }
+                None => {
+                    return stored(store, move |store| {
+                        chat::defer_notice(store, &effect.effect_id)
+                    })
+                    .await;
+                }
+            };
+            let Work::Deliver {
+                address: target, ..
+            } = &mut effect.work
+            else {
+                return Err(Fault::Internal);
+            };
+            *target = address;
+            let params = integrations::publication(&effect)?;
+            let value = serde_json::to_value(params).map_err(|_| Fault::Internal)?;
+            let id = effect.effect_id.clone();
+            let producer = config.bridge_producer_id.clone();
+            match stored(store, move |store| {
+                store.freeze_publication(&id, &producer, &value)
+            })
+            .await
+            {
+                Err(Fault::Closed) => return settle(store, effect.effect_id, "cancelled").await,
+                result => result?,
+            }
+        }
+    };
+    if producer != config.bridge_producer_id {
+        return settle(store, effect.effect_id, "unknown").await;
+    }
+    let params = serde_json::from_value(value).map_err(|_| Fault::Internal)?;
+    let id = effect.effect_id.clone();
+    let plan = stored(store, move |store| chat::begin_notice_send(store, &id)).await?;
+    let reconcile = match plan {
+        NoticeSend::Cancel => return settle(store, effect.effect_id, "cancelled").await,
+        NoticeSend::Status => true,
+        NoticeSend::Publish { .. } => false,
+    };
+    let result = integrations::deliver_chat_notice(config.clone(), producer, params, reconcile)
+        .await
+        .unwrap_or("unknown");
+    let result = if matches!(plan, NoticeSend::Publish { replay: true }) && result == "refused" {
+        "unknown"
+    } else {
+        result
+    };
+    settle(store, effect.effect_id, result).await
+}
+
 /// Executes/reconciles one persisted effect and records its truthful terminal or unknown state.
 /// Provider awaits happen outside SQLite transactions; frozen parameters precede any publish write.
 pub(crate) async fn effect(
@@ -3662,7 +3743,6 @@ pub(crate) async fn effect(
     effect: Effect,
     reconcile: bool,
 ) -> Result<(), Fault> {
-    let mut effect = effect;
     let single_batch = effect.is_single_batch()?;
     let state = match &effect.work {
         Work::Deliver { .. } => {
@@ -3674,57 +3754,9 @@ pub(crate) async fn effect(
                 }
             }
             let id = effect.effect_id.clone();
-            use crate::store::chat::Notice;
             let notice = stored(store, move |store| crate::store::chat::notice(store, &id)).await?;
-            let reconcile = reconcile && !matches!(notice, Notice::Unresolved { .. });
-            match notice {
-                Notice::Legacy => (),
-                Notice::Cancelled => return settle(store, effect.effect_id, "cancelled").await,
-                Notice::Frozen(producer, value) => {
-                    if producer != config.bridge_producer_id {
-                        return settle(store, effect.effect_id, "unknown").await;
-                    }
-                    let params = serde_json::from_value(value).map_err(|_| Fault::Internal)?;
-                    let result = integrations::deliver(config.clone(), producer, params, reconcile)
-                        .await
-                        .unwrap_or("unknown");
-                    return settle(store, effect.effect_id, result).await;
-                }
-                Notice::Undeliverable => {
-                    return settle(
-                        store,
-                        effect.effect_id,
-                        crate::store::chat::NOTICE_UNDELIVERABLE,
-                    )
-                    .await;
-                }
-                Notice::Unresolved { binding, closing } => {
-                    let Ok(Some(address)) = tokio::time::timeout(
-                        std::time::Duration::from_secs(2),
-                        crate::chat::notice_address(config, &binding),
-                    )
-                    .await
-                    else {
-                        if closing {
-                            return settle(
-                                store,
-                                effect.effect_id,
-                                crate::store::chat::NOTICE_UNDELIVERABLE,
-                            )
-                            .await;
-                        }
-                        return stored(store, move |store| {
-                            crate::store::chat::defer_notice(store, &effect.effect_id)
-                        })
-                        .await;
-                    };
-                    if let Work::Deliver {
-                        address: target, ..
-                    } = &mut effect.work
-                    {
-                        *target = address;
-                    }
-                }
+            if !matches!(notice, crate::store::chat::Notice::Legacy) {
+                return chat_notice_effect(store, config, effect, notice).await;
             }
             let params = integrations::publication(&effect)?;
             let value = serde_json::to_value(params).map_err(|_| Fault::Internal)?;
@@ -4688,6 +4720,18 @@ async fn work(
                 return Ok(());
             }
             dispatch_effect(&store, &config, pending, true, &activity).await?;
+        }
+        // One separate batch per tick, with concurrent two-second Run lookups
+        // and one short Bridge exchange per item (no provider work under a Store lock).
+        let due = stored(&store, |store| crate::store::chat::due_notices(store, 4)).await?;
+        let mut notices = JoinSet::new();
+        for notice in due {
+            let store = Arc::clone(&store);
+            let config = config.clone();
+            notices.spawn(async move { effect(&store, &config, notice, false).await });
+        }
+        while let Some(result) = notices.join_next().await {
+            result.map_err(|_| Fault::Internal)??;
         }
         let targets = stored(&store, |store| store.observation_targets()).await?;
         for offset in 0..targets.len().min(20) {

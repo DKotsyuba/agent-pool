@@ -9,7 +9,7 @@ Structured acceptance. Read pool_get section=criteria.
 {% endif %}
 Seats {{ seat_count }} | ready={{ ready }} blocked={{ blocked }}
 {% for s in roster %}
-{{ s.seat_id }} | {{ s.profile|quote }} | admission={{ s.admitted }} joined={{ s.joined }} process={{ s.process }}{% if s.notice_undeliverable %} notice_undeliverable=true{% endif %}{% if s.agent_id %} run={{ s.agent_id }} sequence={{ s.sequence }}{% endif %} | {{ s.assignment }}
+{{ s.seat_id }} | {{ s.profile|quote }} | admission={{ s.admitted }}{% if s.retired %} retired=true{% endif %} joined={{ s.joined }} process={{ s.process }}{% if s.notice_undeliverable %} notice_undeliverable=true{% endif %}{% if s.agent_id %} run={{ s.agent_id }} sequence={{ s.sequence }}{% endif %} | {{ s.assignment }}
 {% endfor %}
 {% if proposal %}
 Proposal {{ proposal.id }} {{ proposal.state }} roster_key={{ proposal.roster_key }}

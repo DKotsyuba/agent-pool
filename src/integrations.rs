@@ -409,11 +409,43 @@ pub async fn deliver(
     params: PublishParams,
     reconcile: bool,
 ) -> Result<&'static str, Fault> {
+    deliver_with_budget(config, producer, params, reconcile, EXCHANGE_TIMEOUT, true).await
+}
+
+/// Publishes or reconciles one chat notice within the resident's short tick budget.
+/// Recovery relies on Bridge event-ID deduplication on the configured producer's
+/// socket and credential. Public Bridge publication has no store-ID fence.
+pub(crate) async fn deliver_chat_notice(
+    config: Config,
+    producer: String,
+    params: PublishParams,
+    reconcile: bool,
+) -> Result<&'static str, Fault> {
+    deliver_with_budget(
+        config,
+        producer,
+        params,
+        reconcile,
+        Duration::from_secs(1),
+        false,
+    )
+    .await
+}
+
+/// Runs one publication or exact status lookup with the caller's exchange budget.
+async fn deliver_with_budget(
+    config: Config,
+    producer: String,
+    params: PublishParams,
+    reconcile: bool,
+    timeout: Duration,
+    reconnect: bool,
+) -> Result<&'static str, Fault> {
     tokio::task::spawn_blocking(move || {
         if producer != config.bridge_producer_id {
             return Err(Fault::Unavailable);
         }
-        let client = bridge(&config, false)?;
+        let client = bridge_with_timeout(&config, false, timeout, reconnect)?;
         if reconcile {
             match client.status(
                 id(),
@@ -1797,6 +1829,8 @@ pub struct RunObservation {
     pub sequence: u64,
     /// Canonical sampled address when Run reported an observation.
     pub address: Option<String>,
+    /// Run explicitly forbids observation for this role.
+    pub restricted_role: bool,
     /// Finite safe state; unknown or unsupported never implies completion.
     pub runtime: String,
 }
@@ -1914,6 +1948,8 @@ pub(crate) async fn observe_run(
         .ok_or(Fault::Unavailable)?;
     Ok(RunObservation {
         address,
+        restricted_role: communication["state"] == "unsupported"
+            && communication["reason"] == "restricted_role",
         runtime,
         sequence,
     })

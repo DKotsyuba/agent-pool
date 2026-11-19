@@ -1196,8 +1196,14 @@ continues to route member-to-owner messages and agreement notices.
 Before freezing a member publication, Pool resolves the latest Run execution
 through `agent_integration` against the seat's recorded Run store. Unresolved
 addresses retry after 5 seconds, doubling to 60 seconds, within a ten-minute
-window. A close notice gets one lookup for each seat current at closure. Retired
-seats and ordinary notices for closed pools are skipped before publication.
+window. The indexed chat queue runs up to four concurrent resolutions per
+resident tick after owner and managed work. A close notice gets one lookup for
+each seat current at closure. A transaction authorizes the first Bridge send
+only while the exact seat is eligible, serialized with close and replacement.
+A send authorized before closure may already have reached Bridge. Such retired
+or closed notices use status reconciliation. Active notices with unconfirmed
+custody can replay frozen parameters and the same event ID for up to ten minutes
+against the configured Bridge producer. Confirmed custody uses status lookup.
 Unresolved notices settle as `notice_undeliverable`, exposed as a historical
 per-seat fact in the owner overview and observer. The journal remains readable
 by authorized callers throughout. Bridge custody or an observed address alone

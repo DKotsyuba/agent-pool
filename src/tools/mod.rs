@@ -373,6 +373,7 @@ pub fn present(reply: Result<Reply, Fault>, templates: &Templates) -> CallToolRe
             Fault::Closed=>"This pool was explicitly closed; global leader status remains.",
             Fault::Completed=>"This pool is completed: a formal completion record is committed and final (it was not explicitly closed). Reads, messages, explicit close and history release remain.",
             Fault::Invalid=>"Check documented fields, UTF-8 byte limits and exact identifiers.",
+            Fault::ChatResearchProfile=>"The research profile cannot receive pool chat notices. Use review.",
             Fault::Internal=>"No success is confirmed. Inspect state before repeating the same intent.",
         }}),
     };

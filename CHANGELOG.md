@@ -4,6 +4,10 @@
 
 ## 0.2.1
 
+- Chat start and replacement reject the Run `research` profile. Other roles Run reports as restricted settle their notices immediately.
+- Unconfirmed Bridge custody retries the exact frozen publication for up to ten minutes. Recovery assumes the configured producer socket and credential still address the same Bridge deployment. Bridge deduplicates by event ID. Confirmed custody and possible sends past the retry window use status reconciliation.
+- Chat notices run in an indexed, bounded queue. Close and replacement fence first sends. The owner overview shows recently retired seats and delivery results identify the exact target seat.
+
 ### Fixed
 
 - Chat member notices use Bridge for public messages, direct messages, vote requests, owner posts, completion and closure. Pool retries unresolved member addresses with bounded backoff and records `notice_undeliverable` for owners and observers when resolution fails. Notices are best effort and history remains durable.
