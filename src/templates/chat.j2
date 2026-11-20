@@ -41,8 +41,8 @@ Next after={{ next }}
 Owner binding saved.
 {% elif view == "launch" %}
 Pool {{ pool_id }} revision={{ revision }} admission={{ state }}
-{% if awaiting_owner %}
-Owner notices will be delivered once the session hook binds. You can also pass owner_address at pool_start.
+{% if owner_binding_hint %}
+{{ owner_binding_hint }}
 {% endif %}
 {% for s in seats %}
 Seat {{ s.id }} current={{ s.current }} joined={{ s.joined }}{% if s.agent_id %} run={{ s.agent_id }}{% endif +%}
