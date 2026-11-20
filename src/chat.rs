@@ -15,6 +15,8 @@ use std::path::Path;
 use tokio::{io::AsyncWriteExt, net::UnixStream};
 
 const VERSION: u32 = 1;
+/// Private owner ingress operation, kept outside the MCP tool catalog.
+pub(crate) const BIND_OWNER: &str = "pool_bind_owner_v1";
 const MEMBER_TOOLS: [&str; 7] = [
     "pool_join",
     "pool_get",
@@ -35,6 +37,37 @@ const OWNER_TOOLS: [&str; 8] = [
     "pool_completion_get",
 ];
 
+/// Native Bridge harness selected by a Crew hook.
+#[derive(Clone, Copy, Deserialize, Serialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum OwnerHarness {
+    /// Claude Code session.
+    ClaudeCode,
+    /// Codex thread.
+    Codex,
+}
+
+impl OwnerHarness {
+    /// Returns the Bridge harness component.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude-code",
+            Self::Codex => "codex",
+        }
+    }
+}
+
+/// Binding request with a native session ID and a resident-derived destination.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BindOwner {
+    /// Exact pool created by the owner start call.
+    pub pool_id: String,
+    /// Harness sending the native hook.
+    pub harness: OwnerHarness,
+    /// Opaque session ID provided by the harness.
+    pub session_id: String,
+}
 /// Owner start creates one ordered ordinary Run batch.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Start {
@@ -281,7 +314,9 @@ pub(crate) enum ChatReply {
         request_key: String,
         seats: Vec<LaunchSeat>,
         old_agent_id: Option<String>,
+        awaiting_owner: bool,
     },
+    OwnerBound,
     Agreement(Agreement),
     Legacy(Box<completion::Page>),
 }
@@ -378,13 +413,17 @@ fn text_reply(text: String, error: bool) -> CallToolResult {
     reply
 }
 
+/// Recovery hint for launch receipts when template rendering fails.
+const OWNER_BIND_HINT: &str = "\nOwner notices will be delivered once the session hook binds. You can also pass owner_address at pool_start.";
+
 fn present(result: Result<ChatReply, Fault>, templates: &Templates) -> CallToolResult {
     match result {
         Ok(ChatReply::Existing(reply)) => crate::tools::present(Ok(reply), templates),
         Ok(reply) => {
             let is_error = matches!(&reply, ChatReply::Launch { state, .. } if matches!(state.as_str(), "refused" | "cancelled" | "not_launched"));
             let text = templates.render("chat", &reply).unwrap_or_else(|_| match &reply {
-                ChatReply::Launch { pool_id, revision, state, request_key, old_agent_id, .. } => format!("Pool {pool_id} revision={revision} admission={state}. Request key {request_key}. Read pool_get for current admission. Prior Run ID: {old_agent_id:?}"),
+                ChatReply::Launch { pool_id, revision, state, request_key, old_agent_id, awaiting_owner, .. } => format!("Pool {pool_id} revision={revision} admission={state}. Request key {request_key}. Read pool_get for current admission. Prior Run ID: {old_agent_id:?}{}", if *awaiting_owner { OWNER_BIND_HINT } else { "" }),
+                ChatReply::OwnerBound => "Owner binding saved.".into(),
                 _ => "READ COMPLETED; presentation degraded. Repeat the read with the same cursor.".into(),
             });
             text_reply(text, is_error)
@@ -496,34 +535,53 @@ pub(crate) async fn owner_connection(
     store: SharedStore,
     templates: &Templates,
 ) -> Result<(), Fault> {
+    let uid = stream.peer_cred().map_err(|_| Fault::Unauthorized)?.uid();
     let bytes = tokio::time::timeout(EXCHANGE_TIMEOUT, integrations::read_frame(&mut stream))
         .await
         .map_err(|_| Fault::Unavailable)??;
     let result = match crate::managed_codec::parse_raw(&bytes).and_then(parse::<OwnerRequest>) {
-        Ok(request) if OWNER_TOOLS.contains(&request.tool.as_str()) => {
-            owner_call(request, &config, &store).await
+        Ok(request)
+            if OWNER_TOOLS.contains(&request.tool.as_str()) || request.tool == BIND_OWNER =>
+        {
+            owner_call(request, &config, &store, uid).await
         }
         _ => Err(Fault::Invalid),
     };
     write(&mut stream, &present(result, templates)).await
 }
 
+/// Executes a kernel-authenticated owner command, including private hook binding.
 async fn owner_call(
     request: OwnerRequest,
     config: &Config,
     store: &SharedStore,
+    uid: u32,
 ) -> Result<ChatReply, Fault> {
     let mut reply = match request.tool.as_str() {
+        BIND_OWNER => {
+            let input: BindOwner = parse(request.arguments)?;
+            let ingress = config.owner_ingress.as_ref().ok_or(Fault::Unavailable)?;
+            let address = ingress.address(uid, input.harness, &input.session_id)?;
+            stored(store, move |store| {
+                state::bind_owner(store, &input.pool_id, uid, &address)
+            })
+            .await?;
+            ChatReply::OwnerBound
+        }
         "pool_start" | "pool_replace" => {
+            let is_start = request.tool == "pool_start";
             let batch = stored(store, move |store| {
-                if request.tool == "pool_start" {
-                    state::start(store, parse(request.arguments)?)
+                if is_start {
+                    state::start(store, parse(request.arguments)?, uid)
                 } else {
                     state::replace(store, parse(request.arguments)?)
                 }
             })
             .await?;
-            stored(store, move |store| state::launch_read(store, &batch)).await?
+            stored(store, move |store| {
+                state::launch_read(store, &batch, is_start)
+            })
+            .await?
         }
         _ => {
             stored(store, move |store| {

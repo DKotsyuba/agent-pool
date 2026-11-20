@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.2.4
+
+Fix release, 2026-11-20.
+
+### Fixed
+
+- Crew PostToolUse hooks bind new chat pools to their starting Claude Code or Codex session through authenticated owner ingress. The first binding queues up to 20 pending owner notices, and an explicit owner address takes precedence.
+
 ## 0.2.3
 
 Fix release, 2026-11-19.

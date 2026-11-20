@@ -40,6 +40,7 @@ mod managed_session;
 mod managed_state;
 mod observer;
 mod observer_socket;
+mod owner_hook;
 mod peer_proof;
 mod response;
 #[allow(
@@ -72,6 +73,12 @@ struct Cli {
 /// Explicit service, MCP and family delivery commands.
 #[derive(Subcommand)]
 enum Commands {
+    /// Bind the calling harness session after a successful pool start.
+    Hook {
+        /// Selected harness hook.
+        #[command(subcommand)]
+        command: owner_hook::HookCommand,
+    },
     /// Read owner projections from an existing resident using one structured stdin request.
     Observe {
         /// Explicit absolute config containing the separately provisioned observer credential.
@@ -326,7 +333,22 @@ fn qualification() -> &'static str {
 /// Dispatches explicit CLI work; stdio shutdown affects only its frontend, never the resident.
 #[tokio::main]
 async fn main() -> ExitCode {
-    match Cli::parse().command {
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error)
+            if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("hook"))
+                && error.exit_code() != 0 =>
+        {
+            owner_hook::note("invalid hook arguments");
+            return ExitCode::SUCCESS;
+        }
+        Err(error) => error.exit(),
+    };
+    match cli.command {
+        Commands::Hook { command } => {
+            owner_hook::run(command).await;
+            ExitCode::SUCCESS
+        }
         Commands::Observe {
             config,
             socket,

@@ -52,7 +52,7 @@ pub struct Config {
     /// Optional group-accessible read-only observer endpoint; absence binds nothing.
     pub observer_socket: Option<ObserverSocket>,
     /// Optional group owner ingress for ordinary Run chats.
-    pub owner_ingress: Option<ObserverSocket>,
+    pub owner_ingress: Option<OwnerIngress>,
 }
 /// Linux-only group socket whose peers are admitted by kernel UID alone.
 #[derive(Clone, Deserialize)]
@@ -68,6 +68,88 @@ pub struct ObserverSocket {
     pub mode: u32,
     /// Allowlisted peer UIDs. Other connections are refused before their request is read.
     pub allowed_uids: Vec<u32>,
+}
+/// Owner socket and the Bridge destinations provisioned for its allowed peers.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerIngress {
+    /// Reuses the observer socket path, permissions and peer admission settings.
+    #[serde(flatten)]
+    pub socket: ObserverSocket,
+    /// Host ID from the local Bridge adapter configuration.
+    pub host_id: Option<String>,
+    /// Bridge native stores keyed by decimal owner UID.
+    #[serde(default)]
+    pub stores: std::collections::BTreeMap<String, OwnerStores>,
+}
+
+/// The independent Bridge store namespaces for an owner's two harnesses.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerStores {
+    /// Claude Code native store namespace.
+    #[serde(rename = "claude-code")]
+    pub claude_code: Option<String>,
+    /// Codex native store namespace.
+    pub codex: Option<String>,
+}
+
+impl OwnerIngress {
+    /// Checks socket settings and every provisioned route before serving.
+    fn validate(&self, socket_path: &Path) -> Result<(), Fault> {
+        self.socket.validate(socket_path)?;
+        for (uid, stores) in &self.stores {
+            let uid: u32 = uid.parse().map_err(|_| Fault::Invalid)?;
+            if !self.socket.allowed_uids.contains(&uid)
+                || (stores.claude_code.is_none() && stores.codex.is_none())
+            {
+                return Err(Fault::Invalid);
+            }
+            for harness in [
+                crate::chat::OwnerHarness::ClaudeCode,
+                crate::chat::OwnerHarness::Codex,
+            ] {
+                if stores.get(harness).is_some() {
+                    self.address(uid, harness, "validation")?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Builds a validated address from the authenticated owner UID and native session.
+    pub(crate) fn address(
+        &self,
+        uid: u32,
+        harness: crate::chat::OwnerHarness,
+        session: &str,
+    ) -> Result<String, Fault> {
+        use bridge_sdk::bridge_protocol::{HarnessName, NativeAddress};
+        let store = self
+            .stores
+            .get(&uid.to_string())
+            .and_then(|stores| stores.get(harness))
+            .ok_or(Fault::Invalid)?;
+        let address = NativeAddress {
+            host: self.host_id.clone().ok_or(Fault::Invalid)?,
+            harness: HarnessName::parse(harness.as_str()).map_err(|_| Fault::Invalid)?,
+            store: store.into(),
+            session: session.into(),
+        }
+        .canonical();
+        NativeAddress::parse(&address).map_err(|_| Fault::Invalid)?;
+        Ok(address)
+    }
+}
+
+impl OwnerStores {
+    /// Returns the namespace provisioned for the selected harness.
+    fn get(&self, harness: crate::chat::OwnerHarness) -> Option<&str> {
+        match harness {
+            crate::chat::OwnerHarness::ClaudeCode => self.claude_code.as_deref(),
+            crate::chat::OwnerHarness::Codex => self.codex.as_deref(),
+        }
+    }
 }
 /// Group read/write without other access.
 fn observer_socket_mode() -> u32 {
@@ -313,11 +395,11 @@ impl Config {
         }
         if let Some(owner) = &config.owner_ingress {
             owner.validate(&config.socket_path)?;
-            if owner.allowed_uids.contains(&config.expected_uid)
+            if owner.socket.allowed_uids.contains(&config.expected_uid)
                 || config
                     .observer_socket
                     .as_ref()
-                    .is_some_and(|observer| observer.path == owner.path)
+                    .is_some_and(|observer| observer.path == owner.socket.path)
             {
                 return Err(Fault::Invalid);
             }

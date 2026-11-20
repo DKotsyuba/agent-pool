@@ -3633,6 +3633,7 @@ pub async fn serve(config_path: &Path) -> Result<(), Fault> {
     let chat_templates = crate::chat::renderer()?;
     let (owner_listener, _owner_guard, owner_uids) = match &config.owner_ingress {
         Some(settings) => {
+            let settings = &settings.socket;
             let (listener, guard) = crate::observer_socket::listener(&config, settings)
                 .await
                 .inspect_err(|_| {

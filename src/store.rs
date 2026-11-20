@@ -1570,6 +1570,9 @@ PRAGMA user_version=5;")?;
         if version < 19 {
             chat::migrate_notices(&db)?;
         }
+        if version < 20 {
+            chat::migrate_owner_binding(&db)?;
+        }
         if version < crate::completion::SCHEMA_VERSION {
             db.execute_batch("COMMIT;")?;
         }
