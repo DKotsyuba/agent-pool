@@ -130,6 +130,17 @@ pub(super) fn migrate_owner_binding(db: &Connection) -> Result<(), Fault> {
     Ok(())
 }
 
+/// Reads the authenticated starter proof, if the pool was started under schema v20.
+fn starter_uid(db: &Connection, pool_id: &str) -> Result<Option<u32>, Fault> {
+    Ok(db
+        .query_row(
+            "SELECT uid FROM chat_starters WHERE pool=?1",
+            [pool_id],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
 /// Binds once and enqueues recent owner notices in the same write transaction.
 pub(crate) fn bind_owner(
     store: &mut Store,
@@ -141,14 +152,7 @@ pub(crate) fn bind_owner(
     let tx = store
         .db
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let starter: Option<u32> = tx
-        .query_row(
-            "SELECT uid FROM chat_starters WHERE pool=?1",
-            [pool_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if starter != Some(uid) {
+    if starter_uid(&tx, pool_id)? != Some(uid) {
         return Err(Fault::Unauthorized);
     }
     if let Some(previous) = owner_address(&tx, pool_id)? {
@@ -1027,6 +1031,7 @@ pub(crate) fn launch_read(
     store: &Store,
     batch: &ChatBatch,
     is_start: bool,
+    routed_uid: Option<u32>,
 ) -> Result<ChatReply, Fault> {
     let batch = batch_by_id(&store.db, &batch.id)?;
     let (pool, _) = pool(&store.db, &batch.pool_id)?;
@@ -1047,7 +1052,16 @@ pub(crate) fn launch_read(
         request_key: batch.request_key,
         seats,
         old_agent_id: batch.old_agent_id,
-        awaiting_owner: is_start && owner_address(&store.db, &pool.pool_id)?.is_none(),
+        owner_binding_hint: if is_start && owner_address(&store.db, &pool.pool_id)?.is_none() {
+            let starter = starter_uid(&store.db, &pool.pool_id)?;
+            Some(if starter.is_some() && starter == routed_uid {
+                OWNER_BIND_HINT
+            } else {
+                OWNER_BIND_UNAVAILABLE
+            })
+        } else {
+            None
+        },
     })
 }
 

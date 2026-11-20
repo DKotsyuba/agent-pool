@@ -98,9 +98,10 @@ impl OwnerIngress {
     /// Checks socket settings and every provisioned route before serving.
     fn validate(&self, socket_path: &Path) -> Result<(), Fault> {
         self.socket.validate(socket_path)?;
-        for (uid, stores) in &self.stores {
-            let uid: u32 = uid.parse().map_err(|_| Fault::Invalid)?;
-            if !self.socket.allowed_uids.contains(&uid)
+        for (key, stores) in &self.stores {
+            let uid: u32 = key.parse().map_err(|_| Fault::Invalid)?;
+            if *key != uid.to_string()
+                || !self.socket.allowed_uids.contains(&uid)
                 || (stores.claude_code.is_none() && stores.codex.is_none())
             {
                 return Err(Fault::Invalid);
@@ -115,6 +116,11 @@ impl OwnerIngress {
             }
         }
         Ok(())
+    }
+
+    /// Reports whether this UID has a configured route for at least one harness.
+    pub(crate) fn has_route(&self, uid: u32) -> bool {
+        self.stores.contains_key(&uid.to_string())
     }
 
     /// Builds a validated address from the authenticated owner UID and native session.
@@ -659,6 +665,31 @@ pub(crate) fn shared_run_socket(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Route keys must use the same canonical decimal spelling as the authenticated UID.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owner_ingress_requires_canonical_uid_keys() -> Result<(), Box<dyn std::error::Error>> {
+        for (key, valid) in [("1002", true), ("01002", false), ("+1002", false)] {
+            let settings: OwnerIngress = toml::from_str(&format!(
+                r#"
+                path = "/run/agent-pool/owner.sock"
+                gid = 1000
+                allowed_uids = [1002]
+                host_id = "test"
+                [stores]
+                "{key}" = {{ codex = "owner" }}
+            "#
+            ))?;
+            assert_eq!(
+                settings
+                    .validate(Path::new("/run/agent-pool/pool.sock"))
+                    .is_ok(),
+                valid
+            );
+        }
+        Ok(())
+    }
 
     /// Credential files and parents must be private; wrong ownership, modes and symlinks are refused.
     #[test]

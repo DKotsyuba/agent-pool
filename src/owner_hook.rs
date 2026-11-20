@@ -115,7 +115,13 @@ fn decode(bytes: &[u8], harness: OwnerHarness) -> Result<BindOwner, Fault> {
 
 /// Inspects known MCP envelope fields and the launch receipt header, leaving other text opaque.
 fn receipt_ids(value: &Value, ids: &mut BTreeSet<String>, depth: usize) -> Result<(), Fault> {
-    if depth > 12 || value["isError"] == true || value["is_error"] == true {
+    if depth > 12
+        || ["isError", "is_error"].iter().any(|key| {
+            value
+                .get(*key)
+                .is_some_and(|flag| flag.as_bool() != Some(false))
+        })
+    {
         return Err(Fault::Invalid);
     }
     match value {
@@ -141,7 +147,8 @@ fn receipt_ids(value: &Value, ids: &mut BTreeSet<String>, depth: usize) -> Resul
                 .and_then(|text| text.split_once(" revision="))
             {
                 insert_id(id, ids)?;
-            } else if let Ok(decoded) = serde_json::from_str::<Value>(text) {
+            } else if serde_json::from_str::<&serde_json::value::RawValue>(text).is_ok() {
+                let decoded = crate::managed_codec::parse_raw(text.as_bytes())?;
                 receipt_ids(&decoded, ids, depth + 1)?;
             }
         }
@@ -217,6 +224,12 @@ mod tests {
             ));
         };
         event["tool_response"]["isError"] = json!(true);
+        invalid(&event);
+        event["tool_response"]["isError"] = json!("false");
+        invalid(&event);
+        event["tool_response"] = json!(format!(
+            r#"{{"pool_id":"{pool}","isError":true,"isError":false}}"#
+        ));
         invalid(&event);
         event["tool_response"] = json!([{"pool_id":pool},{"pool_id":crate::domain::id()}]);
         invalid(&event);

@@ -248,3 +248,6 @@ The resident queues the latest 20 owner messages and completion notices
 recorded before the first bind. Older notices remain in pool history.
 Schema v19 and earlier did not record the starter UID. Existing unbound pools
 remain readable and their historical notices remain in the journal.
+
+When upgrading to 0.2.4, keep a pre-upgrade database backup if you may need
+to roll back. Version 0.2.3 refuses to open a store migrated to schema v20.

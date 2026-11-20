@@ -208,7 +208,7 @@ async fn chat_uncertain_start_reuses_saved_receipt() -> Result<(), Box<dyn std::
                 request_key: "start".into(),
                 seats: Vec::new(),
                 old_agent_id: None,
-                awaiting_owner: true,
+                owner_binding_hint: Some(OWNER_BIND_HINT),
             }),
             templates,
         );
@@ -1494,8 +1494,10 @@ async fn chat_closed_batch_records_late_receipt() -> Result<(), Box<dyn std::err
     .await?;
     reconcile(&config, &store, &mut String::new()).await?;
     mock.await?.map_err(|error| error.to_string())?;
-    let ChatReply::Launch { state, seats, .. } =
-        stored(&store, move |store| state::launch_read(store, &batch, true)).await?
+    let ChatReply::Launch { state, seats, .. } = stored(&store, move |store| {
+        state::launch_read(store, &batch, true, None)
+    })
+    .await?
     else {
         return Err("launch".into());
     };
@@ -1524,7 +1526,7 @@ async fn chat_closed_never_sent_batch_settles_immediately() -> Result<(), Box<dy
     .await?;
     stored(&store, move |store| {
         assert!(state::next_batch(store, "")?.is_none());
-        let ChatReply::Launch { state, seats, .. } = state::launch_read(store, &batch, true)?
+        let ChatReply::Launch { state, seats, .. } = state::launch_read(store, &batch, true, None)?
         else {
             return Err(Fault::Internal);
         };
@@ -1761,5 +1763,113 @@ async fn check_owner_binding(
         assert!(deliveries[1].1.contains(&completion));
         Ok(())
     }).await?;
+    Ok(())
+}
+
+/// Migrates a populated v19 store and replays a new pool's persisted backlog after restart.
+#[tokio::test]
+async fn chat_migrates_v19_and_replays_owner_backlog() -> Result<(), Box<dyn std::error::Error>> {
+    let (_root, mut config, store) = fixture()?;
+    let old = reserve(&store, None).await?;
+    stored(&store, |store| {
+        store
+            .test_db()
+            .execute_batch("DROP TABLE chat_starters; PRAGMA user_version=19;")?;
+        Ok(())
+    })
+    .await?;
+    drop(store);
+
+    config.owner_ingress = Some(toml::from_str(
+        r#"
+        path = "/run/agent-pool/owner.sock"
+        gid = 1000
+        allowed_uids = [1002]
+        host_id = "test"
+        [stores]
+        1002 = { codex = "owner" }
+    "#,
+    )?);
+    let store = Arc::new(Mutex::new(Store::open(&config.database_path)?));
+    let start = |arguments| OwnerRequest {
+        tool: "pool_start".into(),
+        arguments,
+    };
+    let ChatReply::Launch {
+        pool_id,
+        owner_binding_hint,
+        ..
+    } = owner_call(start(input(None)), &config, &store).await?
+    else {
+        return Err("legacy start receipt".into());
+    };
+    assert_eq!(pool_id, old.pool_id);
+    assert_eq!(owner_binding_hint, Some(OWNER_BIND_UNAVAILABLE));
+
+    let mut args = input(None);
+    args["request_key"] = json!("new-start");
+    let start_args = args.clone();
+    let batch = stored(&store, move |store| {
+        let version: i64 = store
+            .test_db()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        assert_eq!(version, 20);
+        state::start(store, parse(args)?, 1002)
+    })
+    .await?;
+    let mut no_routes = config.clone();
+    no_routes.owner_ingress = None;
+    for (settings, expected) in [
+        (&no_routes, OWNER_BIND_UNAVAILABLE),
+        (&config, OWNER_BIND_HINT),
+    ] {
+        let reply = owner_call(start(start_args.clone()), settings, &store).await?;
+        let result = serde_json::to_value(present(Ok(reply), renderer()?))?;
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains(expected))
+        );
+    }
+    install(&store, &batch).await?;
+    let templates = renderer()?;
+    for (tool, key, args) in [
+        ("pool_join", "join", json!({"expected_revision":1})),
+        (
+            "pool_notify_owner",
+            "notice",
+            json!({"expected_revision":2,"body":"persisted backlog"}),
+        ),
+    ] {
+        let call = member_call(&batch, 0, tool, key, args);
+        assert!(ok(&private_call(call, &config, &store, templates).await));
+    }
+    drop(store);
+
+    let store = Arc::new(Mutex::new(Store::open(&config.database_path)?));
+    let bind = |pool_id: &str| OwnerRequest {
+        tool: BIND_OWNER.into(),
+        arguments: json!({"pool_id":pool_id,"harness":"codex","session_id":"session"}),
+    };
+    assert!(matches!(
+        owner_call(bind(&old.pool_id), &config, &store).await,
+        Err(Fault::Unauthorized)
+    ));
+    assert!(matches!(
+        owner_call(bind(&batch.pool_id), &config, &store).await?,
+        ChatReply::OwnerBound
+    ));
+    stored(&store, move |store| {
+        let (address, text): (String, String) = store.test_db().query_row(
+            "SELECT json_extract(data,'$.work.address'),json_extract(data,'$.work.text')
+             FROM effects WHERE pool=?1 AND json_extract(data,'$.work.scope')='owner:'||?1",
+            [batch.pool_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(address, "test/codex/owner/session");
+        assert!(text.contains("persisted backlog"));
+        Ok(())
+    })
+    .await?;
     Ok(())
 }

@@ -314,7 +314,7 @@ pub(crate) enum ChatReply {
         request_key: String,
         seats: Vec<LaunchSeat>,
         old_agent_id: Option<String>,
-        awaiting_owner: bool,
+        owner_binding_hint: Option<&'static str>,
     },
     OwnerBound,
     Agreement(Agreement),
@@ -414,7 +414,9 @@ fn text_reply(text: String, error: bool) -> CallToolResult {
 }
 
 /// Recovery hint for launch receipts when template rendering fails.
-const OWNER_BIND_HINT: &str = "\nOwner notices will be delivered once the session hook binds. You can also pass owner_address at pool_start.";
+pub(crate) const OWNER_BIND_HINT: &str = "Owner notices will be delivered once the session hook binds. You can also pass owner_address at pool_start.";
+/// Journal and completion recovery when a launch cannot bind through owner ingress.
+pub(crate) const OWNER_BIND_UNAVAILABLE: &str = "Owner session binding is unavailable. Read pool_get section=history for notices and pool_completion_get for the result.";
 
 fn present(result: Result<ChatReply, Fault>, templates: &Templates) -> CallToolResult {
     match result {
@@ -422,7 +424,7 @@ fn present(result: Result<ChatReply, Fault>, templates: &Templates) -> CallToolR
         Ok(reply) => {
             let is_error = matches!(&reply, ChatReply::Launch { state, .. } if matches!(state.as_str(), "refused" | "cancelled" | "not_launched"));
             let text = templates.render("chat", &reply).unwrap_or_else(|_| match &reply {
-                ChatReply::Launch { pool_id, revision, state, request_key, old_agent_id, awaiting_owner, .. } => format!("Pool {pool_id} revision={revision} admission={state}. Request key {request_key}. Read pool_get for current admission. Prior Run ID: {old_agent_id:?}{}", if *awaiting_owner { OWNER_BIND_HINT } else { "" }),
+                ChatReply::Launch { pool_id, revision, state, request_key, old_agent_id, owner_binding_hint, .. } => format!("Pool {pool_id} revision={revision} admission={state}. Request key {request_key}. Read pool_get for current admission. Prior Run ID: {old_agent_id:?}{}", owner_binding_hint.map_or_else(String::new, |hint| format!("\n{hint}"))),
                 ChatReply::OwnerBound => "Owner binding saved.".into(),
                 _ => "READ COMPLETED; presentation degraded. Repeat the read with the same cursor.".into(),
             });
@@ -570,6 +572,11 @@ async fn owner_call(
         }
         "pool_start" | "pool_replace" => {
             let is_start = request.tool == "pool_start";
+            let routed_uid = config
+                .owner_ingress
+                .as_ref()
+                .filter(|ingress| ingress.has_route(uid))
+                .map(|_| uid);
             let batch = stored(store, move |store| {
                 if is_start {
                     state::start(store, parse(request.arguments)?, uid)
@@ -579,7 +586,7 @@ async fn owner_call(
             })
             .await?;
             stored(store, move |store| {
-                state::launch_read(store, &batch, is_start)
+                state::launch_read(store, &batch, is_start, routed_uid)
             })
             .await?
         }
