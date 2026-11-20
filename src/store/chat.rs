@@ -10,6 +10,8 @@ use serde_json::{Value, json};
 /// Terminal outcome for a member notice whose Bridge address could not be resolved.
 pub(crate) const NOTICE_UNDELIVERABLE: &str = "notice_undeliverable";
 
+const OWNER_NOTICE_BACKLOG: i64 = 20;
+
 const OWNER: &str = "pool-chat-v1-owner";
 
 /// Installs the chat discriminator, immutable batch inputs and agreement ledger.
@@ -118,6 +120,99 @@ pub(super) fn migrate_notices(db: &Connection) -> Result<(), Fault> {
     inventory_revision_triggers(db, &["chat_notice_targets"])
 }
 
+/// Records the authenticated starter for new chats. Older chats have no starter proof.
+pub(super) fn migrate_owner_binding(db: &Connection) -> Result<(), Fault> {
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS chat_starters(
+            pool TEXT PRIMARY KEY REFERENCES chat_pools(pool), uid INTEGER NOT NULL
+        ); PRAGMA user_version=20;",
+    )?;
+    Ok(())
+}
+
+/// Binds once and enqueues recent owner notices in the same write transaction.
+pub(crate) fn bind_owner(
+    store: &mut Store,
+    pool_id: &str,
+    uid: u32,
+    address: &str,
+) -> Result<(), Fault> {
+    identifier(pool_id)?;
+    let tx = store
+        .db
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let starter: Option<u32> = tx
+        .query_row(
+            "SELECT uid FROM chat_starters WHERE pool=?1",
+            [pool_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if starter != Some(uid) {
+        return Err(Fault::Unauthorized);
+    }
+    if let Some(previous) = owner_address(&tx, pool_id)? {
+        return if previous == address {
+            Ok(())
+        } else {
+            Err(Fault::Conflict)
+        };
+    }
+    tx.execute(
+        "UPDATE chat_pools SET owner_address=?2 WHERE pool=?1",
+        params![pool_id, address],
+    )?;
+    {
+        let mut stmt = tx.prepare(
+            "SELECT id,data FROM (
+                SELECT id,data FROM events WHERE pool=?1
+                AND json_extract(data,'$.kind') IN ('owner_message','pool_completed')
+                ORDER BY id DESC LIMIT ?2
+            ) ORDER BY id",
+        )?;
+        let mut rows = stmt.query(params![pool_id, OWNER_NOTICE_BACKLOG])?;
+        while let Some(row) = rows.next()? {
+            let mut event: Event = decode(&row.get::<_, String>(1)?)?;
+            event.event_id = u64::try_from(row.get::<_, i64>(0)?).map_err(|_| Fault::Internal)?;
+            if event.kind == "owner_message" {
+                queue_owner_notice(&tx, pool_id, address, &event, None)?;
+            } else {
+                let record = agreement(&tx, pool_id, None)?.ok_or(Fault::Internal)?;
+                queue_owner_notice(&tx, pool_id, address, &event, Some(&record.completion_id))?;
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Uses the same delivery content for live and replayed owner notices.
+fn queue_owner_notice(
+    db: &Connection,
+    pool_id: &str,
+    address: &str,
+    event: &Event,
+    completion: Option<&str>,
+) -> Result<(), Fault> {
+    let text = match completion {
+        Some(id) => format!(
+            "Pool {pool_id} completed. Agreement {id}. Read pool_completion_get for the result."
+        ),
+        None => format!(
+            "Pool {pool_id} event {} ({}).\n{}",
+            event.event_id, event.kind, event.body
+        ),
+    };
+    queue_delivery(
+        db,
+        pool_id,
+        None,
+        address,
+        &format!("owner:{pool_id}"),
+        text,
+        Some(event.event_id),
+    )
+}
 /// Checks the mode without exposing routing metadata.
 pub(crate) fn enabled(db: &Connection, pool: &str) -> Result<bool, Fault> {
     Ok(db.query_row(
@@ -198,17 +293,12 @@ pub(super) fn commit_agreement(
         params![record.pool_id, record.completion_id, encode(&record)?],
     )?;
     if let Some(address) = owner_address(db, &record.pool_id)? {
-        queue_delivery(
+        queue_owner_notice(
             db,
             &record.pool_id,
-            None,
             &address,
-            &format!("owner:{}", record.pool_id),
-            format!(
-                "Pool {} completed. Agreement {}. Read pool_completion_get for the result.",
-                record.pool_id, record.completion_id
-            ),
-            Some(event.event_id),
+            &event,
+            Some(&record.completion_id),
         )?;
     }
     Ok(record.completion_id)
@@ -353,7 +443,7 @@ fn save_batch(
 }
 
 /// A single SQL transaction reserves the pool, ordered seats and exact Run batch.
-pub(crate) fn start(store: &mut Store, input: Start) -> Result<ChatBatch, Fault> {
+pub(crate) fn start(store: &mut Store, input: Start, starter_uid: u32) -> Result<ChatBatch, Fault> {
     let command = Command::Create(input.create.clone());
     command.validate()?;
     if !(1..=MAX_MEMBERS).contains(&input.members.len()) {
@@ -378,6 +468,10 @@ pub(crate) fn start(store: &mut Store, input: Start) -> Result<ChatBatch, Fault>
     tx.execute(
         "INSERT INTO chat_pools(pool,owner_address) VALUES (?1,?2)",
         params![pool.pool_id, input.owner_address],
+    )?;
+    tx.execute(
+        "INSERT INTO chat_starters(pool,uid) VALUES (?1,?2)",
+        params![pool.pool_id, starter_uid],
     )?;
     let jobs = input
         .members
@@ -929,7 +1023,11 @@ pub(crate) fn get(db: &Connection, input: GetPool, seat: Option<&str>) -> Result
 }
 
 /// Builds an up-to-date launch summary for the caller, including any prior lineage to cancel.
-pub(crate) fn launch_read(store: &Store, batch: &ChatBatch) -> Result<ChatReply, Fault> {
+pub(crate) fn launch_read(
+    store: &Store,
+    batch: &ChatBatch,
+    is_start: bool,
+) -> Result<ChatReply, Fault> {
     let batch = batch_by_id(&store.db, &batch.id)?;
     let (pool, _) = pool(&store.db, &batch.pool_id)?;
     let mut seats = Vec::with_capacity(batch.jobs.len());
@@ -949,6 +1047,7 @@ pub(crate) fn launch_read(store: &Store, batch: &ChatBatch) -> Result<ChatReply,
         request_key: batch.request_key,
         seats,
         old_agent_id: batch.old_agent_id,
+        awaiting_owner: is_start && owner_address(&store.db, &pool.pool_id)?.is_none(),
     })
 }
 
@@ -1030,18 +1129,7 @@ pub(super) fn queue_chat_notices(
 ) -> Result<(), Fault> {
     if event.kind == "owner_message" {
         if let Some(address) = owner_address {
-            queue_delivery(
-                db,
-                &pool.pool_id,
-                None,
-                address,
-                &format!("owner:{}", pool.pool_id),
-                format!(
-                    "Pool {} event {} ({}).\n{}",
-                    pool.pool_id, event.event_id, event.kind, event.body
-                ),
-                Some(event.event_id),
-            )?;
+            queue_owner_notice(db, &pool.pool_id, address, event, None)?;
         }
         return Ok(());
     }

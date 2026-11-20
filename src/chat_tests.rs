@@ -11,6 +11,15 @@ use tokio::{io::AsyncReadExt, net::UnixListener, sync::Semaphore};
 
 const RUN_STORE: &str = "store_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
+/// Calls the resident owner dispatcher as the test owner UID.
+async fn owner_call(
+    request: OwnerRequest,
+    config: &Config,
+    store: &SharedStore,
+) -> Result<ChatReply, Fault> {
+    super::owner_call(request, config, store, 1002).await
+}
+
 fn fixture() -> Result<(tempfile::TempDir, Config, SharedStore), Box<dyn std::error::Error>> {
     let root = tempfile::tempdir()?;
     let path = root.path();
@@ -191,20 +200,24 @@ async fn chat_uncertain_start_reuses_saved_receipt() -> Result<(), Box<dyn std::
             return Err("launch".into());
         };
         assert_eq!(state, "pending");
-        assert_eq!(
-            present(
-                Ok(ChatReply::Launch {
-                    pool_id: pool_id.clone(),
-                    revision: 1,
-                    state: state.clone(),
-                    request_key: "start".into(),
-                    seats: Vec::new(),
-                    old_agent_id: None
-                }),
-                templates
-            )
-            .is_error,
-            Some(false)
+        let result = present(
+            Ok(ChatReply::Launch {
+                pool_id: pool_id.clone(),
+                revision: 1,
+                state: state.clone(),
+                request_key: "start".into(),
+                seats: Vec::new(),
+                old_agent_id: None,
+                awaiting_owner: true,
+            }),
+            templates,
+        );
+        assert_eq!(result.is_error, Some(false));
+        let result = serde_json::to_value(result)?;
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("once the session hook binds"))
         );
         launched.push((pool_id, seats));
     }
@@ -260,7 +273,7 @@ async fn chat_uncertain_start_reuses_saved_receipt() -> Result<(), Box<dyn std::
 async fn reserve(store: &SharedStore, address: Option<&str>) -> Result<state::ChatBatch, Fault> {
     let args = input(address);
     stored(store, move |store| {
-        let batch = state::start(store, parse(args)?)?;
+        let batch = state::start(store, parse(args)?, 1002)?;
         Ok(batch)
     })
     .await
@@ -306,7 +319,7 @@ async fn complete_with_address(
     if structured {
         args["acceptance"] = json!([{"id":"tested","text":"Result is tested"}]);
     }
-    let batch = stored(&store, move |store| state::start(store, parse(args)?)).await?;
+    let batch = stored(&store, move |store| state::start(store, parse(args)?, 1002)).await?;
     let templates = renderer()?;
     let call = |value| private_call(value, &config, &store, templates);
     let catalog =
@@ -539,6 +552,14 @@ async fn complete_with_address(
         assert_eq!(count, if address.is_some() { 2 } else { 0 });
         Ok(db.query_row("SELECT id FROM chat_agreements WHERE pool=?1",[pid],|r|r.get::<_,String>(0))?)
     }).await?;
+    check_owner_binding(
+        config.clone(),
+        &store,
+        &batch.pool_id,
+        address,
+        &completion_id,
+    )
+    .await?;
     let pid = batch.pool_id.clone();
     let proposal_id = proposal.clone();
     stored(&store, move |store| {
@@ -1148,12 +1169,12 @@ async fn chat_owner_pages_retired_seats_and_failures() -> Result<(), Box<dyn std
     let (_root, _config, store) = fixture()?;
     let mut args = input(None);
     args["members"] = json!(vec![spec("review"); 8]);
-    let batch = stored(&store, move |store| state::start(store, parse(args)?)).await?;
+    let batch = stored(&store, move |store| state::start(store, parse(args)?, 1002)).await?;
     install(&store, &batch).await?;
     let mut walk = input(None);
     walk["request_key"] = json!("interleaved-walk");
     walk["members"] = json!(vec![spec("review"); 6]);
-    let walk = stored(&store, move |store| state::start(store, parse(walk)?)).await?;
+    let walk = stored(&store, move |store| state::start(store, parse(walk)?, 1002)).await?;
     install(&store, &walk).await?;
     let templates = renderer()?;
     stored(&store, move |store| {
@@ -1265,7 +1286,7 @@ async fn chat_migrates_v17_without_changing_old_pool() -> Result<(), Box<dyn std
         let actor = crate::domain::Actor::verified("legacy owner".into(),"legacy","owner")?;
         let command = Command::Create(Create {request_key:"legacy-create".into(),name:"Legacy".into(),purpose:"Old purpose".into(),acceptance:None});
         let Reply::Receipt(old) = store.execute(&actor,&command)? else { return Err(Fault::Internal); };
-        store.test_db().execute_batch("DROP TABLE chat_notice_targets; DROP TABLE chat_agreements; DROP TABLE chat_batches; DROP TABLE chat_pools; PRAGMA user_version=17;")?;
+        store.test_db().execute_batch("DROP TABLE chat_starters; DROP TABLE chat_notice_targets; DROP TABLE chat_agreements; DROP TABLE chat_batches; DROP TABLE chat_pools; PRAGMA user_version=17;")?;
         Ok(old.pool_id)
     }).await?;
     drop(store);
@@ -1274,7 +1295,7 @@ async fn chat_migrates_v17_without_changing_old_pool() -> Result<(), Box<dyn std
         upgraded
             .test_db()
             .query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))?,
-        19
+        20
     );
     let ChatReply::Overview(old) =
         state::owner_call(&mut upgraded, "pool_get", json!({"pool_id":pid}))?
@@ -1283,7 +1304,7 @@ async fn chat_migrates_v17_without_changing_old_pool() -> Result<(), Box<dyn std
     };
     assert_eq!(old.name, "Legacy");
     assert!(old.purpose.contains("Old purpose"));
-    let new = state::start(&mut upgraded, parse(input(None))?)?;
+    let new = state::start(&mut upgraded, parse(input(None))?, 1002)?;
     assert_ne!(new.pool_id, pid);
     Ok(())
 }
@@ -1474,7 +1495,7 @@ async fn chat_closed_batch_records_late_receipt() -> Result<(), Box<dyn std::err
     reconcile(&config, &store, &mut String::new()).await?;
     mock.await?.map_err(|error| error.to_string())?;
     let ChatReply::Launch { state, seats, .. } =
-        stored(&store, move |store| state::launch_read(store, &batch)).await?
+        stored(&store, move |store| state::launch_read(store, &batch, true)).await?
     else {
         return Err("launch".into());
     };
@@ -1503,7 +1524,8 @@ async fn chat_closed_never_sent_batch_settles_immediately() -> Result<(), Box<dy
     .await?;
     stored(&store, move |store| {
         assert!(state::next_batch(store, "")?.is_none());
-        let ChatReply::Launch { state, seats, .. } = state::launch_read(store, &batch)? else {
+        let ChatReply::Launch { state, seats, .. } = state::launch_read(store, &batch, true)?
+        else {
             return Err(Fault::Internal);
         };
         assert_eq!(state, "not_launched");
@@ -1527,7 +1549,7 @@ async fn chat_invalid_spec_settles_refused() -> Result<(), Box<dyn std::error::E
     fs::set_permissions(socket, fs::Permissions::from_mode(0o600))?;
     let mut args = input(None);
     args["members"][0]["spec"]["model"] = json!("invalid-run-model");
-    let batch = stored(&store, move |store| state::start(store, parse(args)?)).await?;
+    let batch = stored(&store, move |store| state::start(store, parse(args)?, 1002)).await?;
     let mock = tokio::spawn(async move {
         for method in ["capabilities", "start_batch"] {
             let (mut stream, _) = listener.accept().await?;
@@ -1633,7 +1655,7 @@ async fn chat_sole_proposer_completes() -> Result<(), Box<dyn std::error::Error>
     let mut args = input(None);
     args["members"] = json!([spec("implement")]);
     args["acceptance"] = json!([{"id":"tested","text":"Result is tested"}]);
-    let batch = stored(&store, move |store| state::start(store, parse(args)?)).await?;
+    let batch = stored(&store, move |store| state::start(store, parse(args)?, 1002)).await?;
     install(&store, &batch).await?;
     let templates = renderer()?;
     let call = |value| private_call(value, &config, &store, templates);
@@ -1675,6 +1697,68 @@ async fn chat_sole_proposer_completes() -> Result<(), Box<dyn std::error::Error>
         assert!(body.ends_with("proposer"));
         let count: i64 = db.query_row("SELECT count(*) FROM events WHERE pool=?1 AND json_extract(data,'$.revision')=3", [&pid], |row| row.get(0))?;
         assert_eq!(count, 4);
+        Ok(())
+    }).await?;
+    Ok(())
+}
+
+/// Exercises UID fencing, explicit address precedence and replay after a real agreement.
+async fn check_owner_binding(
+    mut config: Config,
+    store: &SharedStore,
+    pool_id: &str,
+    explicit: Option<&str>,
+    completion: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    config.owner_ingress = Some(toml::from_str(
+        r#"
+        path = "/run/agent-pool/owner.sock"
+        gid = 1000
+        allowed_uids = [1002, 1004]
+        host_id = "test"
+        [stores]
+        1002 = { codex = "owner", claude-code = "claude-owner" }
+        1004 = { codex = "other" }
+    "#,
+    )?);
+    let request = |session: &str| OwnerRequest {
+        tool: BIND_OWNER.into(),
+        arguments: json!({"pool_id":pool_id,"harness":"codex","session_id":session}),
+    };
+    assert!(matches!(
+        super::owner_call(request("session"), &config, store, 1004).await,
+        Err(Fault::Unauthorized)
+    ));
+    if explicit.is_some() {
+        assert!(matches!(
+            owner_call(request("session"), &config, store).await,
+            Err(Fault::Conflict)
+        ));
+    } else {
+        for _ in 0..2 {
+            assert!(matches!(
+                owner_call(request("session"), &config, store).await?,
+                ChatReply::OwnerBound
+            ));
+        }
+        assert!(matches!(
+            owner_call(request("other-session"), &config, store).await,
+            Err(Fault::Conflict)
+        ));
+    }
+    let address = explicit.unwrap_or("test/codex/owner/session").to_owned();
+    let pool_id = pool_id.to_owned();
+    let completion = completion.to_owned();
+    stored(store, move |store| {
+        let db = store.test_db();
+        let mut stmt = db.prepare("SELECT json_extract(data,'$.work.address'),json_extract(data,'$.work.text')
+            FROM effects WHERE pool=?1 AND member IS NULL AND json_extract(data,'$.work.scope')='owner:'||?1 ORDER BY sequence")?;
+        let deliveries = stmt.query_map([pool_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(deliveries.len(), 2);
+        assert!(deliveries.iter().all(|(target, _)| target == &address));
+        assert!(deliveries[0].1.contains("owner-only"));
+        assert!(deliveries[1].1.contains(&completion));
         Ok(())
     }).await?;
     Ok(())

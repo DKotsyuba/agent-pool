@@ -203,3 +203,48 @@ stable `request_key`. The resident reconciles Run receipts when admission is unc
 even if the owner disconnects.
 `pool_start` accepts an optional canonical `owner_address` for Bridge notices.
 The pool remains readable and can reach agreement if the initiating chat ends.
+
+### Owner binding
+
+Crew binds the session that called `pool_start` through the owner ingress socket.
+Set `host_id` to the host ID from the local Bridge adapter configuration, and map
+each allowed owner's Linux UID to its Bridge store namespace for each enabled
+harness. The socket path and resident UID must match the owner MCP command.
+
+```toml
+[owner_ingress]
+path = "/run/agent-pool/owner.sock"
+gid = 1000 # Use the provisioned socket group.
+allowed_uids = [1002]
+host_id = "dobi"
+
+[owner_ingress.stores]
+1002 = { claude-code = "claude-agent-claude", codex = "codex-agent-claude" }
+```
+
+Add this hook to Crew's hook configuration for both runtimes. Adjust the binary
+path, socket path and resident UID to match the owner MCP deployment.
+
+```toml
+[[hooks]]
+name = "agent-pool-owner-bind"
+runtimes = ["codex", "claude"]
+command = ["/usr/local/bin/agent-pool", "hook", "bind", "--owner-socket", "/run/agent-pool/owner.sock", "--server-uid", "1003", "--harness", "codex"]
+timeout = 5
+
+[hooks.codex]
+event = "PostToolUse"
+matcher = "^mcp__agent[-_]pool__pool_start$"
+
+[hooks.claude]
+event = "PostToolUse"
+matcher = "^mcp__agent[-_]pool__pool_start$"
+command = ["/usr/local/bin/agent-pool", "hook", "bind", "--owner-socket", "/run/agent-pool/owner.sock", "--server-uid", "1003", "--harness", "claude-code"]
+```
+
+Only the kernel UID that created the pool can bind it. An explicit
+`owner_address` takes precedence. Repeating the same binding is safe.
+The resident queues the latest 20 owner messages and completion notices
+recorded before the first bind. Older notices remain in pool history.
+Schema v19 and earlier did not record the starter UID. Existing unbound pools
+remain readable and their historical notices remain in the journal.

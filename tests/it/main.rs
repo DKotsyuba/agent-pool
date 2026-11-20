@@ -3,5 +3,7 @@
 
 #[path = "../installer.rs"]
 mod installer;
+#[path = "../owner_hook.rs"]
+mod owner_hook;
 #[path = "../protocol.rs"]
 mod protocol;

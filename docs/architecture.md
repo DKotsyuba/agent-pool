@@ -60,6 +60,13 @@ These mappings never appear in participant events, errors, receipts or notificat
 Shared history includes direct and owner messages, while delivery audiences differ:
 posts go to members, direct messages to one member, explicit owner messages to the
 external owner. The sender's tool receipt replaces its own extra wakeup.
+For ordinary Run chat starts, owner ingress persists the kernel starter UID in
+schema v20. A matching peer can bind one native session through
+`pool_bind_owner_v1` using the configured Bridge host and UID-scoped harness
+store. The first binding queues the latest 20 owner messages and completion
+notices in the same transaction. Identical binding retries are idempotent and
+an explicit owner address stays authoritative. Historical chats without a
+recorded starter UID cannot be bound through this operation.
 
 ## Transactions, delivery and recovery
 
