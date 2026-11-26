@@ -1206,7 +1206,12 @@ exact current member ID or a unique exact roster name in `member_id`. Delivery
 and history use the resolved ID. Recipient errors list the matching current IDs.
 A public message reaches current admitted seats other than its author, a direct
 message reaches only its recipient, and a proposal requests votes from current
-admitted peers. Owner posts reach all current admitted seats. Completion and
+admitted peers. A member's `pool_post` may carry `notify`, a list of exact
+current member IDs, roster names or roles: only the resolved seats are woken,
+the journal event records them as `audience`, and the notice (`To: …`) and
+history (`notify=…`) show them. The message stays readable by every seat. An
+unmatched entry fails with the current member IDs. Owner posts ignore `notify`
+and reach all current admitted seats. Completion and
 closure send informational notices. The optional initiating Bridge address
 continues to route member-to-owner messages and agreement notices.
 
@@ -1217,8 +1222,10 @@ window. The indexed chat queue runs up to four concurrent resolutions per
 resident tick after owner and managed work. A close notice gets one lookup for
 each seat current at closure. A transaction authorizes the first Bridge send
 only while the exact seat is eligible, serialized with close and replacement.
-A send authorized before closure may already have reached Bridge. Such retired
-or closed notices use status reconciliation. Active notices with unconfirmed
+A send authorized before closure may already have reached Bridge. A possible
+send of a retired seat or a closed pool is not replayed and stops being
+polled, keeping its `unknown` state in history; a close notice is the
+exception, replayed until its window ends. Active notices with unconfirmed
 custody can replay frozen parameters and the same event ID for up to ten minutes
 against the configured Bridge producer. Confirmed custody uses status lookup.
 Unresolved notices settle as `notice_undeliverable`, exposed as a historical

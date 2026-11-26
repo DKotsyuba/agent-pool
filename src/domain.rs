@@ -350,6 +350,11 @@ pub struct Message {
     pub change: Change,
     /// Plain text, 1–8192 UTF-8 bytes.
     pub body: String,
+    /// `pool_post` only: members to wake, each an exact current member ID, roster
+    /// name or role. Omitted wakes every current member; owner posts ignore it.
+    /// History stays shared either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify: Option<Vec<String>>,
 }
 /// Shared-history message delivered only to one current peer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -666,7 +671,23 @@ impl Command {
             }
             Self::Remove(x) => identifier(&x.member_id),
             Self::ReleaseHistory(x) => identifier(&x.member_id),
-            Self::Post(x) | Self::Notify(x) => text(&x.body, MAX_MESSAGE),
+            Self::Post(x) => {
+                if let Some(notify) = &x.notify {
+                    if notify.is_empty() || notify.len() > MAX_MEMBERS {
+                        return Err(Fault::Invalid);
+                    }
+                    for selector in notify {
+                        text(selector, 160)?;
+                    }
+                }
+                text(&x.body, MAX_MESSAGE)
+            }
+            Self::Notify(x) => {
+                if x.notify.is_some() {
+                    return Err(Fault::Invalid);
+                }
+                text(&x.body, MAX_MESSAGE)
+            }
             Self::Send(x) => {
                 text(&x.member_id, 128)?;
                 text(&x.body, MAX_MESSAGE)
@@ -991,6 +1012,10 @@ pub struct Event {
     pub body: String,
     /// Optional exact member target; owner targets are represented by event kind.
     pub recipient: Option<String>,
+    /// Member IDs woken by a selectively notified post; omitted when every
+    /// current member is notified. Never restricts who may read the event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audience: Option<Vec<String>>,
     /// Structured check carried by this journal event, when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check: Option<Box<CriterionCheck>>,

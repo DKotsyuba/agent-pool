@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+## 0.3.2
+
+Fix release, 2026-11-26.
+
+### Fixed
+
+- Sent notices whose custody was never confirmed stop being polled once the seat is retired or the pool is closed; close notices end with their publication window.
+
+## 0.3.1
+
+Fix release, 2026-11-26.
+
+### Added
+
+- `pool_post` accepts an optional `notify` list of exact current member IDs, roster names or roles. Only those members are woken; the message stays in the shared history, and the notice and history show the audience. Owner posts always wake every current member. An unmatched entry returns the current member IDs.
+
+### Fixed
+
+- Chat wake notices no longer wait behind delivery status polls. Never-sent notices are claimed first with their own per-cycle budget (32 sends, 8 polls), and their ten-minute resolution deadline starts at the first attempt instead of at enqueue.
+- Confirmed-custody notices are re-polled with backoff from one to fifteen minutes and stop being polled once the seat is retired, the pool is closed or the publication window has ended. The rows and their last state stay in history. A possible send that was never confirmed also stops being polled once the seat is retired or the pool is closed, unless it is a close notice, which instead stops being polled once its publication window has ended.
+
 ## 0.3.0
 
 Feature release, 2026-11-26.

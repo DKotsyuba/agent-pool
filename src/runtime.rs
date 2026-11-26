@@ -27,6 +27,10 @@ const MAX_CONNECTIONS: usize = 32;
 const MAX_WAITERS: usize = 8;
 /// Serial observer/outbox cycle cadence; missed ticks are skipped, never replayed in bursts.
 const OBSERVATION_INTERVAL: Duration = Duration::from_secs(5);
+/// Never-sent chat notices published per cycle; their lookups run concurrently.
+const NOTICE_SENDS_PER_TICK: u16 = 32;
+/// Custody and unknown status polls per cycle, budgeted apart from fresh sends.
+const NOTICE_POLLS_PER_TICK: u16 = 8;
 /// One SQLite writer shared only through finite blocking store operations.
 pub(crate) type SharedStore = Arc<Mutex<Store>>;
 
@@ -4833,7 +4837,11 @@ async fn work(
         }
         // One separate batch per tick, with concurrent two-second Run lookups
         // and one short Bridge exchange per item (no provider work under a Store lock).
-        let due = stored(&store, |store| crate::store::chat::due_notices(store, 4)).await?;
+        // Fresh sends and status polls have separate budgets; sends are never starved.
+        let due = stored(&store, |store| {
+            crate::store::chat::due_notices(store, NOTICE_SENDS_PER_TICK, NOTICE_POLLS_PER_TICK)
+        })
+        .await?;
         let mut notices = JoinSet::new();
         for notice in due {
             let store = Arc::clone(&store);
@@ -5522,6 +5530,7 @@ mod tests {
                     store.execute(
                         &owner,
                         &Command::Post(Message {
+                            notify: None,
                             change: Change {
                                 pool_id,
                                 expected_revision: created.revision,
@@ -5590,6 +5599,7 @@ mod tests {
                             store.execute(
                                 &race_owner,
                                 &Command::Post(Message {
+                                    notify: None,
                                     change: Change {
                                         pool_id: race_pool,
                                         expected_revision: posted_revision,
@@ -9282,6 +9292,7 @@ mod tests {
                     return Err(BridgeFailure::Refused);
                 }
                 let command = Command::Post(crate::domain::Message {
+                    notify: None,
                     change: crate::domain::Change {
                         pool_id: "pool".into(),
                         expected_revision: 1,
@@ -9370,6 +9381,7 @@ mod tests {
             [serde_json::to_string(&member)?],
         )?;
         let command = Command::Post(crate::domain::Message {
+            notify: None,
             change: crate::domain::Change {
                 pool_id: "pool".into(),
                 expected_revision: 1,
@@ -11846,6 +11858,7 @@ mod tests {
             [serde_json::to_string(&member)?],
         )?;
         let command = Command::Post(crate::domain::Message {
+            notify: None,
             change: crate::domain::Change {
                 pool_id: "pool".into(),
                 expected_revision: 1,
@@ -12041,6 +12054,7 @@ mod tests {
         // domain key until both original remote fences are recovered.
         client.fail.store(true, Ordering::SeqCst);
         let retry_command = Command::Post(crate::domain::Message {
+            notify: None,
             change: crate::domain::Change {
                 pool_id: "pool".into(),
                 expected_revision: 2,
@@ -12315,6 +12329,7 @@ mod tests {
             }
         }
         let cancel_command = Command::Post(crate::domain::Message {
+            notify: None,
             change: crate::domain::Change {
                 pool_id: "pool".into(),
                 expected_revision: 3,

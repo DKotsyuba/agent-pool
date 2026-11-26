@@ -25,7 +25,7 @@ Run rejected the advertised release parameters. Check the Run API and request po
 {% endfor %}
 {% if section == 'criteria' and pool.acceptance is defined %}{% for criterion in pool.acceptance %}Criterion {{ criterion.id }}: {{ criterion.text|quote }}
 {% endfor %}{% endif %}
-{% for event in events %}Event {{ event.event_id }} revision={{ event.revision }} {{ event.kind }} author={{ event.author.kind }}{% if event.author.kind == 'member' %}:{{ event.author.member_id }}{% endif %}{% if event.recipient %} recipient={{ event.recipient }}{% endif %}{% if event.part_index is defined %} message={{ event.message_event_id }} part={{ event.part_index }}/{{ event.part_count }}{% endif +%}
+{% for event in events %}Event {{ event.event_id }} revision={{ event.revision }} {{ event.kind }} author={{ event.author.kind }}{% if event.author.kind == 'member' %}:{{ event.author.member_id }}{% endif %}{% if event.recipient %} recipient={{ event.recipient }}{% endif %}{% if event.audience is defined %} notify={% for id in event.audience %}{% if not loop.first %},{% endif %}{{ id }}{% endfor %}{% endif %}{% if event.part_index is defined %} message={{ event.message_event_id }} part={{ event.part_index }}/{{ event.part_count }}{% endif +%}
 Body: {{ event.body|quote }}
 {% endfor %}
 {% if pool.proposal %}Proposal {{ pool.proposal.proposal_id }} state={{ pool.proposal.state }} roster_key={{ pool.proposal.roster_key }}
