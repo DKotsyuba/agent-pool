@@ -71,7 +71,7 @@ invent a caller identity. The resident survives MCP frontend EOF. `get_status`,
 | `pool_enrollment_get`, `pool_enrollment_resolve` | Owner reads one managed start/replace enrollment, or closes an admitted but unbound one as `retain_unassigned` |
 | `pool_member_update`, `pool_remove`, `pool_replace`, `pool_cancel_replacement` | Change assignments, revoke or safely replace an exact incarnation |
 | `pool_release_history` | Request release of a closed member's retained Run history |
-| `pool_post`, `pool_send_member`, `pool_notify_owner` | Member broadcast, peer delivery and explicit owner contact |
+| `pool_post`, `pool_send_member`, `pool_notify_owner` | Member broadcast (optional `notify` list limits who is woken; history stays shared), peer delivery and explicit owner contact |
 | `pool_propose`, `pool_vote` | Freeze criteria/roster and record unanimous acceptance |
 
 All mutations require a stable `request_key`; existing-pool mutations also require
@@ -173,7 +173,7 @@ and retrieve legacy completions. The resident UID cannot use owner ingress.
 | `pool_start` | Start an ordered group of ordinary Run agents with `{assignment, spec}` per seat. Pass `provider`, `model`, `profile` and `workdir` in each Run spec. |
 | `pool_list` | List pools across owners with optional `state=open\|completed\|closed` and an exclusive `after` cursor. |
 | `pool_get` | Read the goal, current roster, admission/join/process states, votes and result status. Select `history` for journal pages. |
-| `pool_post`, `pool_send_member` | Broadcast or send to one exact current seat. |
+| `pool_post`, `pool_send_member` | Broadcast or send to one exact current seat. Owner posts always wake every seat. |
 | `pool_replace` | Retire a seat and launch a fresh seat at the expected pool revision. Returns the prior Run ID when there was an admission. |
 | `pool_close` | Close the chat and revoke seat authority. Use Run for cancellation. |
 | `pool_completion_get` | Read the agreed result by pool ID. For historical managed records, select `section=content` and page with `after`. |
@@ -181,7 +181,7 @@ and retrieve legacy completions. The resident UID cannot use owner ingress.
 | Member tool | Purpose |
 | --- | --- |
 | `pool_join`, `pool_get` | Confirm the seat and inspect the pool or its journal. |
-| `pool_post`, `pool_send_member`, `pool_notify_owner` | Broadcast, message one current seat or notify the initiating chat. |
+| `pool_post`, `pool_send_member`, `pool_notify_owner` | Broadcast (`notify` wakes only the listed member IDs, names or roles; everyone can still read it), message one current seat or notify the initiating chat. |
 | `pool_propose`, `pool_vote` | Open a proposal and record your ready vote in the same revision, or vote ready, block or revoke against the exact proposal and roster. |
 
 A sole joined seat completes the pool when it proposes. While a proposal is open,

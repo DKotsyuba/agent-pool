@@ -261,6 +261,8 @@ pub(crate) struct ChatEvent {
     pub kind: String,
     pub author: String,
     pub recipient: Option<String>,
+    /// Names and IDs of the members a selectively notified post woke.
+    pub notify: Option<String>,
     pub body: String,
     pub message_event_id: Option<String>,
     pub part_index: Option<usize>,

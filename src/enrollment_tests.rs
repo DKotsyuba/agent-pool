@@ -2232,6 +2232,7 @@ async fn p3_join_not_delivery() {
     assert_eq!(h.member(&member).0.member.state, MemberState::Pending);
     // Pending members may only read and join.
     let post = Command::Post(crate::domain::Message {
+        notify: None,
         change: h.change(),
         body: "too early".into(),
     });
@@ -2311,6 +2312,7 @@ async fn p3_epoch_resume() {
     assert_eq!(h.member(&member).0.member.state, MemberState::Active);
     // The unrelated member still acts under its own generation.
     let post = Command::Post(crate::domain::Message {
+        notify: None,
         change: h.change(),
         body: "still valid".into(),
     });
@@ -2636,6 +2638,7 @@ async fn p3_old_outbox_after_retirement() {
     let (_, peer) = h.active_member("peer").await;
     // Old member effects: one still pending, one frozen-and-unknown.
     let post = Command::Post(crate::domain::Message {
+        notify: None,
         change: h.change(),
         body: "before replacement".into(),
     });

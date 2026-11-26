@@ -233,8 +233,11 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "pool_post",
-            "Post to current members, excluding the sender's duplicate wakeup. Leader is not automatically notified. Bodies over 2048 bytes are committed as ordered history parts; notifications show the first part.",
-            mutation(json!({"body":string(8192)}), &["body"]),
+            "Post to the shared history, which every member can read. Without notify, every current member except the sender is woken. notify limits the wake to the listed exact member IDs, roster names or roles; the notice and history show that audience. Owner posts always wake everyone. Leader is not automatically notified. Bodies over 2048 bytes are committed as ordered history parts; notifications show the first part.",
+            mutation(
+                json!({"body":string(8192),"notify":{"type":"array","minItems":1,"maxItems":crate::domain::MAX_MEMBERS,"items":string(160),"description":"Members to wake: exact current member IDs, roster names or roles. Omit to wake everyone. Ignored for owner posts."}}),
+                &["body"],
+            ),
             false,
         ),
         tool(
@@ -282,7 +285,7 @@ pub fn templates() -> Vec<(&'static str, &'static str)> {
         ("pool_error", "ERROR {{ code }}. {{ recovery }}\n"),
         (
             "pool_recipient_error",
-            "ERROR recipient. Use an exact current member ID or unique exact roster name. Candidate member IDs: {% if candidates %}{% for id in candidates %}{% if not loop.first %}, {% endif %}{{ id }}{% endfor %}{% else %}none{% endif %}.\n",
+            "ERROR recipient. Use an exact current member ID or unique exact roster name; pool_post notify also accepts an exact role. Candidate member IDs: {% if candidates %}{% for id in candidates %}{% if not loop.first %}, {% endif %}{{ id }}{% endfor %}{% else %}none{% endif %}.\n",
         ),
         ("pool_view", include_str!("../templates/pool_view.j2")),
         ("pool_receipt", include_str!("../templates/pool_receipt.j2")),
@@ -453,6 +456,7 @@ mod tests {
                 author: Author::Member("member".into()),
                 body: format!("{{{{literal}}}}\n{}", "\\".repeat(4096)),
                 recipient: None,
+                audience: None,
                 check: None,
                 vote_event_id: None,
                 message_event_id: None,

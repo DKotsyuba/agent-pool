@@ -331,6 +331,7 @@ mod tests {
         let config = fake_config(&binding);
         let pin = fake_bridge_pin(&binding);
         let command = Command::Post(crate::domain::Message {
+            notify: None,
             change: crate::domain::Change {
                 pool_id: binding.pool_id.clone(),
                 expected_revision: 1,

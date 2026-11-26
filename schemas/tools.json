@@ -794,7 +794,7 @@
       "openWorldHint": true,
       "readOnlyHint": false
     },
-    "description": "Post to current members, excluding the sender's duplicate wakeup. Leader is not automatically notified. Bodies over 2048 bytes are committed as ordered history parts; notifications show the first part.",
+    "description": "Post to the shared history, which every member can read. Without notify, every current member except the sender is woken. notify limits the wake to the listed exact member IDs, roster names or roles; the notice and history show that audience. Owner posts always wake everyone. Leader is not automatically notified. Bodies over 2048 bytes are committed as ordered history parts; notifications show the first part.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -806,6 +806,17 @@
         "expected_revision": {
           "minimum": 1,
           "type": "integer"
+        },
+        "notify": {
+          "description": "Members to wake: exact current member IDs, roster names or roles. Omit to wake everyone. Ignored for owner posts.",
+          "items": {
+            "maxLength": 160,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 20,
+          "minItems": 1,
+          "type": "array"
         },
         "pool_id": {
           "maxLength": 128,

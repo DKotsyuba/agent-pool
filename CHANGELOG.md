@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- `pool_post` accepts an optional `notify` list of exact current member IDs, roster names or roles. Only those members are woken; the message stays in the shared history, and the notice and history show the audience. Owner posts always wake every current member. An unmatched entry returns the current member IDs.
+
 ### Fixed
 
 - Chat wake notices no longer wait behind delivery status polls. Never-sent notices are claimed first with their own per-cycle budget (32 sends, 8 polls), and their ten-minute resolution deadline starts at the first attempt instead of at enqueue.

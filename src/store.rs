@@ -3186,6 +3186,15 @@ fn execute_authorized(
     } else {
         None
     };
+    // Owner posts always wake every current member; `notify` applies to member posts only.
+    let audience = match command {
+        Command::Post(request) if !is_owner => request
+            .notify
+            .as_deref()
+            .map(|selectors| notify_audience(&roster, selectors))
+            .transpose()?,
+        _ => None,
+    };
     // C3: a committed completion freezes goal, roster, assignments, proposals and votes.
     if matches!(
         command,
@@ -3740,7 +3749,8 @@ fn execute_authorized(
         }
         _ => return Err(Fault::Invalid),
     };
-    let mut event = append_event(db, &p, kind, author.clone(), body, target.clone())?;
+    let mut event =
+        append_addressed_event(db, &p, kind, author.clone(), body, target.clone(), audience)?;
     if !message_parts.is_empty() {
         append_message_parts(db, &p, &mut event, &message_parts)?;
     }
@@ -3816,11 +3826,19 @@ fn execute_authorized(
             )?;
         }
     } else {
-        let skip: Vec<&str> = caller
+        let mut skip: Vec<&str> = caller
             .as_ref()
             .map(|b| b.member.member_id.as_str())
             .into_iter()
             .collect();
+        if let Some(audience) = &event.audience {
+            skip.extend(
+                roster
+                    .iter()
+                    .map(|b| b.member.member_id.as_str())
+                    .filter(|id| !audience.iter().any(|chosen| chosen == id)),
+            );
+        }
         system_deliveries(db, &p, &event, &roster, &skip)?;
     }
     if let Some(member_id) = created
@@ -4657,6 +4675,49 @@ fn direct_recipient<'a>(
             candidates: Vec::new(),
         }),
     }
+}
+/// Resolves `pool_post` wake selectors to current member IDs in roster order.
+/// Each selector is an exact member ID, else an exact roster name, else an exact
+/// role; an unmatched selector fails with every current member ID as candidates.
+fn notify_audience(roster: &[Binding], selectors: &[String]) -> Result<Vec<String>, Fault> {
+    let mut chosen = vec![false; roster.len()];
+    for selector in selectors {
+        let fields: [fn(&Member) -> &str; 3] = [|m| &m.member_id, |m| &m.name, |m| &m.role];
+        let field = fields
+            .into_iter()
+            .find(|field| roster.iter().any(|b| field(&b.member) == selector))
+            .ok_or_else(|| Fault::Recipient {
+                candidates: roster.iter().map(|b| b.member.member_id.clone()).collect(),
+            })?;
+        for (index, binding) in roster.iter().enumerate() {
+            chosen[index] |= field(&binding.member) == selector;
+        }
+    }
+    Ok(roster
+        .iter()
+        .zip(chosen)
+        .filter(|(_, chosen)| *chosen)
+        .map(|(b, _)| b.member.member_id.clone())
+        .collect())
+}
+/// Names the chosen audience of a selectively notified message, or nothing for a broadcast.
+pub(crate) fn audience_label(event: &Event, roster: &[Binding]) -> Option<String> {
+    let audience = event.audience.as_ref()?;
+    Some(
+        audience
+            .iter()
+            .map(|id| {
+                roster
+                    .iter()
+                    .find(|b| b.member.member_id == *id)
+                    .map_or_else(
+                        || id.clone(),
+                        |b| crate::response::one_line(&b.member.name, 24),
+                    )
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
 }
 /// Loads an exact retained incarnation and whether it still has access.
 pub(crate) fn binding_any(db: &Connection, id: &str) -> Result<(Binding, bool), Fault> {
@@ -5813,6 +5874,18 @@ pub(crate) fn append_event(
     body: String,
     recipient: Option<String>,
 ) -> Result<Event, Fault> {
+    append_addressed_event(db, p, kind, author, body, recipient, None)
+}
+/// Appends an event that also records the member IDs chosen for its wake notice.
+fn append_addressed_event(
+    db: &Connection,
+    p: &Pool,
+    kind: &str,
+    author: Author,
+    body: String,
+    recipient: Option<String>,
+    audience: Option<Vec<String>>,
+) -> Result<Event, Fault> {
     let mut e = Event {
         event_id: 0,
         event_id_exact: None,
@@ -5821,6 +5894,7 @@ pub(crate) fn append_event(
         author,
         body,
         recipient,
+        audience,
         check: None,
         vote_event_id: None,
         message_event_id: None,
@@ -5886,6 +5960,7 @@ fn append_message_parts(
             author: event.author.clone(),
             body: body.clone(),
             recipient: event.recipient.clone(),
+            audience: event.audience.clone(),
             check: None,
             vote_event_id: None,
             message_event_id: Some(message_id.clone()),
@@ -5918,6 +5993,7 @@ fn append_check(
             check.criterion_id, check.status, check.evidence
         ),
         recipient: None,
+        audience: None,
         check: Some(Box::new(check.clone())),
         vote_event_id: Some(vote_id.to_string()),
         message_event_id: None,
@@ -6080,7 +6156,8 @@ fn notification(p: &Pool, roster: &[Binding], e: &Event) -> Result<String, Fault
         e.kind.as_str(),
         "message" | "direct_message" | "owner_message"
     ) {
-        format!("From {}\n", sender_label(e, roster))
+        let to = audience_label(e, roster).map_or_else(String::new, |to| format!("To: {to}\n"));
+        format!("From {}\n{to}", sender_label(e, roster))
     } else {
         String::new()
     };
@@ -6660,6 +6737,7 @@ mod tests {
         s.execute(
             owner,
             &Command::Post(Message {
+                notify: None,
                 change,
                 body: text.into(),
             }),
@@ -7528,6 +7606,7 @@ mod tests {
             .execute(
                 &a,
                 &Command::Post(Message {
+                    notify: None,
                     change: c,
                     body: "hello".into(),
                 }),
@@ -7545,6 +7624,7 @@ mod tests {
         s.execute(
             &a,
             &Command::Notify(Message {
+                notify: None,
                 change: c,
                 body: "Need owner".into(),
             }),
@@ -7566,6 +7646,7 @@ mod tests {
         let held = s.next_effect().unwrap().unwrap();
         let c = change(&s, &p);
         let post = Command::Post(Message {
+            notify: None,
             change: c,
             body: "saved".into(),
         });
@@ -7628,6 +7709,7 @@ mod tests {
         assert_eq!(count(&s, "events"), before);
         let c = change(&s, &p);
         let mut msg = Message {
+            notify: None,
             change: c,
             body: "first".into(),
         };
@@ -7834,6 +7916,7 @@ mod tests {
         binding.run_store_id = Some(format!("store_{}", "a".repeat(32)));
         save_binding(&store.db, &binding, current).unwrap();
         let post = Command::Post(Message {
+            notify: None,
             change: change(&store, &pool_id),
             body: "immutable seed".into(),
         });
@@ -7967,6 +8050,7 @@ mod tests {
         add(&mut store, &owner, &pool_id, &bridge);
         join(&mut store, &bridge, &pool_id);
         let posted = Command::Post(Message {
+            notify: None,
             change: change(&store, &pool_id),
             body: "Prior participant message".into(),
         });
@@ -7994,6 +8078,7 @@ mod tests {
             Err(Fault::Unavailable)
         ));
         let fresh = Command::Post(Message {
+            notify: None,
             change: change(&store, &pool_id),
             body: "Must not commit".into(),
         });
@@ -10210,6 +10295,65 @@ mod tests {
         };
         assert_eq!(receipt.event.recipient.as_deref(), Some(first.as_str()));
     }
+    /// A member's `notify` queues deliveries only for the resolved members; a
+    /// leader's post ignores it, and an unmatched selector lists the roster.
+    #[test]
+    fn post_notify_selects_delivery_audience() {
+        let (_d, mut store) = fixture();
+        let owner = actor("owner");
+        let pool = make(&mut store, &owner, "notify");
+        let authors = [actor("first"), actor("second"), actor("third")];
+        let ids: Vec<String> = authors
+            .iter()
+            .map(|member| add(&mut store, &owner, &pool, member))
+            .collect();
+        for member in &authors {
+            join(&mut store, member, &pool);
+        }
+        let post = |store: &Store, notify: &[&str]| {
+            Command::Post(Message {
+                notify: Some(notify.iter().map(|s| (*s).to_owned()).collect()),
+                change: change(store, &pool),
+                body: "body".into(),
+            })
+        };
+        let deliveries = |store: &Store, event: u64| -> Vec<String> {
+            let mut rows = store
+                .db
+                .prepare(
+                    "SELECT member FROM effects WHERE member IS NOT NULL
+                     AND instr(json_extract(data,'$.work.text'),?1)>0 ORDER BY member",
+                )
+                .unwrap();
+            rows.query_map([format!("Event {event}: message")], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let Reply::Receipt(subset) = store
+            .execute(&authors[0], &post(&store, &[&ids[2]]))
+            .unwrap()
+        else {
+            panic!("expected a receipt");
+        };
+        assert_eq!(subset.event.audience, Some(vec![ids[2].clone()]));
+        assert_eq!(deliveries(&store, subset.event.event_id), [ids[2].clone()]);
+        let Reply::Receipt(all) = store.execute(&owner, &post(&store, &[&ids[2]])).unwrap() else {
+            panic!("expected a receipt");
+        };
+        assert_eq!(all.event.audience, None);
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(deliveries(&store, all.event.event_id), sorted);
+        let Fault::Recipient { mut candidates } = store
+            .execute(&authors[0], &post(&store, &[&ids[1], "nobody"]))
+            .unwrap_err()
+        else {
+            panic!("expected a recipient error");
+        };
+        candidates.sort();
+        assert_eq!(candidates, sorted);
+    }
     /// Twenty maximum-size assignments and quoted proposal data remain retrievable without skipping rows.
     #[test]
     fn maximum_content_fits_notifications_and_paginated_presentation() {
@@ -10249,6 +10393,7 @@ mod tests {
             .execute(
                 &lead,
                 &Command::Post(Message {
+                    notify: None,
                     change: c,
                     body: "\\".repeat(MAX_MESSAGE),
                 }),

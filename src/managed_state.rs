@@ -4856,6 +4856,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let command = Command::Post(crate::domain::Message {
+            notify: None,
             change: Change {
                 pool_id: "pool".into(),
                 expected_revision: 1,
@@ -6020,6 +6021,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let post = Command::Post(Message {
+            notify: None,
             change: Change {
                 pool_id: "pool".into(),
                 expected_revision: 1,

@@ -310,6 +310,7 @@ fn fixture(options: Options) -> Fixture {
             author: crate::domain::Author::Member(member_id.clone()),
             body: format!("Proposal {PROPOSAL}: Ready.\nVerified by {member_id}."),
             recipient: None,
+            audience: None,
             check: None,
             vote_event_id: None,
             message_event_id: None,
@@ -1683,6 +1684,7 @@ async fn p3_completion_counts() {
         .execute(
             &owner(),
             &Command::Post(crate::domain::Message {
+                notify: None,
                 change: change("post"),
                 body: "Thanks.".into(),
             }),
@@ -3101,6 +3103,7 @@ async fn p3_legacy_parity() {
         .execute(
             &owner,
             &Command::Post(Message {
+                notify: None,
                 change,
                 body: "Owner: please verify the result.".into(),
             }),
@@ -3111,6 +3114,7 @@ async fn p3_legacy_parity() {
     h.p1(
         &members[0],
         Command::Post(Message {
+            notify: None,
             change,
             body: "Member 0: result drafted.".into(),
         }),
@@ -3120,6 +3124,7 @@ async fn p3_legacy_parity() {
     h.p1(
         &members[1],
         Command::Notify(Message {
+            notify: None,
             change,
             body: "Member 1: one risk for the owner.".into(),
         }),

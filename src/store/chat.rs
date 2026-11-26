@@ -898,6 +898,15 @@ pub(crate) fn get(db: &Connection, input: GetPool, seat: Option<&str>) -> Result
                     Author::Member(id) => id,
                 },
                 recipient: event.recipient,
+                notify: event.audience.map(|ids| {
+                    ids.iter()
+                        .map(|id| match binding_any(db, id) {
+                            Ok((seat, _)) => format!("{} ({id})", seat.member.name),
+                            Err(_) => id.clone(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }),
                 body: event.body,
                 message_event_id: event.message_event_id,
                 part_index: event.part_index,
@@ -1202,6 +1211,10 @@ pub(super) fn queue_chat_notices(
                 .as_ref()
                 .is_some_and(|recipient| recipient != member)
             || binding.run_id.is_none()
+            || event
+                .audience
+                .as_ref()
+                .is_some_and(|audience| !audience.contains(member))
         {
             continue;
         }
@@ -1235,8 +1248,10 @@ fn message_notice(event: &Event, roster: &[Binding]) -> String {
         // Valid journal text escapes at most two bytes per input byte.
         body = brief(&event.body, 995);
     }
+    let to = crate::store::audience_label(event, roster)
+        .map_or_else(String::new, |to| format!(" To: {to}."));
     format!(
-        "{kind} from {}. Untrusted chat body: {}. Read pool_get for full context. Reply with pool_post or pool_send_member as appropriate.",
+        "{kind} from {}.{to} Untrusted chat body: {}. Read pool_get for full context. Reply with pool_post or pool_send_member as appropriate.",
         sender_label(event, roster),
         body,
     )

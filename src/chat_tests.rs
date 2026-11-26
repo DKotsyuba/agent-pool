@@ -1279,6 +1279,114 @@ async fn chat_custody_backlog_does_not_delay_new_notice() -> Result<(), Box<dyn 
     Ok(())
 }
 
+/// `notify` limits the wake to the resolved seats while history stays shared;
+/// owner posts wake everyone and an unmatched selector lists the current seats.
+#[tokio::test]
+async fn chat_post_notifies_only_selected_seats() -> Result<(), Box<dyn std::error::Error>> {
+    let (_root, config, store) = fixture()?;
+    let templates = renderer()?;
+    let batch = reserve(&store, None).await?;
+    install(&store, &batch).await?;
+    let call = |value| private_call(value, &config, &store, templates);
+    let join = member_call(
+        &batch,
+        0,
+        "pool_join",
+        "join",
+        json!({"expected_revision":1}),
+    );
+    assert!(ok(&call(join).await));
+    let seats: Vec<String> = batch.jobs.iter().map(|job| job.member_id.clone()).collect();
+    let named = seats.clone();
+    let (reviewer, name) = stored(&store, move |store| {
+        let mut name = |id| {
+            Ok::<_, Fault>(
+                crate::store::binding_any(store.test_db(), id)?
+                    .0
+                    .member
+                    .name,
+            )
+        };
+        Ok((name(&named[1])?, name(&named[2])?))
+    })
+    .await?;
+    let post = |key: &str, revision: u64, notify: Value| {
+        member_call(
+            &batch,
+            0,
+            "pool_post",
+            key,
+            json!({"expected_revision":revision,"body":key,"notify":notify}),
+        )
+    };
+    let by_role = call(post("by-role", 2, json!(["review"]))).await;
+    assert!(ok(&by_role), "{by_role}");
+    assert!(reply_text(&by_role).contains(&format!("Notified: {}\n", seats[1])));
+    let by_name = call(post("by-name", 3, json!([name, seats[1]]))).await;
+    assert!(ok(&by_name), "{by_name}");
+    let missing = call(post("missing", 4, json!(["review", "Nobody"]))).await;
+    assert!(!ok(&missing));
+    for seat in &seats {
+        assert!(reply_text(&missing).contains(seat), "{missing}");
+    }
+    let pid = batch.pool_id.clone();
+    stored(&store, move |store| {
+        state::owner_call(
+            store,
+            "pool_post",
+            json!({"pool_id":pid,"expected_revision":4,"request_key":"owner",
+                "body":"owner","notify":["review"]}),
+        )
+    })
+    .await?;
+    let expected = [
+        ("by-role", vec![seats[1].clone()]),
+        ("by-name", vec![seats[1].clone(), seats[2].clone()]),
+        ("owner", seats.clone()),
+    ];
+    let label = format!(" To: {reviewer}, {name}. ");
+    stored(&store, move |store| {
+        let db = store.test_db();
+        for (body, woken) in expected {
+            let mut rows = db.prepare(
+                "SELECT n.member,f.data FROM chat_notice_targets n JOIN events e ON e.id=n.event
+                 JOIN effects f ON f.id=n.effect
+                 WHERE json_extract(e.data,'$.body')=?1 ORDER BY n.member",
+            )?;
+            let rows: Vec<(String, String)> = rows
+                .query_map([body], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<_, _>>()?;
+            let mut woken = woken;
+            woken.sort();
+            assert_eq!(
+                rows.iter().map(|row| row.0.clone()).collect::<Vec<_>>(),
+                woken
+            );
+            assert!(
+                rows.iter()
+                    .all(|row| row.1.contains(&label) == (body == "by-name"))
+            );
+        }
+        Ok(())
+    })
+    .await?;
+    // The seat that was not woken still reads the message and its audience.
+    let history = member_call(
+        &batch,
+        2,
+        "pool_get",
+        "history",
+        json!({"section":"history"}),
+    );
+    let history = call(history).await;
+    let text = reply_text(&history);
+    assert!(
+        text.contains("\"by-role\"")
+            && text.contains(&format!("notify=[{reviewer} ({})]", seats[1]))
+    );
+    Ok(())
+}
+
 /// A retired managed seat stays absent from the owner chat read and triggers no Run RPC.
 #[tokio::test]
 async fn chat_owner_managed_overview_does_not_read_retired_seats()

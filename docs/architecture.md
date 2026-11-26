@@ -1206,7 +1206,12 @@ exact current member ID or a unique exact roster name in `member_id`. Delivery
 and history use the resolved ID. Recipient errors list the matching current IDs.
 A public message reaches current admitted seats other than its author, a direct
 message reaches only its recipient, and a proposal requests votes from current
-admitted peers. Owner posts reach all current admitted seats. Completion and
+admitted peers. A member's `pool_post` may carry `notify`, a list of exact
+current member IDs, roster names or roles: only the resolved seats are woken,
+the journal event records them as `audience`, and the notice (`To: …`) and
+history (`notify=…`) show them. The message stays readable by every seat. An
+unmatched entry fails with the current member IDs. Owner posts ignore `notify`
+and reach all current admitted seats. Completion and
 closure send informational notices. The optional initiating Bridge address
 continues to route member-to-owner messages and agreement notices.
 

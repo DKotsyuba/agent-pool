@@ -5530,6 +5530,7 @@ mod tests {
                     store.execute(
                         &owner,
                         &Command::Post(Message {
+                            notify: None,
                             change: Change {
                                 pool_id,
                                 expected_revision: created.revision,
@@ -5598,6 +5599,7 @@ mod tests {
                             store.execute(
                                 &race_owner,
                                 &Command::Post(Message {
+                                    notify: None,
                                     change: Change {
                                         pool_id: race_pool,
                                         expected_revision: posted_revision,
@@ -9290,6 +9292,7 @@ mod tests {
                     return Err(BridgeFailure::Refused);
                 }
                 let command = Command::Post(crate::domain::Message {
+                    notify: None,
                     change: crate::domain::Change {
                         pool_id: "pool".into(),
                         expected_revision: 1,
@@ -9378,6 +9381,7 @@ mod tests {
             [serde_json::to_string(&member)?],
         )?;
         let command = Command::Post(crate::domain::Message {
+            notify: None,
             change: crate::domain::Change {
                 pool_id: "pool".into(),
                 expected_revision: 1,
@@ -11854,6 +11858,7 @@ mod tests {
             [serde_json::to_string(&member)?],
         )?;
         let command = Command::Post(crate::domain::Message {
+            notify: None,
             change: crate::domain::Change {
                 pool_id: "pool".into(),
                 expected_revision: 1,
@@ -12049,6 +12054,7 @@ mod tests {
         // domain key until both original remote fences are recovered.
         client.fail.store(true, Ordering::SeqCst);
         let retry_command = Command::Post(crate::domain::Message {
+            notify: None,
             change: crate::domain::Change {
                 pool_id: "pool".into(),
                 expected_revision: 2,
@@ -12323,6 +12329,7 @@ mod tests {
             }
         }
         let cancel_command = Command::Post(crate::domain::Message {
+            notify: None,
             change: crate::domain::Change {
                 pool_id: "pool".into(),
                 expected_revision: 3,

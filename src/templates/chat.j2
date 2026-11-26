@@ -27,7 +27,7 @@ Continue with section=members after="{{ next }}" expected_revision={{ revision }
 {% elif view == "history" %}
 Pool {{ pool_id }} revision={{ revision }} | history more={{ more }} next={{ next }}
 {% for e in events %}
-{{ e.id }} {{ e.kind }} {{ e.author }}{% if e.recipient %} to={{ e.recipient }}{% endif %}{% if e.message_event_id %} message={{ e.message_event_id }} part={{ e.part_index }}/{{ e.part_count }}{% endif %} {{ e.body|quote }}
+{{ e.id }} {{ e.kind }} {{ e.author }}{% if e.recipient %} to={{ e.recipient }}{% endif %}{% if e.notify %} notify=[{{ e.notify }}]{% endif %}{% if e.message_event_id %} message={{ e.message_event_id }} part={{ e.part_index }}/{{ e.part_count }}{% endif %} {{ e.body|quote }}
 {% endfor %}
 {% elif view == "list" %}
 Pools {{ returned }}
