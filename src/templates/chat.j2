@@ -11,7 +11,7 @@ Seats {{ seat_count }} | ready={{ ready }} blocked={{ blocked }}
 {% else %}
 Pool {{ pool_id }} revision={{ revision }} | members more={{ more }} next={{ next }}
 {% endif %}{% for s in roster %}
-{{ s.seat_id }} | {{ s.profile|quote }} | admission={{ s.admitted }}{% if s.retired %} retired=true{% endif %} joined={{ s.joined }} process={{ s.process }}{% if s.notice_undeliverable %} notice_undeliverable=true{% endif %}{% if s.agent_id %} run={{ s.agent_id }} sequence={{ s.sequence }}{% endif %} | {{ s.assignment }}
+{{ s.name|one_line(80) }} ({{ s.profile|one_line(80) }}) · {{ s.seat_id }} | admission={{ s.admitted }}{% if s.retired %} retired=true{% endif %} joined={{ s.joined }} process={{ s.process }}{% if s.notice_undeliverable %} notice_undeliverable=true{% endif %}{% if s.agent_id %} run={{ s.agent_id }} sequence={{ s.sequence }}{% endif %} | {{ s.assignment }}
 {% endfor %}{% if view == "overview" %}
 {% if omitted_retired %}+{{ omitted_retired }} more retired seats ({{ omitted_undeliverable }} undeliverable), see section=members.
 {% endif %}
@@ -45,7 +45,7 @@ Pool {{ pool_id }} revision={{ revision }} admission={{ state }}
 {{ owner_binding_hint }}
 {% endif %}
 {% for s in seats %}
-Seat {{ s.id }} current={{ s.current }} joined={{ s.joined }}{% if s.agent_id %} run={{ s.agent_id }}{% endif +%}
+Seat {{ s.name|one_line(80) }} ({{ s.profile|one_line(80) }}) · {{ s.id }} current={{ s.current }} joined={{ s.joined }}{% if s.agent_id %} run={{ s.agent_id }}{% endif +%}
 {% endfor %}
 {% if state == "pending" %}
 The resident reconciles Run admission. Read pool_get for current seat admission.

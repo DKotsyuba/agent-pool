@@ -835,7 +835,7 @@
       "openWorldHint": true,
       "readOnlyHint": false
     },
-    "description": "Deliver to one exact current membership ID and record shared history. Bodies over 2048 bytes are committed as ordered history parts; notifications show the first part. Removed IDs are never redirected.",
+    "description": "Deliver to one exact current membership ID or unique exact roster name in member_id and record shared history. Bodies over 2048 bytes are committed as ordered history parts; notifications show the first part. Removed IDs are never redirected.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {

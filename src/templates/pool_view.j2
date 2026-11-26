@@ -4,8 +4,7 @@ Purpose: {{ pool.purpose|quote }}
 {% if pool.purpose_bytes is defined %}Purpose preview; full length={{ pool.purpose_bytes }} bytes. Read pool_get section=content field=purpose.
 {% endif %}
 Confirmed={{ active }} pending={{ pending }}; leader excluded. Section={{ section }}.
-{% for member in members %}{{ member.member_id }} | {{ member.state }} | execution={{ member.runtime }}
-Name: {{ member.name|quote }}; role: {{ member.role|quote }}
+{% for member in members %}{{ member.name|one_line(80) }} ({{ member.role|one_line(160) }}) · {{ member.member_id }} | {{ member.state }} | execution={{ member.runtime }}
 Task: {{ member.task|quote }}
 {% endfor %}
 {% for delivery in deliveries %}Operation {{ delivery.operation_id }} {{ delivery.operation }} state={{ delivery.state }}{% if delivery.member_id %} member={{ delivery.member_id }}{% endif %}{% if delivery.attention is defined and delivery.attention %} attention={{ delivery.attention }}{% endif %}{% if delivery.attention_subject is defined and delivery.attention_subject %} attention_subject={{ delivery.attention_subject }}{% endif +%}

@@ -499,7 +499,7 @@ mod tests {
         let refused: Envelope = serde_json::from_slice(&reply)?;
         assert_eq!(refused.kind, "error");
         assert_eq!(
-            refused.error.as_ref().map(|error| error.code),
+            refused.error.map(|error| error.code),
             Some(Fault::Unauthorized)
         );
         let value: Value = serde_json::from_slice(&reply)?;

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Added
+
+- New chat seats get stable generated names. Rosters, onboarding and message notices show names and roles alongside member IDs.
+- `pool_send_member` accepts a unique exact current roster name in `member_id`. Ambiguous names return the matching member IDs.
+
 ## 0.2.4
 
 Fix release, 2026-11-20.

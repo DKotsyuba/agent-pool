@@ -3,6 +3,27 @@ use minijinja::{AutoEscape, Environment, UndefinedBehavior};
 use serde::Serialize;
 use std::io::{self, Write};
 
+/// Bounds a display label in UTF-8 bytes and keeps it on one visible line.
+pub(crate) fn one_line(value: &str, limit: usize) -> String {
+    let end = value.floor_char_boundary(limit.min(value.len()));
+    let mut label: String = value[..end]
+        .chars()
+        .map(|c| {
+            if c.is_control()
+                || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+            {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    if end < value.len() {
+        label.push('…');
+    }
+    label
+}
+
 /// Closed immutable MiniJinja environment; rendering has no I/O or domain side effects.
 pub struct Templates {
     /// Embedded templates and explicitly registered formatting-only filters.
@@ -21,6 +42,9 @@ impl Templates {
         env.set_recursion_limit(16);
         env.set_formatter(mcp_presentation::json_bool_formatter);
         env.add_test("defined", |value: minijinja::Value| !value.is_undefined());
+        env.add_filter("one_line", |value: String, limit: usize| {
+            one_line(&value, limit)
+        });
         env.add_filter("quote", |value: String| {
             serde_json::to_string(&value).unwrap_or_else(|_| "\"unavailable\"".into())
         });
@@ -65,6 +89,12 @@ impl Write for Limit {
 #[allow(clippy::unwrap_used, reason = "Test assertions")]
 mod tests {
     use super::*;
+    /// Display labels keep UTF-8 boundaries and cannot create additional lines.
+    #[test]
+    fn display_label_is_bounded_and_single_line() {
+        assert_eq!(one_line("Name\n\trole\u{2028}next", 80), "Name  role next");
+        assert_eq!(one_line("A🦀Z", 4), "A…");
+    }
     #[test]
     /// Missing required values fail despite successful startup template parsing.
     fn strict_missing_rejected() {
