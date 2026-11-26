@@ -1319,23 +1319,27 @@ pub(crate) fn notice(store: &Store, effect: &str) -> Result<Notice, Fault> {
 ///
 /// Never-sent notices have their own `sends` budget and are claimed first, so
 /// custody and unknown status polls (`polls` budget) cannot delay a fresh wake.
-/// Before claiming, confirmed-custody rows whose seat was retired, whose pool is
-/// closed or whose publication window ended stop being polled (the row and its
-/// effect state are retained), and a notice that was never attempted gets its
-/// resolution deadline measured from this first claim rather than from enqueue,
-/// so the resident's own scheduling lag cannot expire it.
+/// Before claiming, rows whose send was started stop being polled once their
+/// seat was retired or their pool was closed, close notices excepted; the row
+/// and its effect state are retained. A close notice is still replayed, so a
+/// closed pool does not end it: like a confirmed-custody row, it ends with its
+/// publication window. Any other unconfirmed send ignores that window, since it
+/// may still be resolved. A notice that was never attempted is not swept: it
+/// gets its resolution deadline measured from this first claim rather than from
+/// enqueue, so the resident's own scheduling lag cannot expire it.
 pub(crate) fn due_notices(store: &mut Store, sends: u16, polls: u16) -> Result<Vec<Effect>, Fault> {
     let tx = store
         .db
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
     let now = receipt_clock()?;
     tx.execute(
-        "UPDATE chat_notice_targets SET pending=0 WHERE pending=1 AND custody_confirmed=1 AND (
-            coalesce(publish_until_ms<=?1,0)
+        "UPDATE chat_notice_targets SET pending=0 WHERE pending=1 AND (custody_confirmed=1 OR send_started=1) AND (
+            ((custody_confirmed=1 OR close_notice=1) AND coalesce(publish_until_ms<=?1,0))
             OR EXISTS(SELECT 1 FROM members m LEFT JOIN pools p ON p.id=m.pool
                 WHERE m.id=chat_notice_targets.member
                 AND ((m.current=0 AND chat_notice_targets.close_notice=0)
-                    OR coalesce(json_extract(p.data,'$.closed'),0))))",
+                    OR (coalesce(json_extract(p.data,'$.closed'),0)
+                        AND (chat_notice_targets.close_notice=0 OR chat_notice_targets.custody_confirmed=1)))))",
         [now],
     )?;
     let mut ids = Vec::new();

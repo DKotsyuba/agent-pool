@@ -1279,6 +1279,245 @@ async fn chat_custody_backlog_does_not_delay_new_notice() -> Result<(), Box<dyn 
     Ok(())
 }
 
+/// Freezes a claimed notice and authorizes its first send, then records a lost
+/// acknowledgement: the send started, but Bridge custody was never confirmed.
+fn unknown_send(store: &mut Store, effect: &mut crate::domain::Effect) -> Result<(), Fault> {
+    let crate::domain::Work::Deliver { address, .. } = &mut effect.work else {
+        return Err(Fault::Internal);
+    };
+    *address = "test/codex/route/session".into();
+    let params = integrations::publication(effect)?;
+    store.freeze_publication(
+        &effect.effect_id,
+        "fixture",
+        &serde_json::to_value(params).map_err(|_| Fault::Internal)?,
+    )?;
+    assert_eq!(
+        state::begin_notice_send(store, &effect.effect_id)?,
+        state::NoticeSend::Publish { replay: false }
+    );
+    store.settle_effect(&effect.effect_id, "unknown")
+}
+
+/// Effects of the chat notice rows a query selects, in stable order.
+fn notice_effects(db: &rusqlite::Connection, sql: &str) -> Result<Vec<String>, Fault> {
+    Ok(db
+        .prepare(sql)?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?)
+}
+
+/// Durable scheduling of one notice row with the state of its effect.
+fn notice_row(db: &rusqlite::Connection, effect: &str) -> Result<(i64, i64, i64, String), Fault> {
+    Ok(db.query_row(
+        "SELECT n.pending,n.send_started,n.custody_confirmed,e.state
+         FROM chat_notice_targets n JOIN effects e ON e.id=n.effect WHERE n.effect=?1",
+        [effect],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?)
+}
+
+/// A notice whose send started without confirmed custody stops being polled once
+/// its seat is retired or its pool is closed, keeping its row and `unknown`
+/// state. A live seat in an open pool stays polled whatever its publication
+/// window, a close notice is replayed until its own window ends, and never-sent
+/// notices, close notices included, are still claimed.
+#[tokio::test]
+async fn chat_unknown_notice_stops_being_polled_for_retired_or_closed()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_root, config, store) = fixture()?;
+    let open_pool = reserve(&store, None).await?;
+    install(&store, &open_pool).await?;
+    let mut other = input(None);
+    other["request_key"] = json!("start-closed");
+    let closed_pool = stored(&store, move |store| {
+        state::start(store, parse(other)?, 1002)
+    })
+    .await?;
+    install(&store, &closed_pool).await?;
+    let live: String = stored(&store, move |store| {
+        let seats: Vec<String> = open_pool.jobs.iter().map(|job| job.member_id.clone()).collect();
+        let post = |pool: &str, revision, key: &str| {
+            json!({"pool_id":pool,"expected_revision":revision,"request_key":key,"body":"notice"})
+        };
+        for (pool, key) in [(&open_pool.pool_id, "open-first"), (&closed_pool.pool_id, "closed-first")] {
+            state::owner_call(store, "pool_post", post(pool, 1, key))?;
+        }
+        let first = state::due_notices(store, 6, 0)?;
+        assert_eq!(first.len(), 6);
+        for mut effect in first {
+            let seat: String = store.test_db().query_row(
+                "SELECT member FROM chat_notice_targets WHERE effect=?1",
+                [&effect.effect_id],
+                |row| row.get(0),
+            )?;
+            // The second seat of the open pool keeps its first notice unsent.
+            if seat != seats[1] {
+                unknown_send(store, &mut effect)?;
+            }
+        }
+        let possible = notice_effects(
+            store.test_db(),
+            "SELECT effect FROM chat_notice_targets
+             WHERE send_started=1 AND custody_confirmed=0 ORDER BY effect",
+        )?;
+        assert_eq!(possible.len(), 5);
+        state::owner_call(
+            store,
+            "pool_close",
+            json!({"pool_id":closed_pool.pool_id,"expected_revision":2,"request_key":"close"}),
+        )?;
+        // The next claim ends the three possible sends of the closed pool.
+        let closes = state::due_notices(store, 3, 0)?;
+        assert_eq!(closes.len(), 3);
+        for effect in &closes {
+            assert!(matches!(
+                state::notice(store, &effect.effect_id)?,
+                state::Notice::Unresolved { closing: true, .. }
+            ));
+        }
+        let kept = notice_effects(
+            store.test_db(),
+            "SELECT effect FROM chat_notice_targets
+             WHERE send_started=1 AND custody_confirmed=0 AND pending=1",
+        )?;
+        assert_eq!(kept.len(), 2);
+        for id in possible.iter().filter(|id| !kept.contains(id)) {
+            assert_eq!(
+                notice_row(store.test_db(), id)?,
+                (0, 1, 0, "unknown".into())
+            );
+        }
+        let mut close = closes.into_iter().next().ok_or(Fault::Internal)?;
+        let unknown_close = close.effect_id.clone();
+        unknown_send(store, &mut close)?;
+        state::owner_call(store, "pool_post", post(&open_pool.pool_id, 2, "open-second"))?;
+        let replacement = json!({"pool_id":open_pool.pool_id,"expected_revision":3,
+            "request_key":"replace-unknown-seat","member_id":seats[2],"member":spec("implement")});
+        state::replace(store, parse(replacement)?)?;
+        let db = store.test_db();
+        let unknown = notice_effects(
+            db,
+            "SELECT effect FROM chat_notice_targets
+             WHERE send_started=1 AND custody_confirmed=0 AND pending=1 ORDER BY effect",
+        )?;
+        let fresh = notice_effects(
+            db,
+            "SELECT effect FROM chat_notice_targets WHERE send_started=0 AND pending=1
+             ORDER BY effect",
+        )?;
+        // Two possible sends in the open pool and the close notice; four unsent notices
+        // in the open pool and two unsent close notices.
+        assert_eq!((unknown.len(), fresh.len()), (3, 6));
+        let live: String = db.query_row(
+            "SELECT n.effect FROM chat_notice_targets n JOIN members m ON m.id=n.member
+             WHERE m.id=?1 AND n.send_started=1 AND n.custody_confirmed=0",
+            [&seats[0]],
+            |row| row.get(0),
+        )?;
+        let retired_fresh: String = db.query_row(
+            "SELECT n.effect FROM chat_notice_targets n JOIN members m ON m.id=n.member
+             WHERE m.id=?1 AND n.send_started=0 AND n.pending=1",
+            [&seats[2]],
+            |row| row.get(0),
+        )?;
+        // An ended publication window alone must not end the live possible send.
+        db.execute(
+            "UPDATE chat_notice_targets SET publish_until_ms=1 WHERE effect=?1",
+            [&live],
+        )?;
+        db.execute("UPDATE chat_notice_targets SET next_resolve_ms=0", [])?;
+        let mut claimed: Vec<String> = state::due_notices(store, 32, 8)?
+            .iter()
+            .map(|effect| effect.effect_id.clone())
+            .collect();
+        let mut expected = fresh.clone();
+        expected.extend([live.clone(), unknown_close.clone()]);
+        claimed.sort();
+        expected.sort();
+        assert_eq!(claimed, expected);
+        let db = store.test_db();
+        let polled = [live.as_str(), unknown_close.as_str()];
+        for id in &unknown {
+            let pending = i64::from(polled.contains(&id.as_str()));
+            assert_eq!(notice_row(db, id)?, (pending, 1, 0, "unknown".into()));
+        }
+        for id in &fresh {
+            let row: (i64, i64) = db.query_row(
+                "SELECT pending,send_started FROM chat_notice_targets WHERE effect=?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            assert_eq!(row, (1, 0));
+        }
+        let unsent_close = notice_effects(
+            db,
+            "SELECT effect FROM chat_notice_targets WHERE close_notice=1 AND send_started=0",
+        )?;
+        // Unsent notices end or ship through their own claim, never through the sweep.
+        assert!(matches!(
+            state::notice(store, &retired_fresh)?,
+            state::Notice::Cancelled
+        ));
+        for id in &unsent_close {
+            assert!(matches!(
+                state::notice(store, id)?,
+                state::Notice::Unresolved { closing: true, .. }
+            ));
+        }
+        // A close notice is still replayed after its lost acknowledgement, and ends
+        // only with its own publication window, keeping its row and state.
+        assert_eq!(
+            state::begin_notice_send(store, &unknown_close)?,
+            state::NoticeSend::Publish { replay: true }
+        );
+        let db = store.test_db();
+        db.execute(
+            "UPDATE chat_notice_targets SET publish_until_ms=1 WHERE effect=?1",
+            [&unknown_close],
+        )?;
+        db.execute(
+            "UPDATE chat_notice_targets SET next_resolve_ms=0 WHERE send_started=1 AND pending=1",
+            [],
+        )?;
+        let due: Vec<String> = state::due_notices(store, 0, 8)?
+            .iter()
+            .map(|effect| effect.effect_id.clone())
+            .collect();
+        assert_eq!(due, [live.as_str()]);
+        assert_eq!(
+            notice_row(store.test_db(), &unknown_close)?,
+            (0, 1, 0, "unknown".into())
+        );
+        Ok(live)
+    })
+    .await?;
+    drop(store);
+    let store = Arc::new(Mutex::new(Store::open(&config.database_path)?));
+    stored(&store, move |store| {
+        // After a restart the live possible send is still polled; the others stay terminal.
+        store.test_db().execute(
+            "UPDATE chat_notice_targets SET next_resolve_ms=0 WHERE send_started=1 AND pending=1",
+            [],
+        )?;
+        let due: Vec<String> = state::due_notices(store, 0, 8)?
+            .iter()
+            .map(|effect| effect.effect_id.clone())
+            .collect();
+        assert_eq!(due, [live]);
+        let ended: i64 = store.test_db().query_row(
+            "SELECT count(*) FROM chat_notice_targets
+             WHERE send_started=1 AND custody_confirmed=0 AND pending=0",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(ended, 5);
+        Ok(())
+    })
+    .await?;
+    Ok(())
+}
+
 /// `notify` limits the wake to the resolved seats while history stays shared;
 /// owner posts wake everyone and an unmatched selector lists the current seats.
 #[tokio::test]
