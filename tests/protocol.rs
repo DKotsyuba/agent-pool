@@ -1094,6 +1094,17 @@ async fn chat_owner_stdio_catalog() {
             "pool_completion_get"
         ]
     );
+    let direct = &tools[4];
+    assert!(
+        direct["description"]
+            .as_str()
+            .unwrap()
+            .contains("unique exact roster name in member_id")
+    );
+    assert_eq!(
+        direct["inputSchema"]["properties"]["member_id"]["type"],
+        "string"
+    );
     let invalid = std::process::Command::new(binary())
         .args([
             "mcp",

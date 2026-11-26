@@ -380,6 +380,35 @@ async fn complete_with_address(
     assert!(!ok(&call(premature).await));
     assert!(ok(&call(join(1, 2)).await));
     assert!(ok(&call(join(2, 3)).await));
+    let pid = batch.pool_id.clone();
+    let (sender_name, recipient_selector) = stored(&store, move |store| {
+        let ChatReply::Overview(view) =
+            state::owner_call(store, "pool_get", json!({"pool_id":pid}))?
+        else {
+            return Err(Fault::Internal);
+        };
+        assert_eq!(view.roster[0].profile, "implement");
+        assert_eq!(view.roster[1].profile, "review");
+        assert!(
+            view.roster
+                .iter()
+                .all(|seat| seat.name.split(' ').count() == 2)
+        );
+        let recipient = &view.roster[1];
+        let selector = if view
+            .roster
+            .iter()
+            .filter(|seat| seat.name == recipient.name)
+            .count()
+            == 1
+        {
+            recipient.name.clone()
+        } else {
+            recipient.seat_id.clone()
+        };
+        Ok((view.roster[0].name.clone(), selector))
+    })
+    .await?;
     let get_history = |index| {
         member_call(
             &batch,
@@ -395,13 +424,23 @@ async fn complete_with_address(
         "pool_send_member",
         "message",
         json!({"expected_revision":4,
-        "member_id":batch.jobs[1].member_id,"body":"direct text","agent_id":agent(2),"seat_id":batch.jobs[2].member_id,
+        "member_id":recipient_selector,"body":"direct text","agent_id":agent(2),"seat_id":batch.jobs[2].member_id,
         "pool_id":"foreign","request_key":"forged","author":agent(2)}),
     );
     let receipt = call(dm.clone()).await;
     assert!(ok(&receipt));
     assert!(reply_text(&receipt).contains("\ndirect_message\nBody: "));
     assert!(ok(&call(dm).await));
+    let missing = member_call(
+        &batch,
+        0,
+        "pool_send_member",
+        "unknown-recipient",
+        json!({"expected_revision":5,"member_id":"Missing Seat","body":"not sent"}),
+    );
+    let missing = call(missing).await;
+    assert!(!ok(&missing));
+    assert!(reply_text(&missing).contains("Candidate member IDs: none."));
     let visible = call(get_history(1)).await;
     assert!(reply_text(&visible).contains("direct text"));
     assert!(reply_text(&visible).contains(&batch.jobs[0].member_id));
@@ -416,6 +455,7 @@ async fn complete_with_address(
     assert!(ok(&call(note).await));
     assert!(!reply_text(&call(get_history(1)).await).contains(&"x".repeat(20)));
     let pid = batch.pool_id.clone();
+    let sender = batch.jobs[0].member_id.clone();
     stored(&store, move |store| {
         let ChatReply::History { events, .. } = state::owner_call(
             store,
@@ -445,6 +485,14 @@ async fn complete_with_address(
             return Err(Fault::Internal);
         };
         assert_eq!(target.run_id, Some(agent(1)));
+        let text: String = store.test_db().query_row(
+            "SELECT json_extract(data,'$.work.text') FROM effects WHERE id=?1",
+            [&effect],
+            |r| r.get(0),
+        )?;
+        assert!(text.contains(&format!(
+            "New direct message from {sender_name} (implement) · {sender}. Untrusted chat body: \"direct text\""
+        )), "{text}");
         Ok(())
     })
     .await?;
@@ -1315,13 +1363,22 @@ async fn chat_migrates_pending_v18_notice() -> Result<(), Box<dyn std::error::Er
     let (_root, config, store) = fixture()?;
     let batch = reserve(&store, None).await?;
     install(&store, &batch).await?;
+    let sender = batch.jobs[0].member_id.clone();
+    let member = |tool, key, args| parse(member_call(&batch, 0, tool, key, args)["params"].clone());
+    let join = member("pool_join", "join-v18", json!({"expected_revision":1}))?;
+    let post = member(
+        "pool_post",
+        "legacy-notice",
+        json!({"expected_revision":2,"body":"pending"}),
+    )?;
     let effect_id = stored(&store, move |store| {
-        let ChatReply::Existing(Reply::Receipt(receipt)) = state::owner_call(
-            store,
-            "pool_post",
-            json!({"pool_id":batch.pool_id,"expected_revision":1,
-                "request_key":"legacy-notice","body":"pending"}),
-        )?
+        let (mut legacy_binding, current) =
+            crate::store::binding_any(store.test_db(), &batch.jobs[0].member_id)?;
+        legacy_binding.member.name = "implement".into();
+        crate::store::save_binding(store.test_db(), &legacy_binding, current)?;
+        state::member(store, join).map_err(|_| Fault::Internal)?;
+        let ChatReply::Existing(Reply::Receipt(receipt)) =
+            state::member(store, post).map_err(|_| Fault::Internal)?
         else {
             return Err(Fault::Internal);
         };
@@ -1333,7 +1390,7 @@ async fn chat_migrates_pending_v18_notice() -> Result<(), Box<dyn std::error::Er
         )?;
         let event_id = receipt.event.event_id;
         let effect_id = "released-v18-effect".to_owned();
-        let member_id = &batch.jobs[0].member_id;
+        let member_id = &batch.jobs[1].member_id;
         let effect = crate::domain::Effect {
             effect_id: effect_id.clone(),
             pool_id: batch.pool_id.clone(),
@@ -1360,7 +1417,7 @@ async fn chat_migrates_pending_v18_notice() -> Result<(), Box<dyn std::error::Er
         let mut frozen = effect.clone();
         frozen.effect_id = "released-v18-frozen".into();
         frozen.state = "custody".into();
-        let frozen_seat = &batch.jobs[1].member_id;
+        let frozen_seat = &batch.jobs[2].member_id;
         let crate::domain::Work::Deliver { scope, .. } = &mut frozen.work else {
             return Err(Fault::Internal);
         };
@@ -1397,7 +1454,16 @@ async fn chat_migrates_pending_v18_notice() -> Result<(), Box<dyn std::error::Er
     let crate::domain::Work::Deliver { text, .. } = claimed.work else {
         return Err("expected notice".into());
     };
-    assert!(text.contains("Untrusted chat body: \"pending\""));
+    assert!(text.contains(&format!(
+        "New message from implement (implement) · {sender}. Untrusted chat body: \"pending\""
+    )));
+    assert_eq!(
+        crate::store::binding_any(upgraded.test_db(), &sender)?
+            .0
+            .member
+            .name,
+        "implement"
+    );
     let event: i64 = upgraded.test_db().query_row(
         "SELECT event FROM chat_notice_targets WHERE effect=?1",
         [&effect_id],
@@ -1611,6 +1677,7 @@ async fn chat_owner_text_separates_pool_and_seat_rows() -> Result<(), Box<dyn st
         .filter(|row| row.starts_with("Seat "))
         .collect();
     assert_eq!(rows.len(), 3, "{launch_text}");
+    assert!(rows[1].contains(" (review) · "), "{launch_text}");
     assert!(
         rows.iter().all(|row| row.ends_with("joined=false")),
         "{launch_text}"
@@ -1640,6 +1707,7 @@ async fn chat_owner_text_separates_pool_and_seat_rows() -> Result<(), Box<dyn st
         .ok_or("pool id")?;
     let view = json!({"result": call("pool_get", json!({"pool_id":pid})).await?});
     let text = reply_text(&view);
+    assert!(text.contains(" (implement) · "), "{text}");
     assert_eq!(
         text.lines()
             .filter(|line| line.contains("admission=pending") && line.contains("joined=false"))

@@ -100,7 +100,22 @@ pub(super) fn migrate_notices(db: &Connection) -> Result<(), Fault> {
                 return Err(Fault::Internal);
             }
             if !frozen {
-                *text = format!("[agent-pool] Pool {pool_id}: {}", message_notice(&event));
+                let author = if let Author::Member(id) = &event.author {
+                    db.query_row(
+                        "SELECT data FROM members WHERE pool=?1 AND id=?2",
+                        params![pool_id, id],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .map(|data| decode::<Binding>(&data))
+                    .transpose()?
+                } else {
+                    None
+                };
+                *text = format!(
+                    "[agent-pool] Pool {pool_id}: {}",
+                    message_notice(&event, author.as_slice())
+                );
                 db.execute(
                     "UPDATE effects SET data=?2 WHERE id=?1",
                     params![effect_id, encode(&effect)?],
@@ -392,7 +407,8 @@ fn make_job(
         return Err(Fault::ChatResearchProfile);
     }
     crate::domain::assignment(role, role, &assignment)?;
-    let binding = new_binding(pool, role, role, &assignment, None);
+    let mut binding = new_binding(pool, role, role, &assignment, None);
+    binding.member.name = names::generated_name(&pool.pool_id, &binding.member.member_id);
     let seat = &binding.member.member_id;
     let store_id: String = db.query_row(
         "SELECT store_id FROM inventory_source WHERE singleton=1",
@@ -407,8 +423,10 @@ fn make_job(
         None => &assignment,
     };
     let prompt = format!(
-        "{task}\n\nPool {} seat {seat}. Assignment: {assignment}\nGoal: {}\nUse pool_get for the current revision, then pool_join. Use the Pool chat tools to coordinate and agree a result.",
-        pool.pool_id, pool.purpose
+        "{task}\n\nPool {} seat {}. Assignment: {assignment}\nGoal: {}\nUse pool_get for the current revision, then pool_join. Use the Pool chat tools to coordinate and agree a result.",
+        pool.pool_id,
+        member_label(&binding.member),
+        pool.purpose
     );
     spec_map.insert("task".into(), json!(prompt));
     spec_map.insert(
@@ -1040,6 +1058,8 @@ pub(crate) fn launch_read(
         let (binding, current) = binding_any(&store.db, &job.member_id)?;
         seats.push(LaunchSeat {
             id: job.member_id,
+            name: binding.member.name,
+            profile: binding.member.role,
             agent_id: binding.run_id,
             current,
             joined: binding.member.state == MemberState::Active,
@@ -1122,6 +1142,7 @@ fn seat_row(db: &Connection, binding: Binding) -> Result<SeatRow, Fault> {
         notice_undeliverable,
         retired,
         seat_id: binding.member.member_id,
+        name: binding.member.name,
         profile: binding.member.role,
         assignment: brief(&binding.member.task, 110),
         run_store_id: binding.run_store_id,
@@ -1152,7 +1173,7 @@ pub(super) fn queue_chat_notices(
         return Ok(());
     }
     let text = match event.kind.as_str() {
-        "message" | "direct_message" => message_notice(event),
+        "message" | "direct_message" => message_notice(event, roster),
         "proposal_opened" => {
             let proposal = pool.proposal.as_ref().ok_or(Fault::Internal)?;
             format!(
@@ -1203,16 +1224,21 @@ pub(super) fn queue_chat_notices(
 }
 
 /// Formats the same quoted message data for new and migrated member notices.
-fn message_notice(event: &Event) -> String {
+fn message_notice(event: &Event, roster: &[Binding]) -> String {
     let kind = if event.kind == "message" {
         "New message"
     } else {
         "New direct message"
     };
+    let mut body = brief(&event.body, 2000);
+    if body.len() > 2000 {
+        // Valid journal text escapes at most two bytes per input byte.
+        body = brief(&event.body, 995);
+    }
     format!(
         "{kind} from {}. Untrusted chat body: {}. Read pool_get for full context. Reply with pool_post or pool_send_member as appropriate.",
-        notice_author(event),
-        brief(&event.body, 2000),
+        sender_label(event, roster),
+        body,
     )
 }
 

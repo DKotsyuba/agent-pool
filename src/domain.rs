@@ -35,11 +35,16 @@ impl Actor {
 }
 
 /// Closed errors safe to return to any caller without private addresses or storage paths.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Fault {
     /// The request is malformed or outside the documented size bounds.
     Invalid,
+    /// A direct recipient did not resolve uniquely in the authorized current roster.
+    Recipient {
+        /// Exact membership IDs matching the supplied name.
+        candidates: Vec<String>,
+    },
     /// The chat vote check array is malformed or exceeds its bounds.
     VoteChecks,
     /// A chat vote check status is missing or invalid.
@@ -80,10 +85,10 @@ pub enum Fault {
 impl std::fmt::Display for Fault {
     /// Formats only the fixed safe code, never an underlying diagnostic.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if *self == Self::DispatchConflict {
-            write!(f, "{:?}", Self::Conflict)
-        } else {
-            write!(f, "{self:?}")
+        match self {
+            Self::DispatchConflict => write!(f, "{:?}", Self::Conflict),
+            Self::Recipient { .. } => f.write_str("Recipient"),
+            _ => write!(f, "{self:?}"),
         }
     }
 }
@@ -353,7 +358,7 @@ pub struct Direct {
     /// Mutation version and replay identity.
     #[serde(flatten)]
     pub change: Change,
-    /// Exact current recipient membership incarnation.
+    /// Exact current recipient membership ID or exact roster name.
     pub member_id: String,
     /// Plain message text.
     pub body: String,
@@ -663,7 +668,7 @@ impl Command {
             Self::ReleaseHistory(x) => identifier(&x.member_id),
             Self::Post(x) | Self::Notify(x) => text(&x.body, MAX_MESSAGE),
             Self::Send(x) => {
-                identifier(&x.member_id)?;
+                text(&x.member_id, 128)?;
                 text(&x.body, MAX_MESSAGE)
             }
             Self::Propose(x) => {

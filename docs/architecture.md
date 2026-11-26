@@ -1198,6 +1198,12 @@ the relay. A retired seat cannot read or write even on an exact retry, and
 closing a pool revokes all seats. Direct history is restricted to the sender,
 recipient and authorized owners. Owner messages are visible to their sender and
 authorized owners. The durable outbox publishes member notices through Bridge.
+New chat seats store a stable display name derived from the pool ID and member
+ID, with the Run profile as their role. Existing seats and managed pools keep
+their stored names. Message notices use the journal author ID to look up the
+sender's name and role. In chat and managed pools, `pool_send_member` accepts an
+exact current member ID or a unique exact roster name in `member_id`. Delivery
+and history use the resolved ID. Recipient errors list the matching current IDs.
 A public message reaches current admitted seats other than its author, a direct
 message reaches only its recipient, and a proposal requests votes from current
 admitted peers. Owner posts reach all current admitted seats. Completion and

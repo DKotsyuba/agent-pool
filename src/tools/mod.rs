@@ -77,7 +77,7 @@ pub(crate) fn chat_definitions(names: &[&str], member: bool) -> Vec<Value> {
                 tool["description"] = json!("Vote on the exact proposal_id and roster_key. For free-text criteria, omit checks and provide evidence for ready or block. For structured acceptance, ready requires one check per exact ID from pool_get section=criteria. Status must be met or unmet. Block may omit checks and revoke must omit them.");
                 tool["inputSchema"]["properties"]["checks"]["items"]["properties"]["criterion_id"]["pattern"] = json!("^[A-Za-z0-9_.-]+$");
             }
-            "pool_send_member" => tool["description"] = json!("Send to an exact current member_id. History is visible to the sender, recipient and owners."),
+            "pool_send_member" => tool["description"] = json!("Send to an exact current member ID or unique exact roster name in member_id. History is visible to the sender, recipient and owners."),
             _ => {}
         }
         if member && *name != "pool_get" {
@@ -239,7 +239,7 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "pool_send_member",
-            "Deliver to one exact current membership ID and record shared history. Bodies over 2048 bytes are committed as ordered history parts; notifications show the first part. Removed IDs are never redirected.",
+            "Deliver to one exact current membership ID or unique exact roster name in member_id and record shared history. Bodies over 2048 bytes are committed as ordered history parts; notifications show the first part. Removed IDs are never redirected.",
             mutation(
                 json!({"member_id":string(128),"body":string(8192)}),
                 &["member_id", "body"],
@@ -280,6 +280,10 @@ pub fn templates() -> Vec<(&'static str, &'static str)> {
             "ERROR invalid_arguments: get_status accepts an empty argument object.\n",
         ),
         ("pool_error", "ERROR {{ code }}. {{ recovery }}\n"),
+        (
+            "pool_recipient_error",
+            "ERROR recipient. Use an exact current member ID or unique exact roster name. Candidate member IDs: {% if candidates %}{% for id in candidates %}{% if not loop.first %}, {% endif %}{{ id }}{% endfor %}{% else %}none{% endif %}.\n",
+        ),
         ("pool_view", include_str!("../templates/pool_view.j2")),
         ("pool_receipt", include_str!("../templates/pool_receipt.j2")),
         (
@@ -336,6 +340,11 @@ struct ErrorView {
     /// Recovery selected from the immutable outcome.
     recovery: &'static str,
 }
+/// Shows only public member IDs from the authorized current roster.
+#[derive(Serialize)]
+struct RecipientErrorView<'a> {
+    candidates: &'a [String],
+}
 /// Constructed only after explicit owner authorization; absent from participant presentation.
 #[derive(Serialize)]
 struct PrivateView<'a> {
@@ -367,7 +376,9 @@ pub fn present(reply: Result<Reply, Fault>, templates: &Templates) -> CallToolRe
         Ok(Reply::Pending{pool_id,request_key})=>templates.render("pool_pending",&PendingView{pool_id,request_key}),
         Ok(Reply::List{pools,next_after,has_more})=>templates.render("pool_list",&ListView{pools,next_after,has_more:*has_more}),
         Ok(Reply::Enrollment(view))=>templates.render("pool_enrollment",view),
-        Err(code)=>templates.render("pool_error",&ErrorView{code:match code{Fault::Completed=>Fault::Closed,Fault::DispatchConflict=>Fault::Conflict,_=>*code},recovery:match code{
+        Err(Fault::Recipient{candidates})=>templates.render("pool_recipient_error",&RecipientErrorView{candidates}),
+        Err(code)=>templates.render("pool_error",&ErrorView{code:match code{Fault::Completed=>Fault::Closed,Fault::DispatchConflict=>Fault::Conflict,_=>code.clone()},recovery:match code{
+            Fault::Recipient{..}=>"Read pool_get for current member IDs.",
             Fault::Stale=>"Read pool_get for current revision and proposal/roster identity before a new intent.",
             Fault::Unavailable=>"A previous write may have committed. Inspect pool_get or repeat only the identical request_key and intent.",
             Fault::RelaunchRequired=>"Relaunch the Pool resident after Bridge managed mode is enabled. Preserve the original request_key for recovery.",
@@ -395,6 +406,7 @@ pub fn present(reply: Result<Reply, Fault>, templates: &Templates) -> CallToolRe
         Ok(Reply::Enrollment(view))=>format!("READ COMPLETED enrollment {} state={} revision={}; presentation degraded. Retry the same read; no Run call or retry was made.",view.enrollment_id,view.state,view.revision),
         Err(Fault::RelaunchRequired)=>"ERROR relaunch_required; relaunch the Pool resident after Bridge managed mode is enabled. Preserve the original request_key for recovery.".into(),
         Err(Fault::Completed)=>"ERROR closed; the pool is completed (formal completion record committed), not explicitly closed. No mutation was applied.".into(),
+        Err(Fault::Recipient{candidates})=>format!("ERROR recipient. Use an exact current member ID. Candidate member IDs: {}.", if candidates.is_empty() {"none".into()} else {candidates.join(", ")}),
         Err(code)=>format!("ERROR {code}; presentation degraded. No success confirmed; preserve the original request_key for reconciliation."),
     });
     result(text, error)

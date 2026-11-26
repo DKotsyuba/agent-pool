@@ -234,6 +234,7 @@ pub(crate) struct Overview {
 #[derive(Serialize)]
 pub(crate) struct SeatRow {
     pub seat_id: String,
+    pub name: String,
     pub profile: String,
     pub assignment: String,
     #[serde(skip)]
@@ -277,6 +278,8 @@ pub(crate) struct PoolRow {
 #[derive(Serialize)]
 pub(crate) struct LaunchSeat {
     pub id: String,
+    pub name: String,
+    pub profile: String,
     pub current: bool,
     pub joined: bool,
     pub agent_id: Option<String>,
@@ -404,7 +407,7 @@ pub(crate) fn renderer() -> Result<&'static Templates, Fault> {
             Templates::new(&entries).map_err(|_| Fault::Internal)
         })
         .as_ref()
-        .map_err(|fault| *fault)
+        .map_err(Clone::clone)
 }
 
 fn text_reply(text: String, error: bool) -> CallToolResult {

@@ -1,5 +1,6 @@
 //! Single-writer SQLite state machine. Transactions commit business state and delivery intents together.
 pub(crate) mod chat;
+mod names;
 use crate::{domain::*, integrations::PinReleaseToken};
 use fs2::FileExt;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -3172,6 +3173,7 @@ fn execute_authorized(
             caller.as_ref().ok_or(Fault::Forbidden)?.member.member_id
         )
     };
+    // Replay the original selector even if the roster changed after commitment.
     let digest = command.digest()?;
     if let Some(reply) = replay(db, &replay_scope, &c.request_key, &digest)? {
         return Ok(reply);
@@ -3179,6 +3181,11 @@ fn execute_authorized(
     if p.closed && !matches!(command, Command::ReleaseHistory(_)) {
         return Err(Fault::Closed);
     }
+    let recipient = if let Command::Send(request) = command {
+        Some(direct_recipient(db, pid, &roster, &request.member_id)?)
+    } else {
+        None
+    };
     // C3: a committed completion freezes goal, roster, assignments, proposals and votes.
     if matches!(
         command,
@@ -3562,13 +3569,10 @@ fn execute_authorized(
             false,
         ),
         Command::Send(x) => {
-            let b = roster
-                .iter()
-                .find(|b| b.member.member_id == x.member_id)
-                .ok_or(Fault::Forbidden)?;
+            let b = recipient.ok_or(Fault::Internal)?;
             direct_address = Some(b.address.clone().unwrap_or_default());
             direct_scope = Some(scope(&b.member.member_id));
-            target = Some(x.member_id.clone());
+            target = Some(b.member.member_id.clone());
             (
                 "direct_message",
                 first_message_part(&x.body, &mut message_parts),
@@ -4621,6 +4625,38 @@ pub(crate) fn bindings(db: &Connection, pool: &str) -> Result<Vec<Binding>, Faul
     stmt.query_map([pool], |r| r.get::<_, String>(0))?
         .map(|r| decode(&r?))
         .collect()
+}
+/// Resolves a display name after authorization, preserving exact and retired ID semantics.
+fn direct_recipient<'a>(
+    db: &Connection,
+    pool: &str,
+    roster: &'a [Binding],
+    selector: &str,
+) -> Result<&'a Binding, Fault> {
+    if let Some(binding) = roster.iter().find(|b| b.member.member_id == selector) {
+        return Ok(binding);
+    }
+    let retired: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM members WHERE pool=?1 AND id=?2)",
+        params![pool, selector],
+        |row| row.get(0),
+    )?;
+    let mut matches = roster
+        .iter()
+        .filter(|b| !retired && b.member.name == selector);
+    match (matches.next(), matches.next()) {
+        (Some(binding), None) => Ok(binding),
+        (Some(first), Some(second)) => Err(Fault::Recipient {
+            candidates: [first, second]
+                .into_iter()
+                .chain(matches)
+                .map(|b| b.member.member_id.clone())
+                .collect(),
+        }),
+        _ => Err(Fault::Recipient {
+            candidates: Vec::new(),
+        }),
+    }
 }
 /// Loads an exact retained incarnation and whether it still has access.
 pub(crate) fn binding_any(db: &Connection, id: &str) -> Result<(Binding, bool), Fault> {
@@ -5990,15 +6026,35 @@ fn roster_text(roster: &[Binding]) -> String {
     );
     for b in roster {
         out.push_str(&format!(
-            "{} | {} | role={} | task={} | {:?}\n",
-            b.member.member_id,
-            brief(&b.member.name, 24),
-            brief(&b.member.role, 40),
+            "{} | task={} | {:?}\n",
+            member_label(&b.member),
             brief(&b.member.task, 48),
             b.member.state
         ));
     }
     out
+}
+/// Displays bounded roster labels alongside the exact membership ID.
+fn member_label(member: &Member) -> String {
+    use crate::response::one_line;
+    format!(
+        "{} ({}) · {}",
+        one_line(&member.name, 24),
+        one_line(&member.role, 40),
+        member.member_id
+    )
+}
+
+/// Looks up a sender by journal author ID in the supplied roster.
+fn sender_label(event: &Event, roster: &[Binding]) -> String {
+    match &event.author {
+        Author::Leader => "owner".into(),
+        Author::Service => "service".into(),
+        Author::Member(id) => roster
+            .iter()
+            .find(|b| b.member.member_id == *id)
+            .map_or_else(|| id.clone(), |b| member_label(&b.member)),
+    }
 }
 /// Quotes a descriptive notification preview on a UTF-8 boundary; exact content stays retrievable.
 fn brief(s: &str, limit: usize) -> String {
@@ -6020,6 +6076,14 @@ fn notification(p: &Pool, roster: &[Binding], e: &Event) -> Result<String, Fault
         .filter(|b| b.member.state == MemberState::Active)
         .count();
     let body = encode(&e.body)?;
+    let sender = if matches!(
+        e.kind.as_str(),
+        "message" | "direct_message" | "owner_message"
+    ) {
+        format!("From {}\n", sender_label(e, roster))
+    } else {
+        String::new()
+    };
     let parts = e.part_count.map_or_else(String::new, |count| {
         format!(
             "Message {} part 1/{count}; read the following history parts for the full text.\n",
@@ -6027,7 +6091,7 @@ fn notification(p: &Pool, roster: &[Binding], e: &Event) -> Result<String, Fault
         )
     });
     let text = format!(
-        "Pool {} revision {}. Event {}: {}\nBody: {}\n{parts}Confirmed {}; pending {}.\n{}Use pool_get for current details; older events never replace newer state.",
+        "Pool {} revision {}. Event {}: {}\n{sender}Body: {}\n{parts}Confirmed {}; pending {}.\n{}Use pool_get for current details; older events never replace newer state.",
         p.pool_id,
         p.revision,
         e.event_id,
@@ -6057,12 +6121,11 @@ pub(crate) fn onboarding(p: &Pool, roster: &[Binding], member: &Member) -> Resul
         ""
     };
     let text = format!(
-        "Agent Pool onboarding\nPool {}: {}\nPurpose: {}\nYour member_id: {}\nRole: {}\nTask: {}\nCurrent revision: {}\n{}\nLeader is external and is not a member or voter. pool_post reaches members only; pool_send_member reaches one current peer; pool_notify_owner reaches the hidden owner. All messages share history. Use local member IDs only. Read pool_get then confirm the current revision with pool_join. {criteria}Pending members cannot vote. Removed membership loses access. Completion or consensus does not close the pool. Separate Bridge remains independent.\n",
+        "Agent Pool onboarding\nPool {}: {}\nPurpose: {}\nYour membership: {}\nTask: {}\nCurrent revision: {}\n{}\nLeader is external and is not a member or voter. pool_post reaches members only; pool_send_member reaches one current peer by ID or unique exact name; pool_notify_owner reaches the hidden owner. All messages share history. Read pool_get then confirm the current revision with pool_join. {criteria}Pending members cannot vote. Removed membership loses access. Completion or consensus does not close the pool. Separate Bridge remains independent.\n",
         p.pool_id,
         p.name,
         purpose,
-        member.member_id,
-        member.role,
+        member_label(member),
         member.task,
         p.revision,
         roster_text(roster)
@@ -10077,15 +10140,20 @@ mod tests {
         let start = s.fixture_legacy_start(&start.effect_id).unwrap();
         assert!(matches!(start.work, Work::Start { .. }));
         let c = change(&s, &p);
-        s.execute(
-            &lead,
-            &Command::Send(Direct {
-                change: c,
-                member_id: mid.clone(),
-                body: "Do not lose this".into(),
-            }),
-        )
-        .unwrap();
+        let Reply::Receipt(receipt) = s
+            .execute(
+                &lead,
+                &Command::Send(Direct {
+                    change: c,
+                    member_id: "Run".into(),
+                    body: "Do not lose this".into(),
+                }),
+            )
+            .unwrap()
+        else {
+            panic!("expected a receipt");
+        };
+        assert_eq!(receipt.event.recipient.as_deref(), Some(mid.as_str()));
         assert!(s.next_effect().unwrap().is_none());
         s.record_run_admission(&start.effect_id, "ag-20261107-010101-0000000007", 1)
             .unwrap();
@@ -10094,10 +10162,53 @@ mod tests {
         while let Some(e) = s.next_effect().unwrap() {
             if let Work::Deliver { address, text, .. } = e.work {
                 assert_eq!(address, "native:exact");
-                delivered |= text.contains("Do not lose this");
+                if text.contains("Do not lose this") {
+                    assert!(text.contains("\nFrom owner\n"));
+                    delivered = true;
+                }
             }
         }
         assert!(delivered);
+    }
+    /// Ambiguous names expose only matching IDs and an exact ID still addresses one seat.
+    #[test]
+    fn direct_recipient_requires_unique_exact_name() {
+        let (_d, mut store) = fixture();
+        let owner = actor("owner");
+        let pool = make(&mut store, &owner, "direct");
+        let first = add(&mut store, &owner, &pool, &actor("first"));
+        let second = add(&mut store, &owner, &pool, &actor("second"));
+        let send = |selector: &str| {
+            Command::Send(Direct {
+                change: change(&store, &pool),
+                member_id: selector.into(),
+                body: "body".into(),
+            })
+        };
+        let ambiguous = send("Member");
+        let missing = send("member");
+        let exact = send(&first);
+        let fault = store.execute(&owner, &ambiguous).unwrap_err();
+        let Fault::Recipient { candidates } = &fault else {
+            panic!("expected a recipient error");
+        };
+        assert_eq!(
+            candidates.iter().collect::<BTreeSet<_>>(),
+            [&first, &second].into_iter().collect()
+        );
+        let templates = crate::response::Templates::new(&crate::tools::templates()).unwrap();
+        let reply = serde_json::to_value(crate::tools::present(Err(fault), &templates)).unwrap();
+        let text = reply["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Candidate member IDs: "));
+        assert!(text.contains(&first) && text.contains(&second));
+        assert_eq!(
+            store.execute(&owner, &missing).unwrap_err(),
+            Fault::Recipient { candidates: vec![] }
+        );
+        let Reply::Receipt(receipt) = store.execute(&owner, &exact).unwrap() else {
+            panic!("expected a receipt");
+        };
+        assert_eq!(receipt.event.recipient.as_deref(), Some(first.as_str()));
     }
     /// Twenty maximum-size assignments and quoted proposal data remain retrievable without skipping rows.
     #[test]
