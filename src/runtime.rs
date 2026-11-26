@@ -27,6 +27,10 @@ const MAX_CONNECTIONS: usize = 32;
 const MAX_WAITERS: usize = 8;
 /// Serial observer/outbox cycle cadence; missed ticks are skipped, never replayed in bursts.
 const OBSERVATION_INTERVAL: Duration = Duration::from_secs(5);
+/// Never-sent chat notices published per cycle; their lookups run concurrently.
+const NOTICE_SENDS_PER_TICK: u16 = 32;
+/// Custody and unknown status polls per cycle, budgeted apart from fresh sends.
+const NOTICE_POLLS_PER_TICK: u16 = 8;
 /// One SQLite writer shared only through finite blocking store operations.
 pub(crate) type SharedStore = Arc<Mutex<Store>>;
 
@@ -4833,7 +4837,11 @@ async fn work(
         }
         // One separate batch per tick, with concurrent two-second Run lookups
         // and one short Bridge exchange per item (no provider work under a Store lock).
-        let due = stored(&store, |store| crate::store::chat::due_notices(store, 4)).await?;
+        // Fresh sends and status polls have separate budgets; sends are never starved.
+        let due = stored(&store, |store| {
+            crate::store::chat::due_notices(store, NOTICE_SENDS_PER_TICK, NOTICE_POLLS_PER_TICK)
+        })
+        .await?;
         let mut notices = JoinSet::new();
         for notice in due {
             let store = Arc::clone(&store);

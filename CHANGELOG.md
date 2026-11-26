@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Fixed
+
+- Chat wake notices no longer wait behind delivery status polls. Never-sent notices are claimed first with their own per-cycle budget (32 sends, 8 polls), and their ten-minute resolution deadline starts at the first attempt instead of at enqueue.
+- Confirmed-custody notices are re-polled with backoff from one to fifteen minutes and stop being polled once the seat is retired, the pool is closed or the publication window has ended. The rows and their last state stay in history.
+
 ## 0.3.0
 
 Feature release, 2026-11-26.

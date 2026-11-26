@@ -1300,31 +1300,57 @@ pub(crate) fn notice(store: &Store, effect: &str) -> Result<Notice, Fault> {
     })
 }
 
-/// Claims a bounded indexed batch independently of the owner and managed outboxes.
-pub(crate) fn due_notices(store: &mut Store, limit: u16) -> Result<Vec<Effect>, Fault> {
+/// Claims bounded batches independently of the owner and managed outboxes.
+///
+/// Never-sent notices have their own `sends` budget and are claimed first, so
+/// custody and unknown status polls (`polls` budget) cannot delay a fresh wake.
+/// Before claiming, confirmed-custody rows whose seat was retired, whose pool is
+/// closed or whose publication window ended stop being polled (the row and its
+/// effect state are retained), and a notice that was never attempted gets its
+/// resolution deadline measured from this first claim rather than from enqueue,
+/// so the resident's own scheduling lag cannot expire it.
+pub(crate) fn due_notices(store: &mut Store, sends: u16, polls: u16) -> Result<Vec<Effect>, Fault> {
     let tx = store
         .db
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
     let now = receipt_clock()?;
-    let ids = {
+    tx.execute(
+        "UPDATE chat_notice_targets SET pending=0 WHERE pending=1 AND custody_confirmed=1 AND (
+            coalesce(publish_until_ms<=?1,0)
+            OR EXISTS(SELECT 1 FROM members m LEFT JOIN pools p ON p.id=m.pool
+                WHERE m.id=chat_notice_targets.member
+                AND ((m.current=0 AND chat_notice_targets.close_notice=0)
+                    OR coalesce(json_extract(p.data,'$.closed'),0))))",
+        [now],
+    )?;
+    let mut ids = Vec::new();
+    for (started, limit) in [(false, sends), (true, polls)] {
         let mut stmt = tx.prepare(
-            "SELECT effect FROM chat_notice_targets WHERE pending=1
+            "SELECT effect FROM chat_notice_targets WHERE pending=1 AND send_started=?3
             AND next_resolve_ms<=?1 ORDER BY next_resolve_ms,event,effect LIMIT ?2",
         )?;
-        stmt.query_map(params![now, limit], |r| r.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?
-    };
+        let rows = stmt.query_map(params![now, limit, started], |r| r.get::<_, String>(0))?;
+        for row in rows {
+            ids.push(row?);
+        }
+    }
     let mut effects = Vec::with_capacity(ids.len());
     for id in ids {
+        // The initial retry delay marks a row that no attempt has settled or deferred yet.
         tx.execute(
-            "UPDATE chat_notice_targets SET next_resolve_ms=?2 WHERE effect=?1",
-            params![id, now + 60_000],
+            "UPDATE chat_notice_targets SET next_resolve_ms=?2,
+             resolve_until_ms=CASE WHEN send_started=0 AND resolve_delay_ms=?4
+                THEN max(resolve_until_ms,?3) ELSE resolve_until_ms END WHERE effect=?1",
+            params![id, now + 60_000, now + 600_000, FIRST_NOTICE_DELAY_MS],
         )?;
         effects.push(effect(&tx, &id)?);
     }
     tx.commit()?;
     Ok(effects)
 }
+
+/// Initial `resolve_delay_ms` of a notice; any settled or deferred attempt raises it.
+const FIRST_NOTICE_DELAY_MS: i64 = 5000;
 
 /// Determines whether frozen intent may be published or only reconciled.
 #[derive(Debug, PartialEq, Eq)]
@@ -1363,14 +1389,22 @@ pub(crate) fn begin_notice_send(store: &mut Store, id: &str) -> Result<NoticeSen
 }
 
 /// Updates durable scheduling alongside the effect settlement transaction.
+/// Confirmed custody is re-polled with exponential backoff from one to fifteen minutes.
 pub(super) fn settle_notice(db: &Connection, id: &str, state: &str) -> Result<(), Fault> {
     let custody = state == "custody";
     let pending = custody || state == "unknown";
     db.execute(
         "UPDATE chat_notice_targets SET pending=?2,custody_confirmed=max(custody_confirmed,?3),
-         next_resolve_ms=?4+resolve_delay_ms,resolve_delay_ms=min(60000,2*resolve_delay_ms)
+         next_resolve_ms=?4+max(resolve_delay_ms,?5),
+         resolve_delay_ms=min(CASE WHEN ?3 THEN 900000 ELSE 60000 END,2*max(resolve_delay_ms,?5))
          WHERE effect=?1",
-        params![id, pending, custody, receipt_clock()?],
+        params![
+            id,
+            pending,
+            custody,
+            receipt_clock()?,
+            if custody { 60_000 } else { 0 }
+        ],
     )?;
     Ok(())
 }

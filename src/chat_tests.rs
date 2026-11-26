@@ -802,7 +802,9 @@ async fn chat_notice_backoff_survives_restart() -> Result<(), Box<dyn std::error
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         assert_eq!((total, author), (5, 1));
-        state::due_notices(store, 1)?.pop().ok_or(Fault::Internal)
+        state::due_notices(store, 1, 1)?
+            .pop()
+            .ok_or(Fault::Internal)
     })
     .await?;
     let crate::domain::Work::Deliver { ref text, .. } = first.work else {
@@ -826,11 +828,11 @@ async fn chat_notice_backoff_survives_restart() -> Result<(), Box<dyn std::error
             [&id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
         )?;
         assert_eq!((state.as_str(),deferred,frozen),("queued",true,false));
-        let next = state::due_notices(store, 1)?.pop().ok_or(Fault::Internal)?;
+        let next = state::due_notices(store, 1, 1)?.pop().ok_or(Fault::Internal)?;
         assert_ne!(next.effect_id,id);
         let target: String = store.test_db().query_row("SELECT member FROM chat_notice_targets WHERE effect=?1", [&next.effect_id], |r| r.get(0))?;
         store.test_db().execute("UPDATE chat_notice_targets SET next_resolve_ms=0,resolve_until_ms=0 WHERE effect=?1", [&id])?;
-        let expired = state::due_notices(store, 1)?.pop().ok_or(Fault::Internal)?;
+        let expired = state::due_notices(store, 1, 1)?.pop().ok_or(Fault::Internal)?;
         assert_eq!(expired.effect_id,id);
         Ok((expired,next,target))
     }).await?;
@@ -908,7 +910,9 @@ async fn chat_restricted_role_is_undeliverable_without_backoff()
             store.next_effect()?.is_none(),
             "chat work belongs to its own queue"
         );
-        let notice = state::due_notices(store, 1)?.pop().ok_or(Fault::Internal)?;
+        let notice = state::due_notices(store, 1, 1)?
+            .pop()
+            .ok_or(Fault::Internal)?;
         let seat_id = store.test_db().query_row(
             "SELECT member FROM chat_notice_targets WHERE effect=?1",
             [&notice.effect_id],
@@ -988,7 +992,7 @@ async fn frozen_notices(
             json!({"pool_id":pool_id,"expected_revision":1,
             "request_key":"frozen-notices","body":"pending"}),
         )?;
-        let mut effects = state::due_notices(store, 2)?;
+        let mut effects = state::due_notices(store, 2, 2)?;
         assert_eq!(effects.len(), 2);
         for effect in &mut effects {
             let crate::domain::Work::Deliver { address, .. } = &mut effect.work else {
@@ -1047,7 +1051,9 @@ async fn chat_replays_frozen_publish_after_restart() -> Result<(), Box<dyn std::
                 "UPDATE chat_notice_targets SET next_resolve_ms=0 WHERE effect=?1",
                 [&id],
             )?;
-            state::due_notices(store, 1)?.pop().ok_or(Fault::Internal)
+            state::due_notices(store, 1, 1)?
+                .pop()
+                .ok_or(Fault::Internal)
         })
         .await?;
         assert_eq!(recovered.effect_id, effect.effect_id);
@@ -1092,7 +1098,7 @@ async fn chat_close_orders_with_first_send() -> Result<(), Box<dyn std::error::E
             state::NoticeSend::Cancel
         );
         store.settle_effect(second, state::NOTICE_UNDELIVERABLE)?;
-        let due = state::due_notices(store, 4)?;
+        let due = state::due_notices(store, 4, 4)?;
         assert_eq!(due.len(), 3);
         for notice in due {
             assert!(matches!(
@@ -1142,10 +1148,131 @@ async fn chat_retry_is_not_starved_by_new_posts() -> Result<(), Box<dyn std::err
                 "UPDATE chat_notice_targets SET next_resolve_ms=1 WHERE effect=?1",
                 [&retry],
             )?;
-            let claim = state::due_notices(store, 1)?.pop().ok_or(Fault::Internal)?;
+            let claim = state::due_notices(store, 1, 1)?
+                .pop()
+                .ok_or(Fault::Internal)?;
             assert_eq!(claim.effect_id, retry);
             state::defer_notice(store, &retry)?;
         }
+        Ok(())
+    })
+    .await?;
+    Ok(())
+}
+
+/// A large custody backlog, partly for a retired seat, a closed pool and ended
+/// publication windows, neither delays nor expires a fresh notice; retired
+/// custody stops being polled and live custody backs off to fifteen minutes.
+#[tokio::test]
+async fn chat_custody_backlog_does_not_delay_new_notice() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (_root, _config, store) = fixture()?;
+    let batch = reserve(&store, None).await?;
+    install(&store, &batch).await?;
+    stored(&store, move |store| {
+        let pid = batch.pool_id;
+        let seats: Vec<String> = batch.jobs.iter().map(|job| job.member_id.clone()).collect();
+        let mut other = input(None);
+        other["request_key"] = json!("start-closed");
+        let closed = state::start(store, parse(other)?, 1002)?;
+        state::owner_call(
+            store,
+            "pool_close",
+            json!({"pool_id":closed.pool_id,"expected_revision":1,"request_key":"close"}),
+        )?;
+        state::owner_call(
+            store,
+            "pool_post",
+            json!({"pool_id":pid,"expected_revision":1,"request_key":"old","body":"old"}),
+        )?;
+        let db = store.test_db();
+        let (template, event): (String, String) = db.query_row(
+            "SELECT e.data,j.data FROM chat_notice_targets n JOIN effects e ON e.id=n.effect
+             JOIN events j ON j.id=n.event LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        db.execute("UPDATE chat_notice_targets SET pending=0", [])?;
+        let far = i64::MAX / 2;
+        // 300 live rows, then 40 with an ended window, 30 of a closed pool, 30 of a retired seat.
+        for index in 0..400 {
+            let (pool, member, until) = match index {
+                0..300 => (&pid, &seats[index % 2], far),
+                300..340 => (&pid, &seats[index % 2], 1),
+                340..370 => (&closed.pool_id, &closed.jobs[0].member_id, far),
+                _ => (&pid, &seats[2], far),
+            };
+            let id = format!("backlog-{index}");
+            db.execute(
+                "INSERT INTO events(pool,data) VALUES(?1,?2)",
+                rusqlite::params![pool, event],
+            )?;
+            let event_id = db.last_insert_rowid();
+            db.execute(
+                "INSERT INTO effects(id,pool,state,data)
+                 VALUES(?1,?2,'custody',json_set(?3,'$.effect_id',?1,'$.state','custody'))",
+                rusqlite::params![id, pool, template],
+            )?;
+            db.execute(
+                "INSERT INTO chat_notice_targets(effect,member,event,resolve_until_ms,
+                 next_resolve_ms,send_started,custody_confirmed,publish_until_ms)
+                 VALUES(?1,?2,?3,1,?4,1,1,?5)",
+                rusqlite::params![id, member, event_id, index as i64, until],
+            )?;
+        }
+        state::owner_call(
+            store,
+            "pool_post",
+            json!({"pool_id":pid,"expected_revision":2,"request_key":"new","body":"new"}),
+        )?;
+        let db = store.test_db();
+        // The seat is retired after the post, and Pool's own lag outlives the enqueue deadline.
+        db.execute("UPDATE members SET current=0 WHERE id=?1", [&seats[2]])?;
+        db.execute(
+            "UPDATE chat_notice_targets SET resolve_until_ms=1 WHERE send_started=0 AND pending=1",
+            [],
+        )?;
+        let fresh: Vec<String> = db
+            .prepare("SELECT effect FROM chat_notice_targets WHERE send_started=0 AND pending=1")?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        assert_eq!(fresh.len(), 3);
+        let due = state::due_notices(store, 32, 8)?;
+        assert_eq!(due.len(), 3 + 8);
+        assert!(
+            due[..3]
+                .iter()
+                .all(|effect| fresh.contains(&effect.effect_id))
+        );
+        let live = fresh
+            .iter()
+            .find(|id| {
+                matches!(
+                    state::notice(store, id),
+                    Ok(state::Notice::Unresolved { closing: false, .. })
+                )
+            })
+            .ok_or(Fault::Internal)?;
+        assert!(due.iter().any(|effect| &effect.effect_id == live));
+        let db = store.test_db();
+        let (rows, pending, kept): (i64, i64, i64) = db.query_row(
+            "SELECT count(*),sum(n.pending),sum(e.state='custody') FROM chat_notice_targets n
+             JOIN effects e ON e.id=n.effect WHERE n.effect LIKE 'backlog-%'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        assert_eq!((rows, pending, kept), (400, 300, 400));
+        let poll = due[3].effect_id.clone();
+        let mut delays = Vec::new();
+        for _ in 0..5 {
+            store.settle_effect(&poll, "custody")?;
+            delays.push(store.test_db().query_row(
+                "SELECT resolve_delay_ms FROM chat_notice_targets WHERE effect=?1 AND pending=1",
+                [&poll],
+                |r| r.get::<_, i64>(0),
+            )?);
+        }
+        assert_eq!(delays, [120_000, 240_000, 480_000, 900_000, 900_000]);
         Ok(())
     })
     .await?;
@@ -1233,7 +1360,7 @@ async fn chat_owner_pages_retired_seats_and_failures() -> Result<(), Box<dyn std
             json!({"pool_id":pid,"expected_revision":1,
             "request_key":"post-before-close","body":"Test"}),
         )?;
-        for notice in state::due_notices(store, 8)? {
+        for notice in state::due_notices(store, 8, 8)? {
             store.settle_effect(&notice.effect_id, state::NOTICE_UNDELIVERABLE)?;
         }
         state::owner_call(
@@ -1447,7 +1574,7 @@ async fn chat_migrates_pending_v18_notice() -> Result<(), Box<dyn std::error::Er
     drop(store);
     let (effect_id, old_frozen, old_publication) = effect_id;
     let mut upgraded = Store::open(&config.database_path)?;
-    let claimed = state::due_notices(&mut upgraded, 1)?
+    let claimed = state::due_notices(&mut upgraded, 1, 0)?
         .pop()
         .ok_or("pending notice")?;
     assert_eq!(claimed.effect_id, effect_id);
