@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.3.0
+
+Feature release, 2026-11-26.
+
 ### Added
 
 - New chat seats get stable generated names. Rosters, onboarding and message notices show names and roles alongside member IDs.
