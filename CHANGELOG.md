@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.3.2
+
+Fix release, 2026-11-26.
+
+### Fixed
+
+- Sent notices whose custody was never confirmed stop being polled once the seat is retired or the pool is closed; close notices end with their publication window.
+
 ## 0.3.1
 
 Fix release, 2026-11-26.
