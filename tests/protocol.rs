@@ -1120,3 +1120,93 @@ async fn chat_owner_stdio_catalog() {
     assert!(!invalid.status.success());
     assert!(invalid.stdout.is_empty());
 }
+
+/// A skewed resident supplies the advertised catalog and one reconnect notification.
+#[tokio::test]
+async fn service_catalog_skew() {
+    use serde_json::{Value, json};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = path.join("pool.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let config = path.join("config.toml");
+    std::fs::write(&config, format!(
+        "socket_path={socket:?}\ndatabase_path={:?}\nexpected_uid={}\nbridge_registration_socket={:?}\nbridge_core_socket={:?}\nbridge_credential_file={:?}\nbridge_producer_id=\"fixture\"\nbridge_audience=\"fixture\"\nbridge_server_executable=\"/fixture/bridge\"\nbridge_server_sha256=\"{}\"\n",
+        path.join("unused.db"), std::fs::metadata(path).unwrap().uid(),
+        path.join("register.sock"), path.join("bridge.sock"), path.join("bridge.token"),
+        "0".repeat(64),
+    )).unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let resident = async {
+            for version in ["999.0.0", env!("CARGO_PKG_VERSION"), "999.0.0"] {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                let mut line = String::new();
+                stream.read_line(&mut line).await.unwrap();
+                assert_eq!(serde_json::from_str::<Value>(&line).unwrap(), json!({"method":"pool_service_catalog_v1"}));
+                let reply = json!({"version":version,"tools":[{"name":"new_tool","inputSchema":{"type":"object"}}]});
+                stream.write_all(format!("{reply}\n").as_bytes()).await.unwrap();
+            }
+        };
+        let client = async {
+            let mut child = tokio::process::Command::new(binary())
+                .args(["mcp", "--config"]).arg(&config)
+                .kill_on_drop(true).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+            let mut input = child.stdin.take().unwrap();
+            let mut output = BufReader::new(child.stdout.take().unwrap()).lines();
+            let initialize = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                "protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"raw-test","version":"1"}
+            }});
+            input.write_all(format!("{initialize}\n").as_bytes()).await.unwrap();
+            let reply: Value = serde_json::from_str(&output.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(reply["result"]["capabilities"]["tools"]["listChanged"], true);
+            let initialized = json!({"jsonrpc":"2.0","method":"notifications/initialized"});
+            input.write_all(format!("{initialized}\n").as_bytes()).await.unwrap();
+            let changed: Value = serde_json::from_str(&output.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(changed["method"], "notifications/tools/list_changed");
+            for (id, method, params) in [
+                (2, "tools/list", json!({})),
+                (3, "tools/call", json!({"name":"new_tool"})),
+                (4, "tools/call", json!({"name":"missing_tool"})),
+            ] {
+                let request = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
+                input.write_all(format!("{request}\n").as_bytes()).await.unwrap();
+                let reply: Value = serde_json::from_str(&output.next_line().await.unwrap().unwrap()).unwrap();
+                assert_eq!(reply["id"], id, "{reply}");
+                if method == "tools/list" {
+                    assert_eq!(reply["result"]["tools"][0]["name"], "new_tool");
+                } else {
+                    assert_eq!(reply["result"]["isError"], true);
+                    assert_eq!(reply["result"]["content"][0]["text"], format!(
+                        "agent-pool service is 999.0.0, this MCP frontend is {}: reconnect the agent-pool MCP server (Claude Code: /mcp → reconnect; Codex: restart the session)",
+                        env!("CARGO_PKG_VERSION"),
+                    ));
+                }
+            }
+            drop(input);
+            assert!(child.wait().await.unwrap().success());
+            assert!(output.next_line().await.unwrap().is_none());
+            for matches in [true, false] {
+                let result = tokio::process::Command::new(binary())
+                    .args(["check-version", "--config"])
+                    .arg(&config)
+                    .kill_on_drop(true)
+                    .output().await.unwrap();
+                assert_eq!(result.status.success(), matches);
+                if matches {
+                    let report: Value = serde_json::from_slice(&result.stdout).unwrap();
+                    assert_eq!(report["frontend_version"], report["service_version"]);
+                } else {
+                    assert!(String::from_utf8_lossy(&result.stderr).contains("reconnect the agent-pool MCP server"));
+                }
+            }
+        };
+        tokio::join!(resident, client);
+    }).await.expect("skew fixture deadline");
+}

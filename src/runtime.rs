@@ -2892,6 +2892,9 @@ async fn connection(
             .await
             .map_err(|_| Fault::Unavailable)??;
         let value = crate::managed_codec::parse_raw(&bytes)?;
+        if value == serde_json::json!({"method": crate::service_catalog::METHOD}) {
+            return Ok(Err(Special::Managed(crate::service_catalog::reply(false))));
+        }
         if value.get("managed_begin").is_some() {
             let envelope: crate::managed_session::BeginEnvelope =
                 serde_json::from_value(value).map_err(|_| Fault::Invalid)?;

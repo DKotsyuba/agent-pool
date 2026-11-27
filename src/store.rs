@@ -3530,7 +3530,7 @@ fn execute_authorized(
             target = Some(x.member_id.clone());
             (
                 "history_release_requested",
-                "Owner requested release of the closed member's retained Run history.".into(),
+                "Leader requested release of the closed member's retained Run history.".into(),
                 false,
             )
         }
@@ -5816,12 +5816,12 @@ pub(crate) fn completion_effects(
         "pool_completed",
         Author::Service,
         format!(
-            "Pool completed. Completion {completion_id}. Goal, roster, assignments, proposals and votes are now frozen; read the record with the owner completion_get operation."
+            "Pool completed. Completion {completion_id}. Goal, roster, assignments, proposals and votes are now frozen; read the record with pool_completion_get."
         ),
         None,
     )?;
     let text = format!(
-        "Pool {pool_id} completed. Completion {completion_id}. The immutable record is available to the owner; this notice is not proof of processing."
+        "Pool {pool_id} completed. Completion {completion_id}. Read pool_completion_get for the immutable record."
     );
     let address = owner_address(db, &owner)?;
     let effect_id = queue(
@@ -5853,8 +5853,8 @@ pub(crate) fn final_notice(
             address,
             &format!("final:{}", b.member.member_id),
             format!(
-                "Membership ended. Pool {}. Member {}. Access revoked; process not stopped.",
-                p.pool_id, b.member.member_id
+                "Membership ended in pool {}. Access revoked. Call finish to close your execution.",
+                p.pool_id
             ),
             Some(event_id),
         )?;
@@ -5887,6 +5887,7 @@ fn append_addressed_event(
     audience: Option<Vec<String>>,
 ) -> Result<Event, Fault> {
     let mut e = Event {
+        recorded_at_ms: crate::observer::now().ok(),
         event_id: 0,
         event_id_exact: None,
         revision: p.revision,
@@ -5953,6 +5954,7 @@ fn append_message_parts(
     }
     for (index, body) in parts.iter().enumerate() {
         let part = Event {
+            recorded_at_ms: event.recorded_at_ms,
             event_id: 0,
             event_id_exact: None,
             revision: p.revision,
@@ -5983,6 +5985,7 @@ fn append_check(
     check: &CriterionCheck,
 ) -> Result<(), Fault> {
     let e = Event {
+        recorded_at_ms: crate::observer::now().ok(),
         event_id: 0,
         event_id_exact: None,
         revision: p.revision,
@@ -6124,7 +6127,7 @@ fn member_label(member: &Member) -> String {
 /// Looks up a sender by journal author ID in the supplied roster.
 fn sender_label(event: &Event, roster: &[Binding]) -> String {
     match &event.author {
-        Author::Leader => "owner".into(),
+        Author::Leader => "leader".into(),
         Author::Service => "service".into(),
         Author::Member(id) => roster
             .iter()
@@ -6167,16 +6170,28 @@ fn notification(p: &Pool, roster: &[Binding], e: &Event) -> Result<String, Fault
             e.event_id
         )
     });
+    let roster_update = if matches!(
+        e.kind.as_str(),
+        "member_added"
+            | "member_removed"
+            | "member_joined"
+            | "member_replaced"
+            | "assignment_changed"
+            | "batch_start_requested"
+            | "enrollment_resolved"
+    ) {
+        format!(
+            "Confirmed {}; pending {}.\n{}",
+            active,
+            roster.len() - active,
+            roster_text(roster)
+        )
+    } else {
+        String::new()
+    };
     let text = format!(
-        "Pool {} revision {}. Event {}: {}\n{sender}Body: {}\n{parts}Confirmed {}; pending {}.\n{}Use pool_get for current details; older events never replace newer state.",
-        p.pool_id,
-        p.revision,
-        e.event_id,
-        e.kind,
-        body,
-        active,
-        roster.len() - active,
-        roster_text(roster)
+        "Pool {} revision {}. Event {}: {}\n{sender}Body: {}\n{parts}{roster_update}Use pool_get for current details; older events never replace newer state.",
+        p.pool_id, p.revision, e.event_id, e.kind, body
     );
     if text.len() > 16384 {
         Err(Fault::Invalid)
@@ -6198,7 +6213,7 @@ pub(crate) fn onboarding(p: &Pool, roster: &[Binding], member: &Member) -> Resul
         ""
     };
     let text = format!(
-        "Agent Pool onboarding\nPool {}: {}\nPurpose: {}\nYour membership: {}\nTask: {}\nCurrent revision: {}\n{}\nLeader is external and is not a member or voter. pool_post reaches members only; pool_send_member reaches one current peer by ID or unique exact name; pool_notify_owner reaches the hidden owner. All messages share history. Read pool_get then confirm the current revision with pool_join. {criteria}Pending members cannot vote. Removed membership loses access. Completion or consensus does not close the pool. Separate Bridge remains independent.\n",
+        "Agent Pool onboarding\nPool {}: {}\nPurpose: {}\nYour membership: {}\nTask: {}\nCurrent revision: {}\n{}\nThe leader stays outside the roster and does not vote. pool_post reaches members, pool_send_member reaches one current peer by ID or unique exact name, and pool_notify_owner reaches the leader. All messages share history. Read pool_get then confirm the current revision with pool_join. {criteria}Pending members cannot vote. Removed membership loses access. Completion and consensus leave the pool open.\n",
         p.pool_id,
         p.name,
         purpose,
@@ -10248,7 +10263,8 @@ mod tests {
             if let Work::Deliver { address, text, .. } = e.work {
                 assert_eq!(address, "native:exact");
                 if text.contains("Do not lose this") {
-                    assert!(text.contains("\nFrom owner\n"));
+                    assert!(text.contains("\nFrom leader\n"));
+                    assert!(!text.contains("Brief roster"));
                     delivered = true;
                 }
             }

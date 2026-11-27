@@ -24,6 +24,21 @@ pub(crate) fn one_line(value: &str, limit: usize) -> String {
     label
 }
 
+/// Formats events from the past hour relative to the render time.
+fn event_time(recorded_at_ms: u64, now_ms: u64) -> String {
+    match now_ms.checked_sub(recorded_at_ms).map(|age| age / 1000) {
+        Some(0..=59) => "just now".into(),
+        Some(age @ 60..=3599) => format!("{}m ago", age / 60),
+        _ => i64::try_from(recorded_at_ms)
+            .ok()
+            .and_then(chrono::DateTime::from_timestamp_millis)
+            .map_or_else(
+                || "time unavailable".into(),
+                |time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            ),
+    }
+}
+
 /// Closed immutable MiniJinja environment; rendering has no I/O or domain side effects.
 pub struct Templates {
     /// Embedded templates and explicitly registered formatting-only filters.
@@ -48,6 +63,7 @@ impl Templates {
         env.add_filter("quote", |value: String| {
             serde_json::to_string(&value).unwrap_or_else(|_| "\"unavailable\"".into())
         });
+        env.add_filter("event_time", event_time);
         for (name, source) in entries {
             env.add_template(name, source)
                 .map_err(|_| "template_invalid")?;
@@ -60,7 +76,10 @@ impl Templates {
         self.env
             .get_template(name)
             .map_err(|_| "template_missing")?
-            .render_captured_to(view, &mut writer)
+            .render_captured_to(
+                minijinja::context!(now_ms => crate::observer::now().unwrap_or_default(), ..minijinja::Value::from_serialize(view)),
+                &mut writer,
+            )
             .map_err(|_| "presentation_failed")?;
         String::from_utf8(writer.0).map_err(|_| "presentation_encoding")
     }
@@ -89,6 +108,15 @@ impl Write for Limit {
 #[allow(clippy::unwrap_used, reason = "Test assertions")]
 mod tests {
     use super::*;
+    /// Recent times are relative. Older or future times use absolute UTC.
+    #[test]
+    fn event_time_uses_relative_or_utc() {
+        assert_eq!(event_time(0, 59_999), "just now");
+        assert_eq!(event_time(0, 60_000), "1m ago");
+        assert_eq!(event_time(0, 3_599_999), "59m ago");
+        assert_eq!(event_time(0, 3_600_000), "1970-01-01T00:00:00Z");
+        assert_eq!(event_time(1_000, 0), "1970-01-01T00:00:01Z");
+    }
     /// Display labels keep UTF-8 boundaries and cannot create additional lines.
     #[test]
     fn display_label_is_bounded_and_single_line() {

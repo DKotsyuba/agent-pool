@@ -298,6 +298,7 @@ fn fixture(options: Options) -> Fixture {
         }
         let last = index + 1 == options.voters.len();
         let vote = Event {
+            recorded_at_ms: None,
             event_id: 0,
             event_id_exact: None,
             revision: 6,
@@ -325,6 +326,7 @@ fn fixture(options: Options) -> Fixture {
         let event_id = db.last_insert_rowid();
         if options.structured {
             let check = Event {
+                recorded_at_ms: None,
                 kind: "vote_check".into(),
                 body: "check".into(),
                 check: Some(Box::new(CriterionCheck {

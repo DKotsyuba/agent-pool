@@ -30,6 +30,72 @@ fn mutation(fields: Value, required: &[&str]) -> Value {
 fn tool(name: &str, description: &str, schema: Value, read: bool) -> Value {
     json!({"name":name,"description":description,"inputSchema":schema,"annotations":{"readOnlyHint":read,"destructiveHint":!read,"idempotentHint":true,"openWorldHint":!read}})
 }
+/// Describes input properties after deriving the ingress-specific schemas.
+fn describe_properties(schema: &mut Value) {
+    if let Some(fields) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        for (name, field) in fields {
+            if field.get("description").is_none() {
+                field["description"] = json!(match name.as_str() {
+                    "pool_id" => "Exact pool ID from pool_list, creation or onboarding.",
+                    "expected_revision" => "Exact current pool revision from pool_get.",
+                    "request_key" =>
+                        "Stable caller-chosen key. Reuse it only to retry the identical intent.",
+                    "name" => "Human-readable label.",
+                    "purpose" => "Shared goal for the pool.",
+                    "acceptance" => "Structured acceptance criteria. Omit for free-text criteria.",
+                    "id" => "Unique criterion ID.",
+                    "text" => "Condition that must be checked.",
+                    "after" =>
+                        "Exclusive continuation cursor from the previous page of this section.",
+                    "before" =>
+                        "Exclusive next_before cursor from the previous reverse history page.",
+                    "section" => "Selects which bounded part of the result to retrieve.",
+                    "proposal_id" => "Exact proposal ID from pool_get.",
+                    "completion_id" =>
+                        "Exact agreement or completion ID. Omit to read the pool's agreement.",
+                    "member_id" =>
+                        "Membership selector. See the tool description for accepted forms.",
+                    "wait_seconds" => "Maximum wait for new forward history in seconds.",
+                    "reverse" => "Read history from the newest event toward older events.",
+                    "field" => "Long text field to retrieve in the content section.",
+                    "role" => "Member role or role label.",
+                    "task" => "Work assigned to the member.",
+                    "address" => "Canonical Bridge address of the invited member.",
+                    "members" => "Members in requested roster order.",
+                    "member" => "Assignment and Run start specification for the replacement.",
+                    "assignment" => "Work assigned to the new seat.",
+                    "spec" => "Run start specification for this member.",
+                    "provider" => "Run provider for the new execution.",
+                    "model" => "Model selected for the new execution.",
+                    "profile" => "Run profile for the new execution.",
+                    "workdir" => "Working directory for the new execution.",
+                    "effort" => "Optional reasoning effort for the model.",
+                    "operation_id" => "Exact replacement operation ID.",
+                    "enrollment_id" => "Exact managed enrollment ID.",
+                    "expected_enrollment_revision" => "Exact revision from pool_enrollment_get.",
+                    "disposition" => "How to resolve the definitively admitted enrollment.",
+                    "body" => "Plain text message to record in pool history.",
+                    "result" => "Proposed result for the shared goal.",
+                    "criteria" => "Free-text conditions for accepting the result.",
+                    "snapshot" => "Optional detailed text accompanying the proposed result.",
+                    "roster_key" => "Exact frozen roster key from the proposal.",
+                    "choice" => "Ballot choice for this proposal.",
+                    "evidence" => "Explanation and evidence for the vote or criterion status.",
+                    "checks" =>
+                        "Structured checks against criteria from pool_get section=criteria.",
+                    "criterion_id" => "Exact acceptance criterion ID.",
+                    "status" => "Whether the criterion was met.",
+                    "state" => "Pool lifecycle filter.",
+                    _ => continue,
+                });
+            }
+            describe_properties(field);
+        }
+    }
+    if let Some(items) = schema.get_mut("items") {
+        describe_properties(items);
+    }
+}
 /// Derives a closed chat catalog from the shared command schemas and chat-only selectors.
 pub(crate) fn chat_definitions(names: &[&str], member: bool) -> Vec<Value> {
     let base = definitions();
@@ -46,19 +112,19 @@ pub(crate) fn chat_definitions(names: &[&str], member: bool) -> Vec<Value> {
             "pool_start" => {
                 let mut schema = base.iter().find(|row| row["name"] == "pool_create").map_or(Value::Null, |row| row["inputSchema"].clone());
                 schema["properties"]["members"] = json!({"type":"array","minItems":1,"maxItems":crate::domain::MAX_MEMBERS,"items":seat});
-                schema["properties"]["owner_address"] = json!({"type":"string","description":"Optional initiating Bridge address for notices."});
+                schema["properties"]["owner_address"] = json!({"type":"string","description":"Optional initiating leader Bridge address for notices."});
                 schema["required"] = json!(["request_key","name","purpose","members"]);
                 tool = json!({"name":name,"description":"Create a shared chat and start ordinary Run agents. Read pool_get for Run admission while the resident reconciles receipts.","inputSchema":schema});
             }
             "pool_get" => {
-                tool["description"] = json!("Read a compact overview or select history, members, proposal, votes, criteria or content. Use the exact next cursor for the selected section.");
+                tool["description"] = json!("Read a compact overview or select history, members, proposal, votes, criteria or content. Use the exact next cursor for the selected section. Member pages are live; send expected_revision on continuation and restart the section if the revision changes.");
                 tool["inputSchema"] = json!({"type":"object","additionalProperties":false,"required":if member {json!([])} else {json!(["pool_id"])},
                   "properties":{"pool_id":string,"section":{"enum":["overview","history","members","proposal","votes","criteria","content"]},
                     "after":string,"field":{"enum":["purpose","snapshot"]},"expected_revision":{"type":"integer","minimum":1}}});
                 if member && let Some(props) = tool["inputSchema"]["properties"].as_object_mut() { props.remove("pool_id"); }
             }
             "pool_list" => {
-                tool["description"] = json!("List pools across all owners. Continue with the exact after cursor.");
+                tool["description"] = json!("List pools across all leaders. Continue with the exact after cursor.");
                 tool["inputSchema"]["properties"]["state"] = json!({"enum":["open","completed","closed"]});
             }
             "pool_replace" => {
@@ -77,7 +143,7 @@ pub(crate) fn chat_definitions(names: &[&str], member: bool) -> Vec<Value> {
                 tool["description"] = json!("Vote on the exact proposal_id and roster_key. For free-text criteria, omit checks and provide evidence for ready or block. For structured acceptance, ready requires one check per exact ID from pool_get section=criteria. Status must be met or unmet. Block may omit checks and revoke must omit them.");
                 tool["inputSchema"]["properties"]["checks"]["items"]["properties"]["criterion_id"]["pattern"] = json!("^[A-Za-z0-9_.-]+$");
             }
-            "pool_send_member" => tool["description"] = json!("Send to an exact current member ID or unique exact roster name in member_id. History is visible to the sender, recipient and owners."),
+            "pool_send_member" => tool["description"] = json!("Send to an exact current member ID or unique exact roster name in member_id. History is visible to the sender, recipient and authorized leaders."),
             _ => {}
         }
         if member && *name != "pool_get" {
@@ -89,6 +155,7 @@ pub(crate) fn chat_definitions(names: &[&str], member: bool) -> Vec<Value> {
                 required.retain(|field| field != "pool_id" && field != "request_key");
             }
         }
+        describe_properties(&mut tool["inputSchema"]);
         tool
     }).collect()
 }
@@ -101,7 +168,7 @@ pub fn definitions() -> Vec<Value> {
     start["spec"] = json!({"type":"object","description":"Original Run start specification, at most 64 KiB. Required tools are asserted, never injected."});
     let mut member = role;
     member["member_id"] = string(128);
-    vec![
+    let mut catalog = vec![
         tool(
             "get_status",
             "Report product identity and qualification. No service or credentials needed.",
@@ -125,7 +192,7 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "pool_get",
-            "Read one bounded authenticated section. Forward history may wait up to 25 seconds; reverse history uses next_before. Content pages require field=purpose|snapshot and the prior expected_revision on continuation. Structured ballot checks follow vote_event_id in history. proposal_id selects a retained decision; owner-only binding requires member_id.",
+            "Read one bounded section. Sections: overview, members, history, proposal, votes, criteria, content, deliveries, binding. Forward history may wait up to 25 seconds; reverse history uses next_before. Roster and vote pages are live; restart from after=0 if the revision changes. Content pages require field=purpose|snapshot and the prior expected_revision on continuation. Structured ballot checks follow vote_event_id in history. proposal_id selects a retained decision. Leader-only binding requires member_id and shows current or removed native mappings; removed execution state is historical. Accepted delivery confirms native handoff; custody and unknown remain monitored.",
             object(
                 json!({"pool_id":string(128),"after":{"type":"integer","minimum":0},"section":{"type":"string","enum":["overview","members","history","proposal","votes","criteria","content","deliveries","binding"]},"proposal_id":string(128),"member_id":string(128),"wait_seconds":{"type":"number","minimum":0,"maximum":25},"reverse":{"type":"boolean"},"before":{"type":"string","pattern":"^[1-9][0-9]*$","maxLength":19},"field":{"type":"string","enum":["purpose","snapshot"]},"expected_revision":{"type":"integer","minimum":1}}),
                 &["pool_id"],
@@ -134,7 +201,7 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "pool_update",
-            "Owner updates pool name and purpose at the current revision; current members are notified.",
+            "Leader updates pool name and purpose at the current revision; current members are notified.",
             mutation(
                 json!({"name":string(80),"purpose":string(8192)}),
                 &["name", "purpose"],
@@ -143,19 +210,19 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "pool_close",
-            "Owner explicitly closes the pool and revokes memberships. Cancels only provably unhanded delivery; never stops processes or clears global leader status.",
+            "Leader explicitly closes the pool and revokes memberships. Cancels only provably unhanded delivery; never stops processes or clears global leader status.",
             mutation(json!({}), &[]),
             false,
         ),
         tool(
             "pool_add",
-            "Owner invites one canonical Bridge address and delivers onboarding. Leaders and reserved agents refuse. Maximum 20 current/pending members; actual identity binds through pool_join.",
+            "Leader invites one canonical Bridge address and delivers onboarding. Leaders and reserved agents refuse. Maximum 20 current/pending members; actual identity binds through pool_join.",
             mutation(add, &["address", "name", "role", "task"]),
             false,
         ),
         tool(
             "pool_start_agent",
-            "Owner reserves a pending member and requests one Run agent with retained history. With P3 enrollment enabled, spec.profile must equal the configured managed role; the receipt's created_id is the enrollment ID (read it with pool_enrollment_get). The member joins only after a qualified Run attestation and its own verified pool_join; lost responses never authorize a new start.",
+            "Leader reserves a pending member and requests one Run agent with retained history. With P3 enrollment enabled, spec.profile must equal the configured managed role; the receipt's created_id is the enrollment ID (read it with pool_enrollment_get). The member joins only after a qualified Run attestation and its own verified pool_join; lost responses never authorize a new start.",
             mutation(start.clone(), &["name", "role", "task", "spec"]),
             false,
         ),
@@ -185,13 +252,13 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "pool_member_update",
-            "Owner changes an exact current member assignment, notifies members and stales unfinished proposals. Accepted decisions stay immutable.",
+            "Leader changes an exact current member assignment, notifies members and stales unfinished proposals. Accepted decisions stay immutable.",
             mutation(member, &["member_id", "name", "role", "task"]),
             false,
         ),
         tool(
             "pool_remove",
-            "Owner removes a member; members may remove only themselves. Revokes access, retires unhanded deliveries and sends one final notice. Does not stop execution.",
+            "Leader removes a member; members may remove only themselves. Revokes access, retires unhanded deliveries and sends one final notice. Does not stop execution.",
             mutation(json!({"member_id":string(128)}), &["member_id"]),
             false,
         ),
@@ -203,7 +270,7 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "pool_enrollment_get",
-            "Owner reads one managed enrollment: per-member admission, qualification, binding, join state and recovery reason. Read-only; never starts or retries.",
+            "Leader reads one managed enrollment: per-member admission, qualification, binding, join state and recovery reason. Read-only; never starts or retries.",
             object(
                 json!({"pool_id":string(128),"enrollment_id":string(128)}),
                 &["pool_id", "enrollment_id"],
@@ -212,7 +279,7 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "pool_enrollment_resolve",
-            "Owner closes a definitively admitted but unbound enrollment as retain_unassigned. Keeps the Run roots and pins, cancels no process, fences the pending memberships and restores the old member's slot for a failed replacement.",
+            "Leader closes a definitively admitted but unbound enrollment as retain_unassigned. Keeps the Run roots and pins, cancels no process, fences the pending memberships and restores the old member's slot for a failed replacement.",
             object(
                 json!({"pool_id":string(128),"enrollment_id":string(128),"expected_enrollment_revision":{"type":"integer","minimum":1},"request_key":string(128),"disposition":{"type":"string","enum":["retain_unassigned"]}}),
                 &[
@@ -233,9 +300,9 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "pool_post",
-            "Post to the shared history, which every member can read. Without notify, every current member except the sender is woken. notify limits the wake to the listed exact member IDs, roster names or roles; the notice and history show that audience. Owner posts always wake everyone. Leader is not automatically notified. Bodies over 2048 bytes are committed as ordered history parts; notifications show the first part.",
+            "Post to the shared history, which every member can read. Without notify, every current member except the sender is woken. notify limits the wake to the listed exact member IDs, roster names or roles; the notice and history show that audience. Leader posts always wake everyone. Leader is not automatically notified. Bodies over 2048 bytes are committed as ordered history parts; notifications show the first part.",
             mutation(
-                json!({"body":string(8192),"notify":{"type":"array","minItems":1,"maxItems":crate::domain::MAX_MEMBERS,"items":string(160),"description":"Members to wake: exact current member IDs, roster names or roles. Omit to wake everyone. Ignored for owner posts."}}),
+                json!({"body":string(8192),"notify":{"type":"array","minItems":1,"maxItems":crate::domain::MAX_MEMBERS,"items":string(160),"description":"Members to wake: exact current member IDs, roster names or roles. Omit to wake everyone. Ignored for leader posts."}}),
                 &["body"],
             ),
             false,
@@ -251,13 +318,13 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "pool_notify_owner",
-            "Confirmed member explicitly notifies the hidden external owner. Bodies over 2048 bytes are committed as ordered history parts; notifications show the first part.",
+            "Confirmed member explicitly notifies the external leader. Bodies over 2048 bytes are committed as ordered history parts; notifications show the first part.",
             mutation(json!({"body":string(8192)}), &["body"]),
             false,
         ),
         tool(
             "pool_propose",
-            "Owner or confirmed member opens a proposal with result, criteria, optional full snapshot and a frozen confirmed roster. Revising an open proposal archives it as stale. Accepted decisions remain immutable; leader never votes.",
+            "Leader or confirmed member opens a proposal with result, criteria, optional full snapshot and a frozen confirmed roster. Revising an open proposal archives it as stale. Accepted decisions remain immutable; leader never votes.",
             mutation(
                 json!({"result":string(2048),"criteria":string(2048),"snapshot":string(65536)}),
                 &["result", "criteria"],
@@ -273,7 +340,11 @@ pub fn definitions() -> Vec<Value> {
             ),
             false,
         ),
-    ]
+    ];
+    for tool in &mut catalog {
+        describe_properties(&mut tool["inputSchema"]);
+    }
+    catalog
 }
 /// Closed embedded layouts are parsed at startup before admitting any mutation.
 pub fn templates() -> Vec<(&'static str, &'static str)> {
@@ -438,9 +509,9 @@ mod tests {
             assert!(d["annotations"]["readOnlyHint"].is_boolean());
         }
     }
-    /// Literal templates remain data; presentation failure preserves an already committed receipt.
+    /// Message bodies stay in history and rendering failures preserve the committed outcome.
     #[test]
-    fn quoted_receipt_and_failure_keep_outcome() {
+    fn compact_receipt_and_failure_keep_outcome() {
         use crate::domain::*;
         let t = Templates::new(&templates()).unwrap();
         let r = Receipt {
@@ -449,6 +520,7 @@ mod tests {
             created_id: None,
             created_ids: Vec::new(),
             event: Event {
+                recorded_at_ms: None,
                 event_id: 7,
                 event_id_exact: None,
                 revision: 9,
@@ -467,7 +539,8 @@ mod tests {
         };
         let normal =
             serde_json::to_string(&present(Ok(Reply::Receipt(Box::new(r.clone()))), &t)).unwrap();
-        assert!(normal.contains("{{literal}}"));
+        assert!(normal.contains("COMMITTED pool pool-id revision=9\\nmessage"));
+        assert!(!normal.contains("{{literal}}"));
         assert!(!normal.contains("presentation degraded"));
         let mut replacement = r.clone();
         replacement.event.kind = "replacement_requested".into();

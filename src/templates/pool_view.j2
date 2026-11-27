@@ -25,7 +25,7 @@ Run rejected the advertised release parameters. Check the Run API and request po
 {% endfor %}
 {% if section == 'criteria' and pool.acceptance is defined %}{% for criterion in pool.acceptance %}Criterion {{ criterion.id }}: {{ criterion.text|quote }}
 {% endfor %}{% endif %}
-{% for event in events %}Event {{ event.event_id }} revision={{ event.revision }} {{ event.kind }} author={{ event.author.kind }}{% if event.author.kind == 'member' %}:{{ event.author.member_id }}{% endif %}{% if event.recipient %} recipient={{ event.recipient }}{% endif %}{% if event.audience is defined %} notify={% for id in event.audience %}{% if not loop.first %},{% endif %}{{ id }}{% endfor %}{% endif %}{% if event.part_index is defined %} message={{ event.message_event_id }} part={{ event.part_index }}/{{ event.part_count }}{% endif +%}
+{% for event in events %}Event {{ event.event_id }}{% if event.recorded_at_ms is defined %} {{ event.recorded_at_ms|event_time(now_ms) }}{% endif %} {{ event.kind }} author={{ event.author.kind }}{% if event.author.kind == 'member' %}:{{ event.author.member_id }}{% endif %}{% if event.recipient %} recipient={{ event.recipient }}{% endif %}{% if event.audience is defined %} notify={% for id in event.audience %}{% if not loop.first %},{% endif %}{{ id }}{% endfor %}{% endif %}{% if event.part_index is defined %} message={{ event.message_event_id }} part={{ event.part_index }}/{{ event.part_count }}{% endif +%}
 Body: {{ event.body|quote }}
 {% endfor %}
 {% if pool.proposal %}Proposal {{ pool.proposal.proposal_id }} state={{ pool.proposal.state }} roster_key={{ pool.proposal.roster_key }}
@@ -46,7 +46,3 @@ Evidence: {{ pool.proposal.votes[voter].evidence|quote }}
 {% endif %}{% if next_before is defined %}More={{ has_more }}; next_before={{ next_before }}. For older history continue pool_get with reverse=true and before=next_before.
 {% else %}More={{ has_more }}; next_after={{ next_after }}. Continue pool_get with the same pool_id and section.
 {% endif %}
-Roster/vote pages are live; restart that section from after=0 if its pool revision changed.
-Sections: overview, members, history, proposal, votes, criteria, content, deliveries. proposal_id selects a retained decision.
-Owner: binding with member_id reads an exact current or removed native mapping; removed execution state is historical.
-Delivery accepted means native handoff, never comprehension; custody and unknown remain monitored.

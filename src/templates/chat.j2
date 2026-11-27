@@ -11,7 +11,7 @@ Seats {{ seat_count }} | ready={{ ready }} blocked={{ blocked }}
 {% else %}
 Pool {{ pool_id }} revision={{ revision }} | members more={{ more }} next={{ next }}
 {% endif %}{% for s in roster %}
-{{ s.name|one_line(80) }} ({{ s.profile|one_line(80) }}) · {{ s.seat_id }} | admission={{ s.admitted }}{% if s.retired %} retired=true{% endif %} joined={{ s.joined }} process={{ s.process }}{% if s.notice_undeliverable %} notice_undeliverable=true{% endif %}{% if s.agent_id %} run={{ s.agent_id }} sequence={{ s.sequence }}{% endif %} | {{ s.assignment }}
+{{ s.name|one_line(80) }} ({{ s.profile|one_line(80) }}) · {{ s.seat_id }} | admission={{ s.admitted }}{% if s.retired %} retired=true{% endif %} joined={{ s.joined }} process={{ s.process }}{% if s.notice_undeliverable %} notice_undeliverable=true{% endif %}{% if s.agent_id %} run={{ s.agent_id }}{% endif %} | {{ s.assignment }}
 {% endfor %}{% if view == "overview" %}
 {% if omitted_retired %}+{{ omitted_retired }} more retired seats ({{ omitted_undeliverable }} undeliverable), see section=members.
 {% endif %}
@@ -27,7 +27,7 @@ Continue with section=members after="{{ next }}" expected_revision={{ revision }
 {% elif view == "history" %}
 Pool {{ pool_id }} revision={{ revision }} | history more={{ more }} next={{ next }}
 {% for e in events %}
-{{ e.id }} {{ e.kind }} {{ e.author }}{% if e.recipient %} to={{ e.recipient }}{% endif %}{% if e.notify %} notify=[{{ e.notify }}]{% endif %}{% if e.message_event_id %} message={{ e.message_event_id }} part={{ e.part_index }}/{{ e.part_count }}{% endif %} {{ e.body|quote }}
+{{ e.id }}{% if e.recorded_at_ms %} {{ e.recorded_at_ms|event_time(now_ms) }}{% endif %} {{ e.kind }} {{ e.author }}{% if e.recipient %} to={{ e.recipient }}{% endif %}{% if e.notify %} notify=[{{ e.notify }}]{% endif %}{% if e.message_event_id %} message={{ e.message_event_id }} part={{ e.part_index }}/{{ e.part_count }}{% endif %} {{ e.body|quote }}
 {% endfor %}
 {% elif view == "list" %}
 Pools {{ returned }}
@@ -38,7 +38,7 @@ Pools {{ returned }}
 Next after={{ next }}
 {% endif %}
 {% elif view == "owner_bound" %}
-Owner binding saved.
+Leader binding saved.
 {% elif view == "launch" %}
 Pool {{ pool_id }} revision={{ revision }} admission={{ state }}
 {% if owner_binding_hint %}

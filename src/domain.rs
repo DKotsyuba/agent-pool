@@ -86,9 +86,12 @@ impl std::fmt::Display for Fault {
     /// Formats only the fixed safe code, never an underlying diagnostic.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::DispatchConflict => write!(f, "{:?}", Self::Conflict),
-            Self::Recipient { .. } => f.write_str("Recipient"),
-            _ => write!(f, "{self:?}"),
+            Self::DispatchConflict => f.write_str("conflict"),
+            Self::Recipient { .. } => f.write_str("recipient"),
+            other => {
+                let value = serde_json::to_value(other).map_err(|_| std::fmt::Error)?;
+                f.write_str(value.as_str().ok_or(std::fmt::Error)?)
+            }
         }
     }
 }
@@ -997,6 +1000,9 @@ pub enum Author {
 /// Append-only safe journal entry; audience controls delivery, not history visibility.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Event {
+    /// Event time in Unix milliseconds, absent for older journal rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_at_ms: Option<u64>,
     /// Global monotonic event cursor, stable across restart.
     pub event_id: u64,
     /// Exact decimal identity on opt-in observer history pages; omitted elsewhere.

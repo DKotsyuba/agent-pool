@@ -566,7 +566,7 @@ pub(crate) fn replace(store: &mut Store, input: ReplaceSeat) -> Result<ChatBatch
     stale(&mut pool);
     pool.revision = pool.revision.checked_add(1).ok_or(Fault::Internal)?;
     save_pool(&tx, &pool)?;
-    append_event(
+    let event = append_event(
         &tx,
         &pool,
         "seat_replaced",
@@ -574,6 +574,7 @@ pub(crate) fn replace(store: &mut Store, input: ReplaceSeat) -> Result<ChatBatch
         format!("Seat {} replaced by {}.", input.member_id, job.member_id),
         None,
     )?;
+    queue_chat_notices(&tx, &pool, std::slice::from_ref(&old), &event, None)?;
     let batch = save_batch(&tx, pool_id, request_key, &digest, vec![job], prior, true)?;
     tx.commit()?;
     Ok(batch)
@@ -890,10 +891,11 @@ pub(crate) fn get(db: &Connection, input: GetPool, seat: Option<&str>) -> Result
         let events: Vec<_> = page
             .into_iter()
             .map(|event| ChatEvent {
+                recorded_at_ms: event.recorded_at_ms,
                 id: event.event_id.to_string(),
                 kind: event.kind,
                 author: match event.author {
-                    Author::Leader => "owner".into(),
+                    Author::Leader => "leader".into(),
                     Author::Service => "service".into(),
                     Author::Member(id) => id,
                 },
@@ -1177,7 +1179,8 @@ pub(super) fn queue_chat_notices(
         }
         return Ok(());
     }
-    let closing = event.kind == "pool_closed";
+    // Final notices remain eligible after the recipient's access is revoked.
+    let closing = matches!(event.kind.as_str(), "pool_closed" | "seat_replaced");
     if pool.closed && !closing {
         return Ok(());
     }
@@ -1191,9 +1194,12 @@ pub(super) fn queue_chat_notices(
                 author = notice_author(event),
             )
         }
-        "pool_closed" => "Pool closed. Seat access ended. This is informational.".into(),
+        "pool_closed" => {
+            "Pool closed. Seat access ended. Call finish to close your execution.".into()
+        }
+        "seat_replaced" => "Your seat was replaced. Call finish to close your execution.".into(),
         "pool_completed" => format!(
-            "{}. Read pool_get for the result. This is informational.",
+            "{}. The leader can read the agreement with pool_completion_get. Call finish to close your execution.",
             event.body.trim_end_matches('.')
         ),
         _ => return Ok(()),
@@ -1260,7 +1266,7 @@ fn message_notice(event: &Event, roster: &[Binding]) -> String {
 /// Uses journal author identity instead of member-supplied text.
 fn notice_author(event: &Event) -> &str {
     match &event.author {
-        Author::Leader => "owner",
+        Author::Leader => "leader",
         Author::Service => "service",
         Author::Member(id) => id,
     }

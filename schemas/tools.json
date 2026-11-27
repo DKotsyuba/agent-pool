@@ -27,15 +27,18 @@
       "additionalProperties": false,
       "properties": {
         "acceptance": {
+          "description": "Structured acceptance criteria. Omit for free-text criteria.",
           "items": {
             "additionalProperties": false,
             "properties": {
               "id": {
+                "description": "Unique criterion ID.",
                 "maxLength": 32,
                 "minLength": 1,
                 "type": "string"
               },
               "text": {
+                "description": "Condition that must be checked.",
                 "maxLength": 1024,
                 "minLength": 1,
                 "type": "string"
@@ -51,16 +54,19 @@
           "type": "array"
         },
         "name": {
+          "description": "Human-readable label.",
           "maxLength": 80,
           "minLength": 1,
           "type": "string"
         },
         "purpose": {
+          "description": "Shared goal for the pool.",
           "maxLength": 8192,
           "minLength": 1,
           "type": "string"
         },
         "request_key": {
+          "description": "Stable caller-chosen key. Reuse it only to retry the identical intent.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
@@ -87,6 +93,7 @@
       "additionalProperties": false,
       "properties": {
         "after": {
+          "description": "Exclusive continuation cursor from the previous page of this section.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
@@ -104,24 +111,28 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Read one bounded authenticated section. Forward history may wait up to 25 seconds; reverse history uses next_before. Content pages require field=purpose|snapshot and the prior expected_revision on continuation. Structured ballot checks follow vote_event_id in history. proposal_id selects a retained decision; owner-only binding requires member_id.",
+    "description": "Read one bounded section. Sections: overview, members, history, proposal, votes, criteria, content, deliveries, binding. Forward history may wait up to 25 seconds; reverse history uses next_before. Roster and vote pages are live; restart from after=0 if the revision changes. Content pages require field=purpose|snapshot and the prior expected_revision on continuation. Structured ballot checks follow vote_event_id in history. proposal_id selects a retained decision. Leader-only binding requires member_id and shows current or removed native mappings; removed execution state is historical. Accepted delivery confirms native handoff; custody and unknown remain monitored.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
         "after": {
+          "description": "Exclusive continuation cursor from the previous page of this section.",
           "minimum": 0,
           "type": "integer"
         },
         "before": {
+          "description": "Exclusive next_before cursor from the previous reverse history page.",
           "maxLength": 19,
           "pattern": "^[1-9][0-9]*$",
           "type": "string"
         },
         "expected_revision": {
+          "description": "Exact current pool revision from pool_get.",
           "minimum": 1,
           "type": "integer"
         },
         "field": {
+          "description": "Long text field to retrieve in the content section.",
           "enum": [
             "purpose",
             "snapshot"
@@ -129,24 +140,29 @@
           "type": "string"
         },
         "member_id": {
+          "description": "Membership selector. See the tool description for accepted forms.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
         },
         "pool_id": {
+          "description": "Exact pool ID from pool_list, creation or onboarding.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
         },
         "proposal_id": {
+          "description": "Exact proposal ID from pool_get.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
         },
         "reverse": {
+          "description": "Read history from the newest event toward older events.",
           "type": "boolean"
         },
         "section": {
+          "description": "Selects which bounded part of the result to retrieve.",
           "enum": [
             "overview",
             "members",
@@ -161,6 +177,7 @@
           "type": "string"
         },
         "wait_seconds": {
+          "description": "Maximum wait for new forward history in seconds.",
           "maximum": 25,
           "minimum": 0,
           "type": "number"
@@ -180,30 +197,35 @@
       "openWorldHint": true,
       "readOnlyHint": false
     },
-    "description": "Owner updates pool name and purpose at the current revision; current members are notified.",
+    "description": "Leader updates pool name and purpose at the current revision; current members are notified.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
         "expected_revision": {
+          "description": "Exact current pool revision from pool_get.",
           "minimum": 1,
           "type": "integer"
         },
         "name": {
+          "description": "Human-readable label.",
           "maxLength": 80,
           "minLength": 1,
           "type": "string"
         },
         "pool_id": {
+          "description": "Exact pool ID from pool_list, creation or onboarding.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
         },
         "purpose": {
+          "description": "Shared goal for the pool.",
           "maxLength": 8192,
           "minLength": 1,
           "type": "string"
         },
         "request_key": {
+          "description": "Stable caller-chosen key. Reuse it only to retry the identical intent.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
@@ -227,20 +249,23 @@
       "openWorldHint": true,
       "readOnlyHint": false
     },
-    "description": "Owner explicitly closes the pool and revokes memberships. Cancels only provably unhanded delivery; never stops processes or clears global leader status.",
+    "description": "Leader explicitly closes the pool and revokes memberships. Cancels only provably unhanded delivery; never stops processes or clears global leader status.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
         "expected_revision": {
+          "description": "Exact current pool revision from pool_get.",
           "minimum": 1,
           "type": "integer"
         },
         "pool_id": {
+          "description": "Exact pool ID from pool_list, creation or onboarding.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
         },
         "request_key": {
+          "description": "Stable caller-chosen key. Reuse it only to retry the identical intent.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
@@ -262,40 +287,47 @@
       "openWorldHint": true,
       "readOnlyHint": false
     },
-    "description": "Owner invites one canonical Bridge address and delivers onboarding. Leaders and reserved agents refuse. Maximum 20 current/pending members; actual identity binds through pool_join.",
+    "description": "Leader invites one canonical Bridge address and delivers onboarding. Leaders and reserved agents refuse. Maximum 20 current/pending members; actual identity binds through pool_join.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
         "address": {
+          "description": "Canonical Bridge address of the invited member.",
           "maxLength": 1024,
           "minLength": 1,
           "type": "string"
         },
         "expected_revision": {
+          "description": "Exact current pool revision from pool_get.",
           "minimum": 1,
           "type": "integer"
         },
         "name": {
+          "description": "Human-readable label.",
           "maxLength": 80,
           "minLength": 1,
           "type": "string"
         },
         "pool_id": {
+          "description": "Exact pool ID from pool_list, creation or onboarding.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
         },
         "request_key": {
+          "description": "Stable caller-chosen key. Reuse it only to retry the identical intent.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
         },
         "role": {
+          "description": "Member role or role label.",
           "maxLength": 160,
           "minLength": 1,
           "type": "string"
         },
         "task": {
+          "description": "Work assigned to the member.",
           "maxLength": 512,
           "minLength": 1,
           "type": "string"
@@ -321,30 +353,35 @@
       "openWorldHint": true,
       "readOnlyHint": false
     },
-    "description": "Owner reserves a pending member and requests one Run agent with retained history. With P3 enrollment enabled, spec.profile must equal the configured managed role; the receipt's created_id is the enrollment ID (read it with pool_enrollment_get). The member joins only after a qualified Run attestation and its own verified pool_join; lost responses never authorize a new start.",
+    "description": "Leader reserves a pending member and requests one Run agent with retained history. With P3 enrollment enabled, spec.profile must equal the configured managed role; the receipt's created_id is the enrollment ID (read it with pool_enrollment_get). The member joins only after a qualified Run attestation and its own verified pool_join; lost responses never authorize a new start.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
         "expected_revision": {
+          "description": "Exact current pool revision from pool_get.",
           "minimum": 1,
           "type": "integer"
         },
         "name": {
+          "description": "Human-readable label.",
           "maxLength": 80,
           "minLength": 1,
           "type": "string"
         },
         "pool_id": {
+          "description": "Exact pool ID from pool_list, creation or onboarding.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
         },
         "request_key": {
+          "description": "Stable caller-chosen key. Reuse it only to retry the identical intent.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
         },
         "role": {
+          "description": "Member role or role label.",
           "maxLength": 160,
           "minLength": 1,
           "type": "string"
@@ -354,6 +391,7 @@
           "type": "object"
         },
         "task": {
+          "description": "Work assigned to the member.",
           "maxLength": 512,
           "minLength": 1,
           "type": "string"
@@ -384,19 +422,23 @@
       "additionalProperties": false,
       "properties": {
         "expected_revision": {
+          "description": "Exact current pool revision from pool_get.",
           "minimum": 1,
           "type": "integer"
         },
         "members": {
+          "description": "Members in requested roster order.",
           "items": {
             "additionalProperties": false,
             "properties": {
               "name": {
+                "description": "Human-readable label.",
                 "maxLength": 80,
                 "minLength": 1,
                 "type": "string"
               },
               "role": {
+                "description": "Member role or role label.",
                 "maxLength": 160,
                 "minLength": 1,
                 "type": "string"
@@ -406,6 +448,7 @@
                 "type": "object"
               },
               "task": {
+                "description": "Work assigned to the member.",
                 "maxLength": 512,
                 "minLength": 1,
                 "type": "string"
@@ -424,11 +467,13 @@
           "type": "array"
         },
         "pool_id": {
+          "description": "Exact pool ID from pool_list, creation or onboarding.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
         },
         "request_key": {
+          "description": "Stable caller-chosen key. Reuse it only to retry the identical intent.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
@@ -456,20 +501,24 @@
       "additionalProperties": false,
       "properties": {
         "expected_revision": {
+          "description": "Exact current pool revision from pool_get.",
           "minimum": 1,
           "type": "integer"
         },
         "member_id": {
+          "description": "Membership selector. See the tool description for accepted forms.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
         },
         "pool_id": {
+          "description": "Exact pool ID from pool_list, creation or onboarding.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
         },
         "request_key": {
+          "description": "Stable caller-chosen key. Reuse it only to retry the identical intent.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
@@ -504,20 +553,24 @@
       "additionalProperties": false,
       "properties": {
         "expected_revision": {
+          "description": "Exact current pool revision from pool_get.",
           "minimum": 1,
           "type": "integer"
         },
         "operation_id": {
+          "description": "Exact replacement operation ID.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
         },
         "pool_id": {
+          "description": "Exact pool ID from pool_list, creation or onboarding.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
         },
         "request_key": {
+          "description": "Stable caller-chosen key. Reuse it only to retry the identical intent.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
@@ -540,40 +593,47 @@
       "openWorldHint": true,
       "readOnlyHint": false
     },
-    "description": "Owner changes an exact current member assignment, notifies members and stales unfinished proposals. Accepted decisions stay immutable.",
+    "description": "Leader changes an exact current member assignment, notifies members and stales unfinished proposals. Accepted decisions stay immutable.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
         "expected_revision": {
+          "description": "Exact current pool revision from pool_get.",
           "minimum": 1,
           "type": "integer"
         },
         "member_id": {
+          "description": "Membership selector. See the tool description for accepted forms.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
         },
         "name": {
+          "description": "Human-readable label.",
           "maxLength": 80,
           "minLength": 1,
           "type": "string"
         },
         "pool_id": {
+          "description": "Exact pool ID from pool_list, creation or onboarding.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
         },
         "request_key": {
+          "description": "Stable caller-chosen key. Reuse it only to retry the identical intent.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
         },
         "role": {
+          "description": "Member role or role label.",
           "maxLength": 160,
           "minLength": 1,
           "type": "string"
         },
         "task": {
+          "description": "Work assigned to the member.",
           "maxLength": 512,
           "minLength": 1,
           "type": "string"
@@ -599,25 +659,29 @@
       "openWorldHint": true,
       "readOnlyHint": false
     },
-    "description": "Owner removes a member; members may remove only themselves. Revokes access, retires unhanded deliveries and sends one final notice. Does not stop execution.",
+    "description": "Leader removes a member; members may remove only themselves. Revokes access, retires unhanded deliveries and sends one final notice. Does not stop execution.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
         "expected_revision": {
+          "description": "Exact current pool revision from pool_get.",
           "minimum": 1,
           "type": "integer"
         },
         "member_id": {
+          "description": "Membership selector. See the tool description for accepted forms.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
         },
         "pool_id": {
+          "description": "Exact pool ID from pool_list, creation or onboarding.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
         },
         "request_key": {
+          "description": "Stable caller-chosen key. Reuse it only to retry the identical intent.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
@@ -645,20 +709,24 @@
       "additionalProperties": false,
       "properties": {
         "expected_revision": {
+          "description": "Exact current pool revision from pool_get.",
           "minimum": 1,
           "type": "integer"
         },
         "member_id": {
+          "description": "Membership selector. See the tool description for accepted forms.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
         },
         "pool_id": {
+          "description": "Exact pool ID from pool_list, creation or onboarding.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
         },
         "request_key": {
+          "description": "Stable caller-chosen key. Reuse it only to retry the identical intent.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
@@ -681,16 +749,18 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Owner reads one managed enrollment: per-member admission, qualification, binding, join state and recovery reason. Read-only; never starts or retries.",
+    "description": "Leader reads one managed enrollment: per-member admission, qualification, binding, join state and recovery reason. Read-only; never starts or retries.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
         "enrollment_id": {
+          "description": "Exact managed enrollment ID.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
         },
         "pool_id": {
+          "description": "Exact pool ID from pool_list, creation or onboarding.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
@@ -711,31 +781,36 @@
       "openWorldHint": true,
       "readOnlyHint": false
     },
-    "description": "Owner closes a definitively admitted but unbound enrollment as retain_unassigned. Keeps the Run roots and pins, cancels no process, fences the pending memberships and restores the old member's slot for a failed replacement.",
+    "description": "Leader closes a definitively admitted but unbound enrollment as retain_unassigned. Keeps the Run roots and pins, cancels no process, fences the pending memberships and restores the old member's slot for a failed replacement.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
         "disposition": {
+          "description": "How to resolve the definitively admitted enrollment.",
           "enum": [
             "retain_unassigned"
           ],
           "type": "string"
         },
         "enrollment_id": {
+          "description": "Exact managed enrollment ID.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
         },
         "expected_enrollment_revision": {
+          "description": "Exact revision from pool_enrollment_get.",
           "minimum": 1,
           "type": "integer"
         },
         "pool_id": {
+          "description": "Exact pool ID from pool_list, creation or onboarding.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
         },
         "request_key": {
+          "description": "Stable caller-chosen key. Reuse it only to retry the identical intent.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
@@ -764,15 +839,18 @@
       "additionalProperties": false,
       "properties": {
         "expected_revision": {
+          "description": "Exact current pool revision from pool_get.",
           "minimum": 1,
           "type": "integer"
         },
         "pool_id": {
+          "description": "Exact pool ID from pool_list, creation or onboarding.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
         },
         "request_key": {
+          "description": "Stable caller-chosen key. Reuse it only to retry the identical intent.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
@@ -794,21 +872,23 @@
       "openWorldHint": true,
       "readOnlyHint": false
     },
-    "description": "Post to the shared history, which every member can read. Without notify, every current member except the sender is woken. notify limits the wake to the listed exact member IDs, roster names or roles; the notice and history show that audience. Owner posts always wake everyone. Leader is not automatically notified. Bodies over 2048 bytes are committed as ordered history parts; notifications show the first part.",
+    "description": "Post to the shared history, which every member can read. Without notify, every current member except the sender is woken. notify limits the wake to the listed exact member IDs, roster names or roles; the notice and history show that audience. Leader posts always wake everyone. Leader is not automatically notified. Bodies over 2048 bytes are committed as ordered history parts; notifications show the first part.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
         "body": {
+          "description": "Plain text message to record in pool history.",
           "maxLength": 8192,
           "minLength": 1,
           "type": "string"
         },
         "expected_revision": {
+          "description": "Exact current pool revision from pool_get.",
           "minimum": 1,
           "type": "integer"
         },
         "notify": {
-          "description": "Members to wake: exact current member IDs, roster names or roles. Omit to wake everyone. Ignored for owner posts.",
+          "description": "Members to wake: exact current member IDs, roster names or roles. Omit to wake everyone. Ignored for leader posts.",
           "items": {
             "maxLength": 160,
             "minLength": 1,
@@ -819,11 +899,13 @@
           "type": "array"
         },
         "pool_id": {
+          "description": "Exact pool ID from pool_list, creation or onboarding.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
         },
         "request_key": {
+          "description": "Stable caller-chosen key. Reuse it only to retry the identical intent.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
@@ -851,25 +933,30 @@
       "additionalProperties": false,
       "properties": {
         "body": {
+          "description": "Plain text message to record in pool history.",
           "maxLength": 8192,
           "minLength": 1,
           "type": "string"
         },
         "expected_revision": {
+          "description": "Exact current pool revision from pool_get.",
           "minimum": 1,
           "type": "integer"
         },
         "member_id": {
+          "description": "Membership selector. See the tool description for accepted forms.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
         },
         "pool_id": {
+          "description": "Exact pool ID from pool_list, creation or onboarding.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
         },
         "request_key": {
+          "description": "Stable caller-chosen key. Reuse it only to retry the identical intent.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
@@ -893,25 +980,29 @@
       "openWorldHint": true,
       "readOnlyHint": false
     },
-    "description": "Confirmed member explicitly notifies the hidden external owner. Bodies over 2048 bytes are committed as ordered history parts; notifications show the first part.",
+    "description": "Confirmed member explicitly notifies the external leader. Bodies over 2048 bytes are committed as ordered history parts; notifications show the first part.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
         "body": {
+          "description": "Plain text message to record in pool history.",
           "maxLength": 8192,
           "minLength": 1,
           "type": "string"
         },
         "expected_revision": {
+          "description": "Exact current pool revision from pool_get.",
           "minimum": 1,
           "type": "integer"
         },
         "pool_id": {
+          "description": "Exact pool ID from pool_list, creation or onboarding.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
         },
         "request_key": {
+          "description": "Stable caller-chosen key. Reuse it only to retry the identical intent.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
@@ -934,35 +1025,41 @@
       "openWorldHint": true,
       "readOnlyHint": false
     },
-    "description": "Owner or confirmed member opens a proposal with result, criteria, optional full snapshot and a frozen confirmed roster. Revising an open proposal archives it as stale. Accepted decisions remain immutable; leader never votes.",
+    "description": "Leader or confirmed member opens a proposal with result, criteria, optional full snapshot and a frozen confirmed roster. Revising an open proposal archives it as stale. Accepted decisions remain immutable; leader never votes.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
         "criteria": {
+          "description": "Free-text conditions for accepting the result.",
           "maxLength": 2048,
           "minLength": 1,
           "type": "string"
         },
         "expected_revision": {
+          "description": "Exact current pool revision from pool_get.",
           "minimum": 1,
           "type": "integer"
         },
         "pool_id": {
+          "description": "Exact pool ID from pool_list, creation or onboarding.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
         },
         "request_key": {
+          "description": "Stable caller-chosen key. Reuse it only to retry the identical intent.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
         },
         "result": {
+          "description": "Proposed result for the shared goal.",
           "maxLength": 2048,
           "minLength": 1,
           "type": "string"
         },
         "snapshot": {
+          "description": "Optional detailed text accompanying the proposed result.",
           "maxLength": 65536,
           "minLength": 1,
           "type": "string"
@@ -991,20 +1088,24 @@
       "additionalProperties": false,
       "properties": {
         "checks": {
+          "description": "Structured checks against criteria from pool_get section=criteria.",
           "items": {
             "additionalProperties": false,
             "properties": {
               "criterion_id": {
+                "description": "Exact acceptance criterion ID.",
                 "maxLength": 32,
                 "minLength": 1,
                 "type": "string"
               },
               "evidence": {
+                "description": "Explanation and evidence for the vote or criterion status.",
                 "maxLength": 1024,
                 "minLength": 1,
                 "type": "string"
               },
               "status": {
+                "description": "Whether the criterion was met.",
                 "enum": [
                   "met",
                   "unmet"
@@ -1023,6 +1124,7 @@
           "type": "array"
         },
         "choice": {
+          "description": "Ballot choice for this proposal.",
           "enum": [
             "ready",
             "block",
@@ -1031,29 +1133,35 @@
           "type": "string"
         },
         "evidence": {
+          "description": "Explanation and evidence for the vote or criterion status.",
           "maxLength": 2048,
           "type": "string"
         },
         "expected_revision": {
+          "description": "Exact current pool revision from pool_get.",
           "minimum": 1,
           "type": "integer"
         },
         "pool_id": {
+          "description": "Exact pool ID from pool_list, creation or onboarding.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
         },
         "proposal_id": {
+          "description": "Exact proposal ID from pool_get.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
         },
         "request_key": {
+          "description": "Stable caller-chosen key. Reuse it only to retry the identical intent.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
         },
         "roster_key": {
+          "description": "Exact frozen roster key from the proposal.",
           "maxLength": 128,
           "minLength": 1,
           "type": "string"
