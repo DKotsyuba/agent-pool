@@ -111,7 +111,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Read one bounded section. Sections: overview, members, history, proposal, votes, criteria, content, deliveries, binding. Forward history may wait up to 25 seconds; reverse history uses next_before. Roster and vote pages are live; restart from after=0 if the revision changes. Content pages require field=purpose|snapshot and the prior expected_revision on continuation. Structured ballot checks follow vote_event_id in history. proposal_id selects a retained decision. Leader-only binding requires member_id and shows current or removed native mappings; removed execution state is historical. Accepted delivery confirms native handoff; custody and unknown remain monitored.",
+    "description": "Read one bounded section. Sections: overview, members, history, proposal, votes, criteria, content, deliveries, binding. Forward history may wait up to 25 seconds; reverse history uses next_before. Roster and vote pages are live; restart from after=0 if the revision changes. Content pages require field=purpose|snapshot and the prior expected_revision on continuation. Structured ballot checks follow vote_event_id in history. proposal_id selects a retained decision. Leader-only binding requires member_id and shows current or removed native mappings; removed execution state is historical. Accepted delivery confirms native handoff; custody and unknown remain monitored. The observer members and inventory roster projections expose chat seat held_message_count and optional oldest_held_message_at_ms.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {

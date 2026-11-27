@@ -1579,27 +1579,25 @@ fn seat_notice(db: &Connection, member: &str) -> Result<Option<SeatNotice>, Faul
 }
 
 /// Counts held message notices when the oldest for a current seat exceeds ten minutes.
+/// Queries custody for message notices, including backlogs below the display threshold.
+const HELD_MESSAGE_TOTALS: &str = "SELECT count(*),min(n.custody_since_ms)
+         FROM chat_notice_targets n JOIN events j ON j.id=n.event
+         WHERE n.member=?1 AND j.pool=?2 AND n.custody_since_ms IS NOT NULL
+         AND json_extract(j.data,'$.kind') IN ('message','direct_message')";
+
+/// Formats current seat backlogs whose oldest message exceeds the display threshold.
 fn held_messages(
     db: &Connection,
     pool: &str,
     roster: &[SeatRow],
 ) -> Result<Vec<HeldMessages>, Fault> {
     let cutoff = receipt_clock()? - 600_000;
-    let mut stmt = db.prepare(
-        "SELECT count(*),min(n.custody_since_ms)
-         FROM chat_notice_targets n JOIN events j ON j.id=n.event
-         WHERE n.member=?1 AND j.pool=?2 AND n.custody_since_ms IS NOT NULL
-         AND json_extract(j.data,'$.kind') IN ('message','direct_message')
-         HAVING min(n.custody_since_ms)<?3",
-    )?;
+    let mut stmt = db.prepare_cached(HELD_MESSAGE_TOTALS)?;
     let mut held = Vec::new();
     for seat in roster {
-        let row = stmt
-            .query_row(params![seat.seat_id, pool, cutoff], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
-            })
-            .optional()?;
-        if let Some((count, since)) = row
+        let (count, since): (i64, Option<i64>) =
+            stmt.query_row(params![seat.seat_id, pool], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        if let Some(since) = since.filter(|since| *since < cutoff)
             && let Some(time) = chrono::DateTime::from_timestamp_millis(since)
         {
             held.push(HeldMessages {
@@ -1663,6 +1661,11 @@ pub(super) fn project_seat(
         ).optional()?.unwrap_or_else(|| "unknown".into())
     };
     let notice = seat_notice(db, &binding.member.member_id)?;
+    let (held_message_count, oldest_held_message_at_ms) =
+        db.prepare_cached(HELD_MESSAGE_TOTALS)?
+            .query_row(params![binding.member.member_id, binding.pool_id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?;
     binding.member.chat_seat = Some(ChatSeat {
         seat_id: binding.member.member_id.clone(),
         run_agent_id: binding.run_id.clone(),
@@ -1672,6 +1675,8 @@ pub(super) fn project_seat(
             .as_ref()
             .is_some_and(|n| n.status == NOTICE_UNDELIVERABLE),
         notice,
+        held_message_count: Some(held_message_count),
+        oldest_held_message_at_ms,
         joined: binding.member.state == MemberState::Active,
     });
     Ok(())

@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## 0.4.1
+
+- Chat seat projections in members and inventory now expose the number of
+  messages held by Bridge and the oldest custody timestamp.
+
 ## 0.4.0
 
 - Auto-resume also recovers members whose runtime did not confirm a wake (`native_owner_input_uncertain`, Agent Run 0.36+).
