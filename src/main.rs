@@ -51,14 +51,22 @@ mod response;
 mod run_hold;
 mod run_status;
 mod runtime;
+mod service_catalog;
 mod store;
 mod tools;
 use clap::{Parser, Subcommand};
 use mcp_presentation::Renderer;
 use rmcp::{
-    ErrorData as McpError, RoleServer, ServerHandler, ServiceExt, model::*, service::RequestContext,
+    ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
+    model::*,
+    service::{NotificationContext, Peer, RequestContext},
 };
-use std::{path::PathBuf, process::ExitCode, sync::Arc};
+use std::{
+    path::PathBuf,
+    process::ExitCode,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 /// Private catalog cache lifetime in milliseconds for modern MCP requests.
 const TOOLS_LIST_TTL_MS: u64 = 60_000;
@@ -109,6 +117,22 @@ enum Commands {
         /// Explicit validated endpoint and credential configuration.
         #[arg(long)]
         config: PathBuf,
+    },
+    /// Check whether the running resident and this MCP executable agree.
+    CheckVersion {
+        /// Private resident configuration.
+        #[arg(
+            long,
+            conflicts_with = "owner_socket",
+            required_unless_present = "owner_socket"
+        )]
+        config: Option<PathBuf>,
+        /// Group owner ingress socket.
+        #[arg(long, requires = "server_uid")]
+        owner_socket: Option<PathBuf>,
+        /// Required kernel UID of the owner ingress resident.
+        #[arg(long, requires = "owner_socket")]
+        server_uid: Option<u32>,
     },
     /// Explicitly approve verified Run and Bridge build or credential changes for existing routes.
     Repin {
@@ -188,6 +212,15 @@ struct Handler {
     owner: Option<(PathBuf, u32)>,
     /// Admission bound for concurrent native assertion exchanges in this frontend.
     calls: Arc<tokio::sync::Semaphore>,
+    /// Per-session probe throttle, last verified catalog and notification state.
+    discovery: Arc<tokio::sync::Mutex<Discovery>>,
+}
+/// A failed probe retains the last verified catalog and version.
+#[derive(Default)]
+struct Discovery {
+    checked: Option<Instant>,
+    catalog: Option<service_catalog::Catalog>,
+    notified: bool,
 }
 impl Handler {
     /// Validates embedded presentation/catalog resources; performs no service or credential I/O.
@@ -203,29 +236,89 @@ impl Handler {
             config,
             owner: None,
             calls: Arc::new(tokio::sync::Semaphore::new(32)),
+            discovery: Default::default(),
         })
+    }
+
+    /// Coalesces concurrent checks and bounds probe frequency, even when the service is absent.
+    async fn refresh_catalog(&self) -> tokio::sync::MutexGuard<'_, Discovery> {
+        let mut state = self.discovery.lock().await;
+        if (self.owner.is_some() || self.config.is_some())
+            && state
+                .checked
+                .is_none_or(|checked| checked.elapsed() >= Duration::from_secs(30))
+        {
+            state.checked = Some(Instant::now());
+            let owner = self
+                .owner
+                .as_ref()
+                .map(|(path, uid)| (path.as_path(), *uid));
+            if let Ok(catalog) = service_catalog::probe(self.config.as_deref(), owner).await {
+                state.catalog = Some(catalog);
+            }
+        }
+        state
+    }
+
+    /// Reports skew and emits at most one tools-changed notification in this session.
+    async fn report_skew(&self, peer: &Peer<RoleServer>) -> Option<String> {
+        let mut state = self.refresh_catalog().await;
+        let catalog = state
+            .catalog
+            .as_ref()
+            .filter(|catalog| catalog.version != service_catalog::VERSION)?;
+        let message = service_catalog::reconnect(&catalog.version);
+        let notify = !state.notified;
+        state.notified = true;
+        drop(state);
+        if notify {
+            let _ = peer.notify_tool_list_changed().await;
+        }
+        Some(message)
     }
 }
 impl ServerHandler for Handler {
     /// Reports protocol capabilities and instructions without claiming service or live qualification.
     fn get_info(&self) -> ServerConfig {
         if self.owner.is_some() {
-            return ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            return ServerConfig::new(ServerCapabilities::builder().enable_tools().enable_tool_list_changed().build())
                 .with_server_info(Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
                 .with_instructions("Use pool_start for ordinary Run agents working toward one shared result. Any authorized owner can inspect and manage chats. Repeat uncertain mutations with the identical request_key and intent.");
         }
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().enable_tool_list_changed().build())
             .with_server_info(Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
             .with_instructions("Use get_status for product identity. Pool calls require a current authenticated native invocation and configured resident. Durable admission is separate from external delivery and agent completion.")
     }
-    /// Return the static catalog; modern requests cache it privately for 60 seconds.
+    /// Check the resident before completing the legacy handshake.
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, McpError> {
+        drop(self.refresh_catalog().await);
+        context.peer.set_peer_info(request.clone());
+        self.negotiate_initialize(&request)
+    }
+
+    /// Send initial skew notification after the legacy handshake is complete.
+    async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
+        self.report_skew(&context.peer).await;
+    }
+
+    /// Return the resident catalog when available, with the embedded catalog as fallback.
     /// Pagination is unused; legacy sessions retain their original wire fields.
     async fn list_tools(
         &self,
         _: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        let mut result = ListToolsResult::with_all_items(self.catalog.clone());
+        self.report_skew(&context.peer).await;
+        let state = self.discovery.lock().await;
+        let catalog = state
+            .catalog
+            .as_ref()
+            .map_or(&self.catalog, |catalog| &catalog.tools);
+        let mut result = ListToolsResult::with_all_items(catalog.clone());
         if context
             .protocol_version()
             .is_some_and(|version| version.as_str() >= ProtocolVersion::V_2026_07_28.as_str())
@@ -242,6 +335,9 @@ impl ServerHandler for Handler {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
+        if let Some(message) = self.report_skew(&context.peer).await {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(message)]).into());
+        }
         // rmcp 3.4 moves the ORIGINAL wire params._meta into RequestContext before
         // dispatch (service.rs); request.meta is empty here. This is not a fallback
         // identity. The native adapter must still authenticate its protected claims.
@@ -468,6 +564,27 @@ async fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Commands::CheckVersion {
+            config,
+            owner_socket,
+            server_uid,
+        } => {
+            match service_catalog::probe(config.as_deref(), owner_socket.as_deref().zip(server_uid))
+                .await
+            {
+                Ok(catalog) if catalog.version == service_catalog::VERSION => print_json(
+                    serde_json::json!({"frontend_version": service_catalog::VERSION, "service_version": catalog.version}),
+                ),
+                Ok(catalog) => {
+                    eprintln!("{}", service_catalog::reconnect(&catalog.version));
+                    ExitCode::FAILURE
+                }
+                Err(fault) => {
+                    eprintln!("agent-pool service version unavailable: {fault}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Commands::Mcp {
             config,
             owner_socket,

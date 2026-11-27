@@ -1276,3 +1276,15 @@ event in the same transaction. A sole seat qualifies on proposal opening. A comp
 The agreement records member consensus and Run continues to report process
 outcomes separately. Observer `completion_get` with section `header` returns the
 agreement for its exact ID; managed records retain their existing format.
+
+### Frontend catalog freshness
+
+The stdio frontend checks the resident catalog at initialization and at most
+once per 30 seconds on tool requests. Both ingress modes serve the catalog
+through their existing authenticated sockets. Older or temporarily unavailable
+residents leave the last verified catalog, or the embedded catalog on a fresh
+connection, available. When the service version differs, the frontend sends one
+tools-list change notification and returns reconnect guidance on tool calls.
+Run `agent-pool check-version --config PATH` or
+`agent-pool check-version --owner-socket PATH --server-uid UID` for an
+installer check. The exit status is nonzero for skew or an unavailable version.

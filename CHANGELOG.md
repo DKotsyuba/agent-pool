@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## [Unreleased]
+
+### Changed
+
+- Pool notices direct finished and removed members to `finish` and direct the leader to `pool_completion_get` after agreement. Roster changes include a roster summary. Message receipts omit the body, and history shows recent event times relative to the read and older times in UTC.
+- The MCP frontend discovers the resident tool catalog and reports version skew with reconnect instructions. Installers can check the running version with `agent-pool check-version`.
 
 ### Added
 
