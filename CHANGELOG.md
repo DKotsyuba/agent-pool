@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Auto-resume also recovers members whose runtime did not confirm a wake (`native_owner_input_uncertain`, Agent Run 0.36+).
+
 ### Changed
 
 - Seat views show the latest notice and its observation age, with counts for
