@@ -72,6 +72,8 @@ impl Failure {
             "runtime_transport_failed" => "runtime_transport_failed",
             "runtime_ownership_observation_failed" => "runtime_ownership_observation_failed",
             "ended_without_finish" => "ended_without_finish",
+            // Run >= 0.36: the runtime did not confirm a wake; resuming reconciles it.
+            "native_owner_input_uncertain" => "native_owner_input_uncertain",
             "supervisor_dead" if agent["status"] == "lost" => "supervisor_dead",
             "supervisor_identity_mismatch" if agent["status"] == "lost" => {
                 "supervisor_identity_mismatch"
@@ -520,4 +522,19 @@ async fn active_leader(
         return Ok(Some(leader.member.member_id));
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod owner_input_kind_tests {
+    use super::Failure;
+
+    /// An unconfirmed wake is a supported recovery kind, not a quota wait.
+    #[test]
+    fn unconfirmed_wake_is_recoverable() {
+        let agent = serde_json::json!({"status":"failed","failure_kind":"native_owner_input_uncertain",
+            "model":"deepseek-v4.1-flash","finished_at":1.0});
+        let failure = Failure::observed(&agent, 3).expect("recoverable kind");
+        assert_eq!(failure.kind, "native_owner_input_uncertain");
+        assert!(!failure.waiting_for_quota());
+    }
 }
