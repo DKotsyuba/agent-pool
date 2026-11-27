@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Added
+
+- Pool chat records resumable Run failures and wakes the running leader or the
+  initiating owner. Quota-exhausted seats appear as waiting for quota. With a
+  configured Agent Quota socket, Pool can resume the same lineage after fresh
+  capacity evidence and records each attempt and outcome in chat history.
+
 ## 0.3.2
 
 Fix release, 2026-11-26.

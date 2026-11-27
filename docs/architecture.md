@@ -1233,6 +1233,36 @@ per-seat fact in the owner overview and observer. The journal remains readable
 by authorized callers throughout. Bridge custody or an observed address alone
 does not prove a new turn began.
 
+The resident observes the latest Run execution for current, admitted seats in
+open chats. It records each supported terminal failure once per seat and
+execution sequence. Notices wake the unique running `pool-leader` or `leader`
+seat. A failed leader, absent or ambiguous leader, or unconfirmed running state
+routes the notice to the initiating owner. If the owner has yet to bind a
+delivery address, the existing bounded owner backlog replays the notice on bind.
+The overview projects quota exhaustion as `waiting for quota` from Run's latest
+observation. Membership and the Run record retain their original state.
+
+Agent Quota recovery requires `quota_socket` in resident config. Pool
+authenticates the socket owner and peer, using `quota_peer_uid` when configured
+and its own UID by default. Global `auto_resume = false` or
+`auto_resume: false` on `pool_start` disables automatic attempts. Omission
+enables attempts on configured residents, including for pre-v21 pools.
+Failure notices still work with either switch off or without a Quota socket.
+
+Pool requires usable, unexpired capacity for the seat's configured provider and
+Run model with an observation strictly newer than the failure. It verifies the
+original Run store and claims the attempt for the current seat of an open pool
+before sending. Run receives the stable agent ID and the failed execution's
+sequence as an admission precondition, or the exact original execution ID for
+sequence one. A competing resume stops that execution's recovery. A Run version
+that rejects the sequence argument leaves the seat for manual recovery. Pool
+records up to three distinct attempts per execution. Retryable refusals such as
+`binding_cooldown` back off for 30 and then 60 seconds before rechecking capacity.
+Pool stores each attempt's key before dispatch and reuses it when replaying an
+unsettled claim. If Run returns an uncertain outcome, Pool records it and stops
+automatic attempts for that execution. Run owns cleanup and continuation
+admission throughout.
+
 Schema v18 adds chat pool metadata, durable batch intents, notice target mappings
 and the immutable agreement ledger. Schema v19 adds durable retry timing and
 one notice intent per event and seat. All current seats must join before a chat

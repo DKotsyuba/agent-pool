@@ -75,6 +75,12 @@ pub(crate) struct Start {
     pub create: Create,
     pub members: Vec<StartMember>,
     pub owner_address: Option<String>,
+    /// Defaults to enabled. Omit the default from the durable start fingerprint.
+    #[serde(
+        default = "crate::chat_recovery::enabled_by_default",
+        skip_serializing_if = "crate::chat_recovery::is_enabled"
+    )]
+    pub auto_resume: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -564,6 +570,11 @@ async fn owner_call(
     store: &SharedStore,
     uid: u32,
 ) -> Result<ChatReply, Fault> {
+    let _admission = if matches!(request.tool.as_str(), "pool_replace" | "pool_close") {
+        Some(crate::chat_recovery::ADMISSION.lock().await)
+    } else {
+        None
+    };
     let mut reply = match request.tool.as_str() {
         BIND_OWNER => {
             let input: BindOwner = parse(request.arguments)?;
@@ -602,6 +613,7 @@ async fn owner_call(
             .await?
         }
     };
+    drop(_admission);
     observe_overview(config, &mut reply).await;
     Ok(reply)
 }
@@ -699,7 +711,15 @@ async fn process_state(config: &Config, reply: &mut ChatReply) {
     }
     while let Some(result) = observations.join_next().await {
         if let Ok((index, Ok(observation))) = result {
-            overview.roster[index].process = observation.runtime;
+            overview.roster[index].process = if observation
+                .failure
+                .as_ref()
+                .is_some_and(crate::chat_recovery::Failure::waiting_for_quota)
+            {
+                "waiting for quota".into()
+            } else {
+                observation.runtime
+            };
             overview.roster[index].sequence = Some(observation.sequence);
         }
     }

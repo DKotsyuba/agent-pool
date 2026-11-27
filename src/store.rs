@@ -1,5 +1,6 @@
 //! Single-writer SQLite state machine. Transactions commit business state and delivery intents together.
 pub(crate) mod chat;
+pub(crate) mod chat_recovery;
 mod names;
 use crate::{domain::*, integrations::PinReleaseToken};
 use fs2::FileExt;
@@ -1573,6 +1574,9 @@ PRAGMA user_version=5;")?;
         }
         if version < 20 {
             chat::migrate_owner_binding(&db)?;
+        }
+        if version < 21 {
+            chat_recovery::migrate(&db)?;
         }
         if version < crate::completion::SCHEMA_VERSION {
             db.execute_batch("COMMIT;")?;

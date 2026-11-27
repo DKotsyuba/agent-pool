@@ -45,6 +45,13 @@ pub struct Config {
     pub run_socket: Option<PathBuf>,
     /// Optional trusted Linux Run server UID; absent keeps the same-user private socket policy.
     pub run_peer_uid: Option<u32>,
+    /// Optional Agent Quota snapshot socket.
+    pub quota_socket: Option<PathBuf>,
+    /// Optional Quota service UID. Omission requires the Pool service UID.
+    pub quota_peer_uid: Option<u32>,
+    /// Globally permit quota-triggered chat seat recovery. Defaults to true.
+    #[serde(default = "crate::chat_recovery::enabled_by_default")]
+    pub auto_resume: bool,
     /// Optional separately provisioned Run reader for managed outcome and namespace operations.
     pub managed_run_reader: Option<ManagedRunReader>,
     /// Optional separately provisioned private Run attempt transport; absence disables it.
@@ -264,6 +271,7 @@ impl Config {
         .chain(config.bridge_observer_credential_file.iter())
         .chain(config.owner_observer_credential_file.iter())
         .chain(config.run_socket.iter())
+        .chain(config.quota_socket.iter())
         {
             if !path.is_absolute()
                 || path
@@ -289,6 +297,12 @@ impl Config {
             || config.run_peer_uid.is_some() && config.run_socket.is_none()
             || config.run_peer_uid.is_some() && !cfg!(target_os = "linux")
             || config.run_peer_uid == Some(u32::MAX)
+            || config.quota_peer_uid.is_some() && config.quota_socket.is_none()
+            || config.quota_peer_uid == Some(u32::MAX)
+            || config
+                .quota_peer_uid
+                .is_some_and(|uid| uid != config.expected_uid)
+                && !cfg!(target_os = "linux")
         {
             return Err(Fault::Invalid);
         }

@@ -185,7 +185,9 @@ pub(crate) fn bind_owner(
         let mut stmt = tx.prepare(
             "SELECT id,data FROM (
                 SELECT id,data FROM events WHERE pool=?1
-                AND json_extract(data,'$.kind') IN ('owner_message','pool_completed')
+                AND (json_extract(data,'$.kind') IN ('owner_message','pool_completed')
+                    OR (json_extract(data,'$.audience') IS NULL
+                        AND json_extract(data,'$.kind') IN ('member_execution_failed','member_resume_attempt','member_resume_outcome')))
                 ORDER BY id DESC LIMIT ?2
             ) ORDER BY id",
         )?;
@@ -193,7 +195,7 @@ pub(crate) fn bind_owner(
         while let Some(row) = rows.next()? {
             let mut event: Event = decode(&row.get::<_, String>(1)?)?;
             event.event_id = u64::try_from(row.get::<_, i64>(0)?).map_err(|_| Fault::Internal)?;
-            if event.kind == "owner_message" {
+            if event.kind != "pool_completed" {
                 queue_owner_notice(&tx, pool_id, address, &event, None)?;
             } else {
                 let record = agreement(&tx, pool_id, None)?.ok_or(Fault::Internal)?;
@@ -206,7 +208,7 @@ pub(crate) fn bind_owner(
 }
 
 /// Uses the same delivery content for live and replayed owner notices.
-fn queue_owner_notice(
+pub(super) fn queue_owner_notice(
     db: &Connection,
     pool_id: &str,
     address: &str,
@@ -491,6 +493,12 @@ pub(crate) fn start(store: &mut Store, input: Start, starter_uid: u32) -> Result
         "INSERT INTO chat_pools(pool,owner_address) VALUES (?1,?2)",
         params![pool.pool_id, input.owner_address],
     )?;
+    if !input.auto_resume {
+        tx.execute(
+            "INSERT INTO chat_resume_disabled(pool) VALUES (?1)",
+            [&pool.pool_id],
+        )?;
+    }
     tx.execute(
         "INSERT INTO chat_starters(pool,uid) VALUES (?1,?2)",
         params![pool.pool_id, starter_uid],
@@ -1182,6 +1190,9 @@ pub(super) fn queue_chat_notices(
         return Ok(());
     }
     let text = match event.kind.as_str() {
+        "member_execution_failed" | "member_resume_attempt" | "member_resume_outcome" => {
+            event.body.clone()
+        }
         "message" | "direct_message" => message_notice(event, roster),
         "proposal_opened" => {
             let proposal = pool.proposal.as_ref().ok_or(Fault::Internal)?;
@@ -1530,6 +1541,6 @@ pub(crate) fn defer_receipt(store: &mut Store, id: &str) -> Result<(), Fault> {
 }
 
 /// SQLite stores receipt timestamps as signed millisecond integers.
-pub(super) fn receipt_clock() -> Result<i64, Fault> {
+pub(crate) fn receipt_clock() -> Result<i64, Fault> {
     i64::try_from(crate::observer::now()?).map_err(|_| Fault::Unavailable)
 }
