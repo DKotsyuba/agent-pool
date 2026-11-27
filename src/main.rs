@@ -4,6 +4,7 @@
 static TEST_EXEC_HASH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 mod chat;
+mod chat_recovery;
 mod completion;
 mod completion_key;
 mod completion_saga;

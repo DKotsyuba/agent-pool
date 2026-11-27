@@ -113,6 +113,7 @@ pub(crate) fn chat_definitions(names: &[&str], member: bool) -> Vec<Value> {
                 let mut schema = base.iter().find(|row| row["name"] == "pool_create").map_or(Value::Null, |row| row["inputSchema"].clone());
                 schema["properties"]["members"] = json!({"type":"array","minItems":1,"maxItems":crate::domain::MAX_MEMBERS,"items":seat});
                 schema["properties"]["owner_address"] = json!({"type":"string","description":"Optional initiating leader Bridge address for notices."});
+                schema["properties"]["auto_resume"] = json!({"type":"boolean","default":true,"description":"Automatically resume eligible failed seats when quota recovers."});
                 schema["required"] = json!(["request_key","name","purpose","members"]);
                 tool = json!({"name":name,"description":"Create a shared chat and start ordinary Run agents. Read pool_get for Run admission while the resident reconciles receipts.","inputSchema":schema});
             }

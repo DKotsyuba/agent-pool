@@ -956,6 +956,12 @@ async fn run_rpc_result<T: serde::de::DeserializeOwned>(
                 return Err(RunFailure::unknown());
             }
             let mut failure = RunFailure::from_response(&error);
+            if method == "resume"
+                && failure.code == "invalid_params"
+                && error["message"] == "unknown, missing, or incorrectly typed tool argument"
+            {
+                failure.code = "unknown_resume_argument";
+            }
             if method == "start_batch" && strict_initial_refusal(&frame, request_id) {
                 failure.known_unadmitted = true;
             }
@@ -1020,6 +1026,7 @@ impl RunFailure {
                 Some("selection_busy") => "selection_busy",
                 Some("no_eligible_account") => "no_eligible_account",
                 Some("quota_exhausted") => "quota_exhausted",
+                Some("sequence_mismatch") => "sequence_mismatch",
                 Some("binding_cooldown") => "binding_cooldown",
                 Some("PathEscapeError") => "PathEscapeError",
                 Some("StateTransitionError") => "StateTransitionError",
@@ -1833,6 +1840,8 @@ pub struct RunObservation {
     pub restricted_role: bool,
     /// Finite safe state; unknown or unsupported never implies completion.
     pub runtime: String,
+    /// Supported terminal failure facts for chat recovery.
+    pub(crate) failure: Option<crate::chat_recovery::Failure>,
 }
 
 /// Samples the selected Run sequence; this alone does not prove execution or attempt identity.
@@ -1951,6 +1960,7 @@ pub(crate) async fn observe_run(
         restricted_role: communication["state"] == "unsupported"
             && communication["reason"] == "restricted_role",
         runtime,
+        failure: crate::chat_recovery::Failure::observed(&result["agent"], sequence),
         sequence,
     })
 }
@@ -2069,6 +2079,9 @@ mod tests {
             owner_observer_credential_file: None,
             run_socket: Some(path.join("run.sock")),
             run_peer_uid: None,
+            quota_socket: None,
+            quota_peer_uid: None,
+            auto_resume: true,
             managed_run_reader: None,
             observer_socket: None,
             owner_ingress: None,

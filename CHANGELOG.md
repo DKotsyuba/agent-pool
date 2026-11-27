@@ -7,6 +7,13 @@
 - Pool notices direct finished and removed members to `finish` and direct the leader to `pool_completion_get` after agreement. Roster changes include a roster summary. Message receipts omit the body, and history shows recent event times relative to the read and older times in UTC.
 - The MCP frontend discovers the resident tool catalog and reports version skew with reconnect instructions. Installers can check the running version with `agent-pool check-version`.
 
+### Added
+
+- Pool chat records resumable Run failures and wakes the running leader or the
+  initiating owner. Quota-exhausted seats appear as waiting for quota. With a
+  configured Agent Quota socket, Pool can resume the same lineage after fresh
+  capacity evidence and records each attempt and outcome in chat history.
+
 ## 0.3.2
 
 Fix release, 2026-11-26.

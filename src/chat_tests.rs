@@ -1815,7 +1815,7 @@ async fn chat_migrates_v17_without_changing_old_pool() -> Result<(), Box<dyn std
         let actor = crate::domain::Actor::verified("legacy owner".into(),"legacy","owner")?;
         let command = Command::Create(Create {request_key:"legacy-create".into(),name:"Legacy".into(),purpose:"Old purpose".into(),acceptance:None});
         let Reply::Receipt(old) = store.execute(&actor,&command)? else { return Err(Fault::Internal); };
-        store.test_db().execute_batch("DROP TABLE chat_starters; DROP TABLE chat_notice_targets; DROP TABLE chat_agreements; DROP TABLE chat_batches; DROP TABLE chat_pools; PRAGMA user_version=17;")?;
+        store.test_db().execute_batch("DROP TABLE chat_recovery; DROP TABLE chat_resume_disabled; DROP TABLE chat_starters; DROP TABLE chat_notice_targets; DROP TABLE chat_agreements; DROP TABLE chat_batches; DROP TABLE chat_pools; PRAGMA user_version=17;")?;
         Ok(old.pool_id)
     }).await?;
     drop(store);
@@ -1823,8 +1823,8 @@ async fn chat_migrates_v17_without_changing_old_pool() -> Result<(), Box<dyn std
     assert_eq!(
         upgraded
             .test_db()
-            .query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))?,
-        20
+            .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))?,
+        crate::completion::SCHEMA_VERSION
     );
     let ChatReply::Overview(old) =
         state::owner_call(&mut upgraded, "pool_get", json!({"pool_id":pid}))?
@@ -2362,7 +2362,7 @@ async fn chat_migrates_v19_and_replays_owner_backlog() -> Result<(), Box<dyn std
         let version: i64 = store
             .test_db()
             .query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        assert_eq!(version, 20);
+        assert_eq!(version, crate::completion::SCHEMA_VERSION);
         state::start(store, parse(args)?, 1002)
     })
     .await?;
@@ -2422,3 +2422,6 @@ async fn chat_migrates_v19_and_replays_owner_backlog() -> Result<(), Box<dyn std
     .await?;
     Ok(())
 }
+
+#[path = "chat_recovery_tests.rs"]
+mod recovery_tests;
