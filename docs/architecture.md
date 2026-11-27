@@ -1227,9 +1227,14 @@ send of a retired seat or a closed pool is not replayed and stops being
 polled, keeping its `unknown` state in history; a close notice is the
 exception, replayed until its window ends. Active notices with unconfirmed
 custody can replay frozen parameters and the same event ID for up to ten minutes
-against the configured Bridge producer. Confirmed custody uses status lookup.
-Unresolved notices settle as `notice_undeliverable`, exposed as a historical
-per-seat fact in the owner overview and observer. The journal remains readable
+against the configured Bridge producer. Confirmed custody uses status lookup
+for the original frozen event ID. After the publication window, retirement, or
+closure, a separate lane checks at most two confirmed notices per tick and at
+most once per notice per fifteen minutes. Unresolved notices settle as
+`notice_undeliverable` with a bounded reason when known. Seat views report the
+latest notice by journal order, its last observation age, and a count of
+earlier failures. The leader overview also shows current seats with messages
+held by Bridge for over ten minutes. The journal remains readable
 by authorized callers throughout. Bridge custody or an observed address alone
 does not prove a new turn began.
 

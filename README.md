@@ -194,8 +194,9 @@ Run supplies member identity through its ordinary worker MCP. Choose each worker
 wakeable profile such as `implement` or `review`. Pool refuses `research` for both
 start and replacement because it cannot receive pool chat notices. The owner
 `pool_get` overview includes up to five recently retired seats and reports
-`notice_undeliverable` per seat. Use `section=members` to page through all current
-and retired chat seats. For each continuation, pass the previous page’s `next` as
+the latest notice status and earlier failure count per seat. It flags current
+seats with messages held by Bridge for over ten minutes. Use `section=members`
+to page through all current and retired chat seats. For each continuation, pass the previous page’s `next` as
 the string `after` and the first page’s `revision` as `expected_revision`. If the
 revision changed, restart at the first page. Mutations take the observed
 `expected_revision`. Owners supply a

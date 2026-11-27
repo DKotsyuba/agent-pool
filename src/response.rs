@@ -39,6 +39,11 @@ fn event_time(recorded_at_ms: u64, now_ms: u64) -> String {
     }
 }
 
+/// Formats elapsed whole minutes for durable notice clocks, clamping clock skew to zero.
+fn age_minutes(recorded_at_ms: u64, now_ms: u64) -> u64 {
+    now_ms.saturating_sub(recorded_at_ms) / 60_000
+}
+
 /// Closed immutable MiniJinja environment; rendering has no I/O or domain side effects.
 pub struct Templates {
     /// Embedded templates and explicitly registered formatting-only filters.
@@ -64,6 +69,7 @@ impl Templates {
             serde_json::to_string(&value).unwrap_or_else(|_| "\"unavailable\"".into())
         });
         env.add_filter("event_time", event_time);
+        env.add_filter("age_minutes", age_minutes);
         for (name, source) in entries {
             env.add_template(name, source)
                 .map_err(|_| "template_invalid")?;

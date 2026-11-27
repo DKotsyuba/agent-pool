@@ -845,7 +845,17 @@ async fn chat_notice_backoff_survives_restart() -> Result<(), Box<dyn std::error
         templates,
     )
     .await;
-    assert!(reply_text(&overview).contains("notice_undeliverable=true"));
+    assert!(reply_text(&overview).contains("1 earlier undeliverable"));
+    stored(&store, move |store| {
+        let reason: String = store.test_db().query_row(
+            "SELECT undeliverable_reason FROM chat_notice_targets WHERE effect=?1",
+            [&effect_id],
+            |r| r.get(0),
+        )?;
+        assert_eq!(reason, "address unresolved at deadline");
+        Ok(())
+    })
+    .await?;
     let replacement = json!({"pool_id":pid,"expected_revision":5,"request_key":"replace-notice-seat",
         "member_id":target,"member":spec("implement")});
     let next_id = next.effect_id.clone();
@@ -957,13 +967,20 @@ async fn chat_restricted_role_is_undeliverable_without_backoff()
     tokio::time::timeout(std::time::Duration::from_secs(3), mock).await???;
     stored(&store, move |store| {
         let db = store.test_db();
-        let result: (String, bool) = db.query_row(
-            "SELECT e.state,n.pending FROM effects e
+        let result: (String, bool, String) = db.query_row(
+            "SELECT e.state,n.pending,n.undeliverable_reason FROM effects e
             JOIN chat_notice_targets n ON e.id=n.effect WHERE e.id=?1",
             [&id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
-        assert_eq!(result, (state::NOTICE_UNDELIVERABLE.into(), false));
+        assert_eq!(
+            result,
+            (
+                state::NOTICE_UNDELIVERABLE.into(),
+                false,
+                "restricted role".into()
+            )
+        );
         let request: crate::observer::Request =
             parse(json!({"schema_version":1,"operation":"get",
             "params":{"pool_id":batch.pool_id,"section":"deliveries"}}))?;
@@ -1161,9 +1178,119 @@ async fn chat_retry_is_not_starved_by_new_posts() -> Result<(), Box<dyn std::err
     Ok(())
 }
 
+/// An expired publication can only look up the original frozen intent. Its late
+/// acceptance clears the backlog while the prior failure stays in the seat history.
+#[tokio::test]
+async fn chat_late_custody_acceptance_recovers_seat_view() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (_root, _config, store) = fixture()?;
+    let batch = reserve(&store, None).await?;
+    install(&store, &batch).await?;
+    let templates = renderer()?;
+    stored(&store, move |store| {
+        let pid = batch.pool_id;
+        let seat = &batch.jobs[0].member_id;
+        let overview =
+            |store: &mut Store| state::owner_call(store, "pool_get", json!({"pool_id":pid}));
+        let render = |reply| {
+            serde_json::to_string(&present(Ok(reply), templates)).map_err(|_| Fault::Internal)
+        };
+        let post = |store: &mut Store, revision| {
+            state::owner_call(
+                store,
+                "pool_post",
+                json!({"pool_id":pid,"expected_revision":revision,
+                "request_key":format!("post-{revision}"),"body":"message"}),
+            )
+        };
+        post(store, 1)?;
+        let first: String = store.test_db().query_row(
+            "SELECT effect FROM chat_notice_targets WHERE member=?1",
+            [seat],
+            |r| r.get(0),
+        )?;
+        store.settle_undeliverable_notice(&first, state::UndeliverableReason::Closing)?;
+        assert!(
+            render(overview(store)?)?
+                .contains("undeliverable now (address unresolved during close)")
+        );
+
+        post(store, 2)?;
+        let mut notice = state::due_notices(store, 16, 0)?
+            .into_iter()
+            .find(|effect| {
+                matches!(&effect.work, crate::domain::Work::Deliver { scope, .. }
+                if scope == &format!("agent-pool:member:{seat}"))
+            })
+            .ok_or(Fault::Internal)?;
+        let crate::domain::Work::Deliver { address, .. } = &mut notice.work else {
+            return Err(Fault::Internal);
+        };
+        *address = "test/codex/route/session".into();
+        let id = notice.effect_id.clone();
+        let frozen = serde_json::to_value(integrations::publication(&notice)?)
+            .map_err(|_| Fault::Internal)?;
+        store.freeze_publication(&id, "fixture", &frozen)?;
+        assert_eq!(
+            state::begin_notice_send(store, &id)?,
+            state::NoticeSend::Publish { replay: false }
+        );
+        store.settle_effect(&id, "custody")?;
+        let now = state::receipt_clock()?;
+        store.test_db().execute(
+            "UPDATE chat_notice_targets SET custody_since_ms=?2,observed_at_ms=?3,
+             publish_until_ms=1,next_resolve_ms=0 WHERE effect=?1",
+            rusqlite::params![id, now - 11 * 60_000, now - 2 * 60_000],
+        )?;
+        let held = render(overview(store)?)?;
+        assert!(held.contains("in Bridge custody for 11 min"));
+        assert!(held.contains("observed 2 min ago"));
+        assert!(held.contains("1 message held by Bridge since"));
+        assert!(held.contains("wake via steer if urgent"));
+        assert!(held.contains("1 earlier undeliverable"));
+        assert!(!held.contains("undeliverable now"));
+
+        let due = state::due_notices(store, 0, 8)?;
+        assert_eq!(
+            due.iter()
+                .map(|effect| &effect.effect_id)
+                .collect::<Vec<_>>(),
+            [&id]
+        );
+        assert_eq!(
+            state::begin_notice_send(store, &id)?,
+            state::NoticeSend::Status
+        );
+        let state::Notice::Frozen(producer, params) = state::notice(store, &id)? else {
+            return Err(Fault::Internal);
+        };
+        assert_eq!(producer, "fixture");
+        assert_eq!(params, frozen);
+        assert_eq!(params["event_id"], id);
+        store.settle_effect(&id, "unknown")?;
+        assert!(state::due_notices(store, 0, 8)?.is_empty());
+        assert!(render(overview(store)?)?.contains("observed 2 min ago"));
+
+        store.test_db().execute(
+            "UPDATE chat_notice_targets SET next_resolve_ms=0 WHERE effect=?1",
+            [&id],
+        )?;
+        assert_eq!(state::due_notices(store, 0, 8)?[0].effect_id, id);
+        store.settle_effect(&id, "accepted")?;
+        let accepted = render(overview(store)?)?;
+        assert!(accepted.contains("accepted by native destination"));
+        assert!(accepted.contains("1 earlier undeliverable"));
+        assert!(!accepted.contains("held by Bridge since"));
+        assert!(state::due_notices(store, 0, 8)?.is_empty());
+        Ok(())
+    })
+    .await?;
+    Ok(())
+}
+
 /// A large custody backlog, partly for a retired seat, a closed pool and ended
-/// publication windows, neither delays nor expires a fresh notice; retired
-/// custody stops being polled and live custody backs off to fifteen minutes.
+/// publication windows, neither delays nor expires a fresh notice. Live custody
+/// backs off to fifteen minutes.
 #[tokio::test]
 async fn chat_custody_backlog_does_not_delay_new_notice() -> Result<(), Box<dyn std::error::Error>>
 {
@@ -1731,7 +1858,7 @@ async fn chat_owner_pages_retired_seats_and_failures() -> Result<(), Box<dyn std
         let revision = view.revision;
         let text = serde_json::to_string(&present(Ok(overview), templates))
             .map_err(|_| Fault::Internal)?;
-        assert!(text.contains("+3 more retired seats (3 undeliverable), see section=members."));
+        assert!(text.contains("+3 more retired seats (3 undeliverable notices), see section=members."));
         let mut ids = std::collections::BTreeSet::new();
         for (after, size, more) in [("0", 5, true), ("5", 3, false)] {
             let reply = state::owner_call(
@@ -1751,12 +1878,12 @@ async fn chat_owner_pages_retired_seats_and_failures() -> Result<(), Box<dyn std
             assert_eq!((roster.len(), *has_more), (size, more));
             assert_eq!(*next, if more { 5 } else { 8 });
             for seat in roster {
-                assert!(seat.retired && seat.notice_undeliverable);
+                assert!(seat.retired && seat.notice.as_ref().is_some_and(|n| n.earlier_undeliverable == 1));
                 assert!(ids.insert(seat.seat_id.clone()));
             }
             let text = serde_json::to_string(&present(Ok(reply), templates))
                 .map_err(|_| Fault::Internal)?;
-            assert!(text.contains("retired=true") && text.contains("notice_undeliverable=true"));
+            assert!(text.contains("retired=true") && text.contains("1 earlier undeliverable"));
         }
         assert_eq!(ids.len(), 8);
 
@@ -2321,9 +2448,16 @@ async fn chat_migrates_v19_and_replays_owner_backlog() -> Result<(), Box<dyn std
     let (_root, mut config, store) = fixture()?;
     let old = reserve(&store, None).await?;
     stored(&store, |store| {
-        store
-            .test_db()
-            .execute_batch("DROP TABLE chat_starters; PRAGMA user_version=19;")?;
+        store.test_db().execute_batch(
+            "DROP TABLE chat_starters;
+                DROP INDEX chat_notices_late_status;
+                DROP INDEX chat_notices_held_by_member;
+                DROP INDEX chat_notices_member_event;
+                ALTER TABLE chat_notice_targets DROP COLUMN observed_at_ms;
+                ALTER TABLE chat_notice_targets DROP COLUMN custody_since_ms;
+                ALTER TABLE chat_notice_targets DROP COLUMN undeliverable_reason;
+                PRAGMA user_version=19;",
+        )?;
         Ok(())
     })
     .await?;

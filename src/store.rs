@@ -1578,6 +1578,9 @@ PRAGMA user_version=5;")?;
         if version < 21 {
             chat_recovery::migrate(&db)?;
         }
+        if version < 22 {
+            chat::migrate_notice_visibility(&db)?;
+        }
         if version < crate::completion::SCHEMA_VERSION {
             db.execute_batch("COMMIT;")?;
         }
@@ -2086,7 +2089,15 @@ PRAGMA user_version=5;")?;
     }
     /// Records an effect outcome without cancelling an admission that may already have been sent.
     pub fn settle_effect(&mut self, effect_id: &str, state: &str) -> Result<(), Fault> {
-        self.settle_effect_checked(effect_id, state, None)
+        self.settle_effect_checked(effect_id, state, None, None)
+    }
+    /// Records a bounded diagnostic together with the pre-publication failure.
+    pub(crate) fn settle_undeliverable_notice(
+        &mut self,
+        effect_id: &str,
+        reason: chat::UndeliverableReason,
+    ) -> Result<(), Fault> {
+        self.settle_effect_checked(effect_id, chat::NOTICE_UNDELIVERABLE, None, Some(reason))
     }
     /// Settles only the matching replacement claim; a late worker cannot overwrite a newer claim.
     pub(crate) fn settle_replacement(
@@ -2095,7 +2106,7 @@ PRAGMA user_version=5;")?;
         token: &str,
         state: &str,
     ) -> Result<(), Fault> {
-        self.settle_effect_checked(effect_id, state, Some(token))
+        self.settle_effect_checked(effect_id, state, Some(token), None)
     }
     /// Applies the common effect settlement after checking replacement claim ownership.
     fn settle_effect_checked(
@@ -2103,6 +2114,7 @@ PRAGMA user_version=5;")?;
         effect_id: &str,
         state: &str,
         token: Option<&str>,
+        notice_reason: Option<chat::UndeliverableReason>,
     ) -> Result<(), Fault> {
         if ![
             "unknown",
@@ -2243,7 +2255,7 @@ PRAGMA user_version=5;")?;
             params![effect_id, state, encode(&effect)?],
         )?;
         if matches!(effect.work, Work::Deliver { .. }) {
-            chat::settle_notice(&tx, effect_id, state)?;
+            chat::settle_notice(&tx, effect_id, state, notice_reason)?;
         }
         if matches!(state, "refused" | "cancelled") && matches!(effect.work, Work::Start { .. }) {
             let (binding, _) =

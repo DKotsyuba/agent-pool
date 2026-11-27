@@ -896,11 +896,28 @@ pub struct ChatSeat {
     pub profile: String,
     /// Pending, admitted, refused, or unknown.
     pub admission: String,
-    /// Whether any notice to this seat expired without a Bridge address.
+    /// Whether the latest notice failed to resolve a Bridge address.
     #[serde(default)]
     pub notice_undeliverable: bool,
+    /// Latest notice and the count of failures before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice: Option<SeatNotice>,
     /// Whether this seat joined.
     pub joined: bool,
+}
+/// Latest notice by journal order, with separate custody and observation clocks.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeatNotice {
+    /// Safe status label derived from durable Pool and Bridge evidence.
+    pub status: String,
+    /// Time at which Pool first knew Bridge held the notice, in Unix milliseconds.
+    pub custody_since_ms: Option<i64>,
+    /// Last recorded status evidence for this notice, in Unix milliseconds.
+    pub observed_at_ms: Option<i64>,
+    /// Bounded address resolution diagnostic, when recorded.
+    pub reason: Option<String>,
+    /// Number of earlier notices that failed before publication.
+    pub earlier_undeliverable: i64,
 }
 /// Proposal lifecycle; accepted proposals are immutable and independent of pool lifetime.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
