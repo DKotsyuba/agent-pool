@@ -10,7 +10,30 @@ use serde_json::{Value, json};
 /// Terminal outcome for a member notice whose Bridge address could not be resolved.
 pub(crate) const NOTICE_UNDELIVERABLE: &str = "notice_undeliverable";
 
+/// Safe, finite explanations for failures before Bridge publication.
+#[derive(Clone, Copy)]
+pub(crate) enum UndeliverableReason {
+    RestrictedRole,
+    AddressDeadline,
+    Closing,
+}
+
+impl UndeliverableReason {
+    /// Returns the stored and displayed reason without provider-supplied text.
+    fn label(self) -> &'static str {
+        match self {
+            Self::RestrictedRole => "restricted role",
+            Self::AddressDeadline => "address unresolved at deadline",
+            Self::Closing => "address unresolved during close",
+        }
+    }
+}
+
 const OWNER_NOTICE_BACKLOG: i64 = 20;
+
+/// Late status lookups have a separate per-tick budget and a per-notice interval.
+const LATE_NOTICE_POLLS_PER_TICK: u16 = 2;
+const LATE_NOTICE_INTERVAL_MS: i64 = 900_000;
 
 const OWNER: &str = "pool-chat-v1-owner";
 
@@ -141,6 +164,27 @@ pub(super) fn migrate_owner_binding(db: &Connection) -> Result<(), Fault> {
         "CREATE TABLE IF NOT EXISTS chat_starters(
             pool TEXT PRIMARY KEY REFERENCES chat_pools(pool), uid INTEGER NOT NULL
         ); PRAGMA user_version=20;",
+    )?;
+    Ok(())
+}
+
+/// Adds notice observations. Legacy custody is known at least as of this upgrade.
+pub(super) fn migrate_notice_visibility(db: &Connection) -> Result<(), Fault> {
+    db.execute_batch(
+        "ALTER TABLE chat_notice_targets ADD COLUMN observed_at_ms INTEGER;
+         ALTER TABLE chat_notice_targets ADD COLUMN custody_since_ms INTEGER;
+         ALTER TABLE chat_notice_targets ADD COLUMN undeliverable_reason TEXT;
+         CREATE INDEX chat_notices_member_event ON chat_notice_targets(member,event DESC);
+         CREATE INDEX chat_notices_late_status ON chat_notice_targets(next_resolve_ms,event,effect)
+         WHERE pending=0 AND custody_since_ms IS NOT NULL;
+         CREATE INDEX chat_notices_held_by_member ON chat_notice_targets(member)
+         WHERE custody_since_ms IS NOT NULL;
+         PRAGMA user_version=22;",
+    )?;
+    db.execute(
+        "UPDATE chat_notice_targets SET custody_since_ms=?1 WHERE custody_confirmed=1
+         AND effect IN (SELECT id FROM effects WHERE state IN ('custody','unknown'))",
+        [receipt_clock()?],
     )?;
     Ok(())
 }
@@ -934,7 +978,8 @@ pub(crate) fn get(db: &Connection, input: GetPool, seat: Option<&str>) -> Result
             next,
         });
     }
-    let owner_chat = seat.is_none() && enabled(db, &input.pool_id)?;
+    let chat_pool = enabled(db, &input.pool_id)?;
+    let owner_chat = seat.is_none() && chat_pool;
     if owner_chat && input.section == ChatSection::Members {
         return owner_member_page(db, &pool, input);
     }
@@ -996,9 +1041,9 @@ pub(crate) fn get(db: &Connection, input: GetPool, seat: Option<&str>) -> Result
     let (mut omitted_retired, mut omitted_undeliverable) = (0, 0);
     if owner_chat {
         (omitted_retired, omitted_undeliverable) = db.query_row(
-            "SELECT count(*),count(*) FILTER (WHERE EXISTS(
-                SELECT 1 FROM chat_notice_targets n JOIN effects e ON e.id=n.effect
-                WHERE n.member=older.id AND e.state='notice_undeliverable'))
+            "SELECT count(*),coalesce(sum((
+                SELECT count(*) FROM chat_notice_targets n JOIN effects e ON e.id=n.effect
+                WHERE n.member=older.id AND e.state='notice_undeliverable')),0)
              FROM (SELECT id FROM members WHERE pool=?1 AND current=0
                    ORDER BY rowid DESC LIMIT -1 OFFSET 5) older",
             [&input.pool_id],
@@ -1015,6 +1060,17 @@ pub(crate) fn get(db: &Connection, input: GetPool, seat: Option<&str>) -> Result
         .into_iter()
         .map(|binding| seat_row(db, binding))
         .collect::<Result<Vec<_>, _>>()?;
+    let held_messages = if owner_chat
+        || (chat_pool
+            && seat.is_some_and(|id| {
+                roster.iter().any(|row| {
+                    row.seat_id == id && matches!(row.profile.as_str(), "leader" | "pool-leader")
+                })
+            })) {
+        held_messages(db, &input.pool_id, &roster[..current_count])?
+    } else {
+        Vec::new()
+    };
     let state = status(&pool, completion.is_some());
     let (ready, blocked) = pool
         .proposal
@@ -1050,6 +1106,7 @@ pub(crate) fn get(db: &Connection, input: GetPool, seat: Option<&str>) -> Result
         seat_count: current_count,
         omitted_retired,
         omitted_undeliverable,
+        held_messages,
         roster,
         ready,
         blocked,
@@ -1146,7 +1203,7 @@ fn owner_member_page(db: &Connection, pool: &Pool, input: GetPool) -> Result<Cha
     })
 }
 
-/// Projects one safe chat seat including durable notice failures.
+/// Projects one safe chat seat including its latest notice and failure history.
 fn seat_row(db: &Connection, binding: Binding) -> Result<SeatRow, Fault> {
     let admitted = binding.run_id.is_some();
     let admission = if admitted {
@@ -1155,10 +1212,10 @@ fn seat_row(db: &Connection, binding: Binding) -> Result<SeatRow, Fault> {
         db.query_row("SELECT b.state FROM chat_batches b,json_each(b.jobs) j WHERE b.pool=?1 AND json_extract(j.value,'$.member_id')=?2",
                 params![binding.pool_id,binding.member.member_id], |r| r.get::<_,String>(0)).optional()?.unwrap_or_else(|| "unavailable".into())
     };
-    let notice_undeliverable = notice_undeliverable(db, &binding.member.member_id)?;
+    let notice = seat_notice(db, &binding.member.member_id)?;
     let retired = binding.member.state == MemberState::Removed;
     Ok(SeatRow {
-        notice_undeliverable,
+        notice,
         retired,
         seat_id: binding.member.member_id,
         name: binding.member.name,
@@ -1287,7 +1344,7 @@ fn notice_author(event: &Event) -> &str {
 pub(crate) enum Notice {
     Legacy,
     Cancelled,
-    Undeliverable,
+    Undeliverable(UndeliverableReason),
     Frozen(String, Value),
     Unresolved {
         binding: Box<Binding>,
@@ -1323,7 +1380,11 @@ pub(crate) fn notice(store: &Store, effect: &str) -> Result<Notice, Fault> {
     Ok(if (!current && !closing) || binding.run_id.is_none() {
         Notice::Cancelled
     } else if receipt_clock()? >= deadline {
-        Notice::Undeliverable
+        Notice::Undeliverable(if closing {
+            UndeliverableReason::Closing
+        } else {
+            UndeliverableReason::AddressDeadline
+        })
     } else {
         Notice::Unresolved {
             binding: Box::new(binding),
@@ -1336,14 +1397,9 @@ pub(crate) fn notice(store: &Store, effect: &str) -> Result<Notice, Fault> {
 ///
 /// Never-sent notices have their own `sends` budget and are claimed first, so
 /// custody and unknown status polls (`polls` budget) cannot delay a fresh wake.
-/// Before claiming, rows whose send was started stop being polled once their
-/// seat was retired or their pool was closed, close notices excepted; the row
-/// and its effect state are retained. A close notice is still replayed, so a
-/// closed pool does not end it: like a confirmed-custody row, it ends with its
-/// publication window. Any other unconfirmed send ignores that window, since it
-/// may still be resolved. A notice that was never attempted is not swept: it
-/// gets its resolution deadline measured from this first claim rather than from
-/// enqueue, so the resident's own scheduling lag cannot expire it.
+/// After expiry, retirement or close takes a confirmed notice out of the
+/// regular lane, a separate capped lane claims it for read-only status lookup.
+/// Never-attempted notices get a resolution deadline from their first claim.
 pub(crate) fn due_notices(store: &mut Store, sends: u16, polls: u16) -> Result<Vec<Effect>, Fault> {
     let tx = store
         .db
@@ -1381,6 +1437,24 @@ pub(crate) fn due_notices(store: &mut Store, sends: u16, polls: u16) -> Result<V
         )?;
         effects.push(effect(&tx, &id)?);
     }
+    let mut stmt = tx.prepare(
+        "SELECT n.effect FROM chat_notice_targets n JOIN publications p ON p.effect=n.effect
+         WHERE n.pending=0 AND n.custody_since_ms IS NOT NULL AND n.next_resolve_ms<=?1
+         ORDER BY n.next_resolve_ms,n.event,n.effect LIMIT ?2",
+    )?;
+    let late = stmt
+        .query_map(params![now, polls.min(LATE_NOTICE_POLLS_PER_TICK)], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
+    for id in late {
+        tx.execute(
+            "UPDATE chat_notice_targets SET next_resolve_ms=?2 WHERE effect=?1",
+            params![id, now + LATE_NOTICE_INTERVAL_MS],
+        )?;
+        effects.push(effect(&tx, &id)?);
+    }
     tx.commit()?;
     Ok(effects)
 }
@@ -1406,13 +1480,16 @@ pub(crate) fn begin_notice_send(store: &mut Store, id: &str) -> Result<NoticeSen
         "SELECT n.member,e.pool,n.close_notice,n.send_started,n.custody_confirmed,n.publish_until_ms
          FROM chat_notice_targets n JOIN effects e ON e.id=n.effect
          JOIN publications p ON p.effect=n.effect WHERE n.effect=?1
-         AND (n.pending=1 OR e.state='cancelled')",
+         AND (n.pending=1 OR n.custody_since_ms IS NOT NULL OR e.state='cancelled')",
         [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?;
+    if custody {
+        return Ok(NoticeSend::Status);
+    }
     let (seat, current) = binding_any(&tx, &member)?;
     let eligible =
         seat.run_id.is_some() && (closing || (current && !pool(&tx, &pool_id)?.0.closed));
     let now = receipt_clock()?;
-    if custody || (started && (!eligible || deadline.is_some_and(|end| now >= end))) {
+    if started && (!eligible || deadline.is_some_and(|end| now >= end)) {
         return Ok(NoticeSend::Status);
     }
     if !eligible {
@@ -1426,20 +1503,37 @@ pub(crate) fn begin_notice_send(store: &mut Store, id: &str) -> Result<NoticeSen
 
 /// Updates durable scheduling alongside the effect settlement transaction.
 /// Confirmed custody is re-polled with exponential backoff from one to fifteen minutes.
-pub(super) fn settle_notice(db: &Connection, id: &str, state: &str) -> Result<(), Fault> {
+pub(super) fn settle_notice(
+    db: &Connection,
+    id: &str,
+    state: &str,
+    reason: Option<UndeliverableReason>,
+) -> Result<(), Fault> {
     let custody = state == "custody";
     let pending = custody || state == "unknown";
     db.execute(
-        "UPDATE chat_notice_targets SET pending=?2,custody_confirmed=max(custody_confirmed,?3),
-         next_resolve_ms=?4+max(resolve_delay_ms,?5),
-         resolve_delay_ms=min(CASE WHEN ?3 THEN 900000 ELSE 60000 END,2*max(resolve_delay_ms,?5))
+        "UPDATE chat_notice_targets
+         SET pending=CASE WHEN ?2 THEN pending ELSE 0 END,
+         custody_confirmed=max(custody_confirmed,?3),
+         custody_since_ms=CASE WHEN ?3 THEN coalesce(custody_since_ms,?4)
+                               WHEN ?2 THEN custody_since_ms ELSE NULL END,
+         observed_at_ms=CASE WHEN ?6 THEN ?4 ELSE observed_at_ms END,
+         undeliverable_reason=?7,
+         next_resolve_ms=CASE WHEN pending=0 AND custody_confirmed=1
+                              THEN max(next_resolve_ms,?4+?8)
+                              ELSE ?4+max(resolve_delay_ms,?5) END,
+         resolve_delay_ms=min(CASE WHEN ?3 OR custody_confirmed=1 THEN ?8 ELSE 60000 END,
+                              2*max(resolve_delay_ms,?5))
          WHERE effect=?1",
         params![
             id,
             pending,
             custody,
             receipt_clock()?,
-            if custody { 60_000 } else { 0 }
+            if custody { 60_000 } else { 0 },
+            state != "unknown",
+            reason.map(UndeliverableReason::label),
+            LATE_NOTICE_INTERVAL_MS,
         ],
     )?;
     Ok(())
@@ -1464,14 +1558,58 @@ pub(crate) fn defer_notice(store: &mut Store, id: &str) -> Result<(), Fault> {
     Ok(())
 }
 
-/// Reports a seat with a recorded address-resolution failure.
-fn notice_undeliverable(db: &Connection, member: &str) -> Result<bool, Fault> {
+/// Selects the latest journal notice, independent of the order in which effects settle.
+fn seat_notice(db: &Connection, member: &str) -> Result<Option<SeatNotice>, Fault> {
     Ok(db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM chat_notice_targets n JOIN effects e ON e.id=n.effect
-         WHERE n.member=?1 AND e.state='notice_undeliverable')",
+        "SELECT CASE WHEN n.custody_since_ms IS NOT NULL THEN 'custody' ELSE e.state END,
+                n.custody_since_ms,n.observed_at_ms,n.undeliverable_reason,
+                (SELECT count(*) FROM chat_notice_targets older JOIN effects failure ON failure.id=older.effect
+                 WHERE older.member=n.member AND older.event<n.event AND failure.state='notice_undeliverable')
+         FROM chat_notice_targets n JOIN effects e ON e.id=n.effect
+         WHERE n.member=?1 ORDER BY n.event DESC LIMIT 1",
         [member],
-        |r| r.get(0),
-    )?)
+        |r| Ok(SeatNotice {
+            status: r.get(0)?,
+            custody_since_ms: r.get(1)?,
+            observed_at_ms: r.get(2)?,
+            reason: r.get(3)?,
+            earlier_undeliverable: r.get(4)?,
+        }),
+    ).optional()?)
+}
+
+/// Counts held message notices when the oldest for a current seat exceeds ten minutes.
+fn held_messages(
+    db: &Connection,
+    pool: &str,
+    roster: &[SeatRow],
+) -> Result<Vec<HeldMessages>, Fault> {
+    let cutoff = receipt_clock()? - 600_000;
+    let mut stmt = db.prepare(
+        "SELECT count(*),min(n.custody_since_ms)
+         FROM chat_notice_targets n JOIN events j ON j.id=n.event
+         WHERE n.member=?1 AND j.pool=?2 AND n.custody_since_ms IS NOT NULL
+         AND json_extract(j.data,'$.kind') IN ('message','direct_message')
+         HAVING min(n.custody_since_ms)<?3",
+    )?;
+    let mut held = Vec::new();
+    for seat in roster {
+        let row = stmt
+            .query_row(params![seat.seat_id, pool, cutoff], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            })
+            .optional()?;
+        if let Some((count, since)) = row
+            && let Some(time) = chrono::DateTime::from_timestamp_millis(since)
+        {
+            held.push(HeldMessages {
+                name: seat.name.clone(),
+                count,
+                since: time.format("%H:%MZ").to_string(),
+            });
+        }
+    }
+    Ok(held)
 }
 
 /// Picks a pending batch in stable rotating order. Only the resident dispatches these.
@@ -1524,12 +1662,16 @@ pub(super) fn project_seat(
             params![binding.pool_id, binding.member.member_id], |row| row.get::<_,String>(0)
         ).optional()?.unwrap_or_else(|| "unknown".into())
     };
+    let notice = seat_notice(db, &binding.member.member_id)?;
     binding.member.chat_seat = Some(ChatSeat {
         seat_id: binding.member.member_id.clone(),
         run_agent_id: binding.run_id.clone(),
         profile: binding.member.role.clone(),
         admission,
-        notice_undeliverable: notice_undeliverable(db, &binding.member.member_id)?,
+        notice_undeliverable: notice
+            .as_ref()
+            .is_some_and(|n| n.status == NOTICE_UNDELIVERABLE),
+        notice,
         joined: binding.member.state == MemberState::Active,
     });
     Ok(())

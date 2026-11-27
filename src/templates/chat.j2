@@ -11,9 +11,15 @@ Seats {{ seat_count }} | ready={{ ready }} blocked={{ blocked }}
 {% else %}
 Pool {{ pool_id }} revision={{ revision }} | members more={{ more }} next={{ next }}
 {% endif %}{% for s in roster %}
-{{ s.name|one_line(80) }} ({{ s.profile|one_line(80) }}) · {{ s.seat_id }} | admission={{ s.admitted }}{% if s.retired %} retired=true{% endif %} joined={{ s.joined }} process={{ s.process }}{% if s.notice_undeliverable %} notice_undeliverable=true{% endif %}{% if s.agent_id %} run={{ s.agent_id }}{% endif %} | {{ s.assignment }}
+{{ s.name|one_line(80) }} ({{ s.profile|one_line(80) }}) · {{ s.seat_id }} | admission={{ s.admitted }}{% if s.retired %} retired=true{% endif %} joined={{ s.joined }} process={{ s.process }}{% if s.agent_id %} run={{ s.agent_id }}{% endif %} | {{ s.assignment }}
+{% if s.notice %}
+  Latest notice {% if s.notice.status == "accepted" %}accepted by native destination{% elif s.notice.status == "custody" %}in Bridge custody{% if s.notice.custody_since_ms %} for {{ s.notice.custody_since_ms|age_minutes(now_ms) }} min{% endif %}{% elif s.notice.status == "notice_undeliverable" %}undeliverable now{% if s.notice.reason %} ({{ s.notice.reason }}){% endif %}{% else %}{{ s.notice.status }}{% endif %} · {% if s.notice.observed_at_ms %}observed {{ s.notice.observed_at_ms|age_minutes(now_ms) }} min ago{% else %}observation time unavailable{% endif %}{% if s.notice.earlier_undeliverable %} · {{ s.notice.earlier_undeliverable }} earlier undeliverable{% endif %}
+{% endif %}
 {% endfor %}{% if view == "overview" %}
-{% if omitted_retired %}+{{ omitted_retired }} more retired seats ({{ omitted_undeliverable }} undeliverable), see section=members.
+{% for seat in held_messages %}
+{{ seat.name|one_line(80) }}: {{ seat.count }} message{% if seat.count != 1 %}s{% endif %} held by Bridge since {{ seat.since }} — wake via steer if urgent.
+{% endfor %}
+{% if omitted_retired %}+{{ omitted_retired }} more retired seats ({{ omitted_undeliverable }} undeliverable notices), see section=members.
 {% endif %}
 {% if proposal %}
 Proposal {{ proposal.id }} {{ proposal.state }} roster_key={{ proposal.roster_key }}

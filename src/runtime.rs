@@ -3746,12 +3746,15 @@ async fn chat_notice_effect(
     mut effect: Effect,
     notice: crate::store::chat::Notice,
 ) -> Result<(), Fault> {
-    use crate::store::chat::{self, NOTICE_UNDELIVERABLE, Notice, NoticeSend};
+    use crate::store::chat::{self, Notice, NoticeSend, UndeliverableReason};
     let (producer, value) = match notice {
         Notice::Legacy => return Err(Fault::Internal),
         Notice::Cancelled => return settle(store, effect.effect_id, "cancelled").await,
-        Notice::Undeliverable => {
-            return settle(store, effect.effect_id, NOTICE_UNDELIVERABLE).await;
+        Notice::Undeliverable(reason) => {
+            return stored(store, move |store| {
+                store.settle_undeliverable_notice(&effect.effect_id, reason)
+            })
+            .await;
         }
         Notice::Frozen(producer, value) => (producer, value),
         Notice::Unresolved { binding, closing } => {
@@ -3763,16 +3766,23 @@ async fn chat_notice_effect(
             .ok()
             .flatten();
             let address = match resolution {
-                Some(crate::chat::NoticeAddress::Address(address)) => address,
+                Some(crate::chat::NoticeAddress::Address(address)) => Ok(address),
                 Some(crate::chat::NoticeAddress::RestrictedRole) => {
-                    return settle(store, effect.effect_id, NOTICE_UNDELIVERABLE).await;
+                    Err(UndeliverableReason::RestrictedRole)
                 }
-                None if closing => {
-                    return settle(store, effect.effect_id, NOTICE_UNDELIVERABLE).await;
-                }
+                None if closing => Err(UndeliverableReason::Closing),
                 None => {
                     return stored(store, move |store| {
                         chat::defer_notice(store, &effect.effect_id)
+                    })
+                    .await;
+                }
+            };
+            let address = match address {
+                Ok(address) => address,
+                Err(reason) => {
+                    return stored(store, move |store| {
+                        store.settle_undeliverable_notice(&effect.effect_id, reason)
                     })
                     .await;
                 }

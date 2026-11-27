@@ -230,6 +230,8 @@ pub(crate) struct Overview {
     pub seat_count: usize,
     pub omitted_retired: i64,
     pub omitted_undeliverable: i64,
+    /// Current seats whose Bridge message backlog is older than ten minutes.
+    pub held_messages: Vec<HeldMessages>,
     pub ready: usize,
     pub blocked: usize,
     pub completion: Option<String>,
@@ -248,10 +250,18 @@ pub(crate) struct SeatRow {
     pub sequence: Option<u64>,
     pub agent_id: Option<String>,
     pub admitted: String,
-    pub notice_undeliverable: bool,
+    pub notice: Option<crate::domain::SeatNotice>,
     pub retired: bool,
     pub joined: bool,
     pub process: String,
+}
+
+/// Compact overview entry for a seat with an aging Bridge backlog.
+#[derive(Serialize)]
+pub(crate) struct HeldMessages {
+    pub name: String,
+    pub count: i64,
+    pub since: String,
 }
 
 #[derive(Serialize)]
