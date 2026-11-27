@@ -530,11 +530,12 @@ mod owner_input_kind_tests {
 
     /// An unconfirmed wake is a supported recovery kind, not a quota wait.
     #[test]
-    fn unconfirmed_wake_is_recoverable() {
+    fn unconfirmed_wake_is_recoverable() -> Result<(), &'static str> {
         let agent = serde_json::json!({"status":"failed","failure_kind":"native_owner_input_uncertain",
             "model":"deepseek-v4.1-flash","finished_at":1.0});
-        let failure = Failure::observed(&agent, 3).expect("recoverable kind");
+        let failure = Failure::observed(&agent, 3).ok_or("recoverable kind")?;
         assert_eq!(failure.kind, "native_owner_input_uncertain");
         assert!(!failure.waiting_for_quota());
+        Ok(())
     }
 }
