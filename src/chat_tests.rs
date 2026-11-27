@@ -1288,6 +1288,104 @@ async fn chat_late_custody_acceptance_recovers_seat_view() -> Result<(), Box<dyn
     Ok(())
 }
 
+/// Both observer projections report fresh broadcast and direct message custody.
+#[tokio::test]
+async fn chat_observer_reports_held_messages() -> Result<(), Box<dyn std::error::Error>> {
+    let (_root, _config, store) = fixture()?;
+    let batch = reserve(&store, None).await?;
+    install(&store, &batch).await?;
+    let templates = renderer()?;
+    stored(&store, move |store| {
+        let pid = batch.pool_id;
+        let seat = &batch.jobs[0].member_id;
+        let check = |store: &Store, count, oldest: Option<i64>| {
+            for (operation, params, pointer) in [
+                (
+                    "get",
+                    json!({"pool_id":pid,"section":"members"}),
+                    "/view/members",
+                ),
+                (
+                    "inventory_snapshot",
+                    json!({"filter":"all","limit":10}),
+                    "/pools/0/roster",
+                ),
+            ] {
+                let request =
+                    parse(json!({"schema_version":1,"operation":operation,"params":params}))?;
+                let data =
+                    serde_json::to_value(store.observe(&request)?).map_err(|_| Fault::Internal)?;
+                let roster = data
+                    .pointer(pointer)
+                    .and_then(Value::as_array)
+                    .ok_or(Fault::Internal)?;
+                let projected = roster
+                    .iter()
+                    .find(|member| member["seat_id"] == *seat)
+                    .ok_or(Fault::Internal)?;
+                assert_eq!(projected["held_message_count"], count);
+                assert_eq!(
+                    projected
+                        .get("oldest_held_message_at_ms")
+                        .and_then(Value::as_i64),
+                    oldest
+                );
+                if oldest.is_none() {
+                    assert!(projected.get("oldest_held_message_at_ms").is_none());
+                }
+                assert!(roster.iter().any(|member| member["seat_id"] != *seat
+                    && member["held_message_count"] == 0
+                    && member.get("oldest_held_message_at_ms").is_none()));
+            }
+            Ok::<_, Fault>(())
+        };
+        check(store, 0, None)?;
+        state::owner_call(
+            store,
+            "pool_post",
+            json!({"pool_id":pid,"expected_revision":1,
+            "request_key":"broadcast","body":"broadcast"}),
+        )?;
+        state::owner_call(
+            store,
+            "pool_send_member",
+            json!({"pool_id":pid,"expected_revision":2,
+            "request_key":"direct","member_id":seat,"body":"direct"}),
+        )?;
+        check(store, 0, None)?;
+        let now = state::receipt_clock()?;
+        let effect = |store: &mut Store, kind| {
+            store.test_db().query_row(
+                "SELECT n.effect FROM chat_notice_targets n JOIN events j ON j.id=n.event
+                 WHERE n.member=?1 AND json_extract(j.data,'$.kind')=?2",
+                rusqlite::params![seat, kind],
+                |r| r.get::<_, String>(0),
+            )
+        };
+        let broadcast = effect(store, "message")?;
+        let direct = effect(store, "direct_message")?;
+        for (id, since) in [(&broadcast, now - 1_000), (&direct, now - 2_000)] {
+            store.settle_effect(id, "custody")?;
+            store.test_db().execute(
+                "UPDATE chat_notice_targets SET custody_since_ms=?2 WHERE effect=?1",
+                rusqlite::params![id, since],
+            )?;
+        }
+        check(store, 2, Some(now - 2_000))?;
+        let overview = state::owner_call(store, "pool_get", json!({"pool_id":pid}))?;
+        let text = serde_json::to_string(&present(Ok(overview), templates))
+            .map_err(|_| Fault::Internal)?;
+        assert!(!text.contains("held by Bridge since"));
+        store.settle_effect(&direct, "accepted")?;
+        check(store, 1, Some(now - 1_000))?;
+        store.settle_effect(&broadcast, "accepted")?;
+        check(store, 0, None)?;
+        Ok(())
+    })
+    .await?;
+    Ok(())
+}
+
 /// A large custody backlog, partly for a retired seat, a closed pool and ended
 /// publication windows, neither delays nor expires a fresh notice. Live custody
 /// backs off to fifteen minutes.

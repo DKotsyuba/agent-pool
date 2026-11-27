@@ -1233,7 +1233,11 @@ closure, a separate lane checks at most two confirmed notices per tick and at
 most once per notice per fifteen minutes. Unresolved notices settle as
 `notice_undeliverable` with a bounded reason when known. Seat views report the
 latest notice by journal order, its last observation age, and a count of
-earlier failures. The leader overview also shows current seats with messages
+earlier failures. The observer's `get` members and `inventory_snapshot` roster
+include each chat seat's `held_message_count` and, when messages are held,
+`oldest_held_message_at_ms` (the oldest custody timestamp in Unix milliseconds).
+The count includes all held messages and is zero for an empty backlog.
+The leader overview also shows current seats with messages
 held by Bridge for over ten minutes. The journal remains readable
 by authorized callers throughout. Bridge custody or an observed address alone
 does not prove a new turn began.

@@ -902,6 +902,12 @@ pub struct ChatSeat {
     /// Latest notice and the count of failures before it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notice: Option<SeatNotice>,
+    /// Number of messages currently held by Bridge for this seat, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_message_count: Option<i64>,
+    /// Oldest held message's custody timestamp in Unix milliseconds, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_held_message_at_ms: Option<i64>,
     /// Whether this seat joined.
     pub joined: bool,
 }
