@@ -257,6 +257,7 @@ pub(crate) struct ProposalRow {
 
 #[derive(Serialize)]
 pub(crate) struct ChatEvent {
+    pub recorded_at_ms: Option<u64>,
     pub id: String,
     pub kind: String,
     pub author: String,
@@ -419,9 +420,9 @@ fn text_reply(text: String, error: bool) -> CallToolResult {
 }
 
 /// Recovery hint for launch receipts when template rendering fails.
-pub(crate) const OWNER_BIND_HINT: &str = "Owner notices will be delivered once the session hook binds. You can also pass owner_address at pool_start.";
+pub(crate) const OWNER_BIND_HINT: &str = "Leader notices will be delivered once the session hook binds. You can also pass owner_address at pool_start.";
 /// Journal and completion recovery when a launch cannot bind through owner ingress.
-pub(crate) const OWNER_BIND_UNAVAILABLE: &str = "Owner session binding is unavailable. Read pool_get section=history for notices and pool_completion_get for the result.";
+pub(crate) const OWNER_BIND_UNAVAILABLE: &str = "Leader session binding is unavailable. Read pool_get section=history for notices and pool_completion_get for the result.";
 
 fn present(result: Result<ChatReply, Fault>, templates: &Templates) -> CallToolResult {
     match result {
@@ -430,7 +431,7 @@ fn present(result: Result<ChatReply, Fault>, templates: &Templates) -> CallToolR
             let is_error = matches!(&reply, ChatReply::Launch { state, .. } if matches!(state.as_str(), "refused" | "cancelled" | "not_launched"));
             let text = templates.render("chat", &reply).unwrap_or_else(|_| match &reply {
                 ChatReply::Launch { pool_id, revision, state, request_key, old_agent_id, owner_binding_hint, .. } => format!("Pool {pool_id} revision={revision} admission={state}. Request key {request_key}. Read pool_get for current admission. Prior Run ID: {old_agent_id:?}{}", owner_binding_hint.map_or_else(String::new, |hint| format!("\n{hint}"))),
-                ChatReply::OwnerBound => "Owner binding saved.".into(),
+                ChatReply::OwnerBound => "Leader binding saved.".into(),
                 _ => "READ COMPLETED; presentation degraded. Repeat the read with the same cursor.".into(),
             });
             text_reply(text, is_error)
@@ -547,6 +548,11 @@ pub(crate) async fn owner_connection(
         .await
         .map_err(|_| Fault::Unavailable)??;
     let result = match crate::managed_codec::parse_raw(&bytes).and_then(parse::<OwnerRequest>) {
+        Ok(request)
+            if request.tool == crate::service_catalog::METHOD && request.arguments == json!({}) =>
+        {
+            return write(&mut stream, &crate::service_catalog::reply(true)).await;
+        }
         Ok(request)
             if OWNER_TOOLS.contains(&request.tool.as_str()) || request.tool == BIND_OWNER =>
         {
@@ -727,16 +733,7 @@ pub(crate) async fn frontend(
     #[cfg(target_os = "linux")]
     {
         tokio::time::timeout(EXCHANGE_TIMEOUT * 5, async {
-            crate::config::identity_uid_map()?;
-            let before = crate::config::shared_run_socket(path, uid)?;
-            let mut stream = UnixStream::connect(path)
-                .await
-                .map_err(|_| Fault::Unavailable)?;
-            if stream.peer_cred().map_err(|_| Fault::Unauthorized)?.uid() != uid
-                || crate::config::shared_run_socket(path, uid)? != before
-            {
-                return Err(Fault::Unauthorized);
-            }
+            let mut stream = connect_owner(path, uid).await?;
             write(&mut stream, &OwnerRequest { tool, arguments }).await?;
             let bytes = integrations::read_frame(&mut stream).await?;
             if let Ok(reply) = serde_json::from_slice::<CallToolResult>(&bytes) {
@@ -792,6 +789,29 @@ pub(crate) async fn notice_address(
         Some(NoticeAddress::RestrictedRole)
     } else {
         observation.address.map(NoticeAddress::Address)
+    }
+}
+
+/// Verifies the owner socket and peer before sending a request.
+pub(crate) async fn connect_owner(path: &Path, uid: u32) -> Result<UnixStream, Fault> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::config::identity_uid_map()?;
+        let before = crate::config::shared_run_socket(path, uid)?;
+        let stream = UnixStream::connect(path)
+            .await
+            .map_err(|_| Fault::Unavailable)?;
+        if stream.peer_cred().map_err(|_| Fault::Unauthorized)?.uid() != uid
+            || crate::config::shared_run_socket(path, uid)? != before
+        {
+            return Err(Fault::Unauthorized);
+        }
+        Ok(stream)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (path, uid);
+        Err(Fault::Unavailable)
     }
 }
 

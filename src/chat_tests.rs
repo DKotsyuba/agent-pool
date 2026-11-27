@@ -429,7 +429,8 @@ async fn complete_with_address(
     );
     let receipt = call(dm.clone()).await;
     assert!(ok(&receipt));
-    assert!(reply_text(&receipt).contains("\ndirect_message\nBody: "));
+    assert!(reply_text(&receipt).contains("\ndirect_message\n"));
+    assert!(!reply_text(&receipt).contains("Body: "));
     assert!(ok(&call(dm).await));
     let missing = member_call(
         &batch,
@@ -614,7 +615,7 @@ async fn complete_with_address(
         let db = store.test_db();
         let proposal_notices: i64 = db.query_row("SELECT count(*) FROM chat_notice_targets n JOIN effects e ON e.id=n.effect WHERE e.pool=?1 AND instr(e.data,?2)>0", [&pid,&format!("A vote is requested on proposal {proposal_id}")], |r| r.get(0))?;
         assert_eq!(proposal_notices,2);
-        let completion_notices: i64 = db.query_row("SELECT count(*) FROM chat_notice_targets n JOIN effects e ON e.id=n.effect WHERE e.pool=?1 AND instr(e.data,'This is informational')>0", [pid], |r| r.get(0))?;
+        let completion_notices: i64 = db.query_row("SELECT count(*) FROM chat_notice_targets n JOIN effects e ON e.id=n.effect WHERE e.pool=?1 AND instr(e.data,'pool_completion_get')>0 AND instr(e.data,'Call finish')>0", [pid], |r| r.get(0))?;
         assert_eq!(completion_notices,3);
         Ok(())
     }).await?;
@@ -1406,9 +1407,15 @@ async fn chat_unknown_notice_stops_being_polled_for_retired_or_closed()
             "SELECT effect FROM chat_notice_targets WHERE send_started=0 AND pending=1
              ORDER BY effect",
         )?;
-        // Two possible sends in the open pool and the close notice; four unsent notices
-        // in the open pool and two unsent close notices.
-        assert_eq!((unknown.len(), fresh.len()), (3, 6));
+        // Four unsent messages, two unsent close notices and one replacement final notice.
+        assert_eq!((unknown.len(), fresh.len()), (3, 7));
+        let final_text: String = db.query_row(
+            "SELECT json_extract(e.data,'$.work.text') FROM chat_notice_targets n
+             JOIN effects e ON e.id=n.effect WHERE n.member=?1 AND n.close_notice=1",
+            [&seats[2]],
+            |row| row.get(0),
+        )?;
+        assert!(final_text.contains("Call finish"));
         let live: String = db.query_row(
             "SELECT n.effect FROM chat_notice_targets n JOIN members m ON m.id=n.member
              WHERE m.id=?1 AND n.send_started=1 AND n.custody_confirmed=0",
@@ -1417,7 +1424,7 @@ async fn chat_unknown_notice_stops_being_polled_for_retired_or_closed()
         )?;
         let retired_fresh: String = db.query_row(
             "SELECT n.effect FROM chat_notice_targets n JOIN members m ON m.id=n.member
-             WHERE m.id=?1 AND n.send_started=0 AND n.pending=1",
+             WHERE m.id=?1 AND n.send_started=0 AND n.pending=1 AND n.close_notice=0",
             [&seats[2]],
             |row| row.get(0),
         )?;
